@@ -7,13 +7,14 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "publish": "wrangler publish",
-    "logs": "wrangler tail"
+    "logs": "wrangler tail",
+    "update-wrangler": "npm install --save-dev wrangler@4"
   },
   "dependencies": {
-    "php-wasm": "^0.0.5"
+    "php-wasm": "^0.0.8"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^4.73.0"
   },
   "keywords": ["php", "cloudflare", "workers", "installer"],
   "author": "sugan0927",
