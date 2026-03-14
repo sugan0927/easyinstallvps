@@ -1,8 +1,8 @@
-name = "easyinstallvps"  # CI system के अनुसार नाम बदला
+name = "easyinstallvps"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-# Node.js compatibility flags
-compatibility_flags = ["nodejs_compat", "nodejs_compat_v2"]
+# Only use one compatibility flag
+compatibility_flags = ["nodejs_compat"]
 
-# बिना build section के सीधे deploy
+# No need for nodejs_compat_v2
