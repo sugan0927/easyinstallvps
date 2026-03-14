@@ -271,7 +271,7 @@ echo -e "\${BLUE}━━━━━━━━━━━━━━━━━━━━━
 
 // Function to serve main HTML page
 function serveMainPage() {
-  const mainCommand = 'sudo bash -c "$(curl -fsSL https://easyinstallvps.your-subdomain.workers.dev/install.sh)"';
+  const mainCommand = 'sudo bash -c "$(curl -fsSL https://easyinstallvps.aidoor-co-in.workers.dev/install.sh)"';
   
   const html = `<!DOCTYPE html>
 <html lang="en">
