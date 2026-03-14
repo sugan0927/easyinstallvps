@@ -1,8 +1,8 @@
-name = "easyinstallvps"
+name = "easyinstall-php"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-# Environment Variables
+# Global variables
 [vars]
 APP_NAME = "EasyInstallPHP"
 APP_VERSION = "1.0.0"
@@ -10,18 +10,21 @@ GITHUB_REPO_OWNER = "sugan0927"
 GITHUB_REPO_NAME = "easyinstallvps"
 GITHUB_BRANCH = "main"
 
-# Production Environment
+# Production environment
 [env.production]
 vars = { ENVIRONMENT = "production" }
 
-# Development Environment
+# Development environment
 [env.development]
 vars = { ENVIRONMENT = "development" }
 
-# Remove or comment out routes if not needed
-# routes = [
-#   { pattern = "easyinstall.sugan.workers.dev/*", zone_id = "your-zone-id" }
-# ]
-
-# Compatibility Flags
+# Compatibility flags
 compatibility_flags = ["nodejs_compat"]
+
+# Node.js compatibility
+[build]
+command = "npm run build"
+upload.format = "modules"
+
+[build.upload]
+main = "./dist/index.js"
