@@ -2,11 +2,26 @@ name = "easyinstall-php"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# Environment Variables
 [vars]
-ENVIRONMENT = "production"
+APP_NAME = "EasyInstallPHP"
+APP_VERSION = "1.0.0"
+GITHUB_REPO_OWNER = "sugan0927"
+GITHUB_REPO_NAME = "easyinstallvps"
+GITHUB_BRANCH = "main"
 
+# Production Environment
 [env.production]
 vars = { ENVIRONMENT = "production" }
 
-[env.staging]
-vars = { ENVIRONMENT = "staging" }
+# Development Environment
+[env.development]
+vars = { ENVIRONMENT = "development" }
+
+# Routes Configuration
+routes = [
+  { pattern = "easyinstall.sugan.workers.dev/*", zone_id = null }
+]
+
+# Compatibility Flags
+compatibility_flags = ["nodejs_compat"]
