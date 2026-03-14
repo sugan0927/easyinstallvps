@@ -1,19 +1,10 @@
 {
   "name": "easyinstallvps",
   "version": "1.0.0",
-  "type": "module",
-  "description": "EasyInstallPHP on Cloudflare Workers",
   "main": "src/index.js",
   "scripts": {
-    "dev": "wrangler dev --node-compat",
-    "deploy": "wrangler deploy --node-compat",
-    "deploy:force": "wrangler deploy --node-compat --force",
-    "logs": "wrangler tail"
-  },
-  "dependencies": {
-    "@php-wasm/node": "^0.1.61",
-    "@php-wasm/web": "^0.1.61",
-    "php-wasm": "^0.0.8"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
   },
   "devDependencies": {
     "wrangler": "^4.73.0"
