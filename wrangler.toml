@@ -20,11 +20,3 @@ vars = { ENVIRONMENT = "development" }
 
 # Compatibility flags
 compatibility_flags = ["nodejs_compat"]
-
-# Node.js compatibility
-[build]
-command = "npm run build"
-upload.format = "modules"
-
-[build.upload]
-main = "./dist/index.js"
