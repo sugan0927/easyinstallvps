@@ -1,4 +1,4 @@
-name = "easyinstall-php"
+name = "easyinstallvps"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
@@ -18,10 +18,10 @@ vars = { ENVIRONMENT = "production" }
 [env.development]
 vars = { ENVIRONMENT = "development" }
 
-# Routes Configuration
-routes = [
-  { pattern = "easyinstall.sugan.workers.dev/*", zone_id = null }
-]
+# Remove or comment out routes if not needed
+# routes = [
+#   { pattern = "easyinstall.sugan.workers.dev/*", zone_id = "your-zone-id" }
+# ]
 
 # Compatibility Flags
 compatibility_flags = ["nodejs_compat"]
