@@ -1,9 +1,8 @@
-name = "easyinstall-php"
+name = "easyinstallvps"  # CI system के अनुसार नाम बदला
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-[vars]
-GITHUB_REPO_OWNER = "sugan0927"
-GITHUB_REPO_NAME = "easyinstallvps"
+# Node.js compatibility flags
+compatibility_flags = ["nodejs_compat", "nodejs_compat_v2"]
 
-compatibility_flags = ["nodejs_compat"]
+# बिना build section के सीधे deploy
