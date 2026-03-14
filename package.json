@@ -1,0 +1,21 @@
+{
+  "name": "easyinstall-php-worker",
+  "version": "1.0.0",
+  "description": "EasyInstallPHP on Cloudflare Workers",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "publish": "wrangler publish",
+    "logs": "wrangler tail"
+  },
+  "dependencies": {
+    "php-wasm": "^0.0.5"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "keywords": ["php", "cloudflare", "workers", "installer"],
+  "author": "sugan0927",
+  "license": "MIT"
+}
