@@ -1,18 +1,19 @@
 name = "easyinstallvps"
-main = "src/index.js"
-compatibility_date = "2025-01-01"
+main = "src/index.js"  # यह सही पाथ होना चाहिए
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
 
+# Global variables
 [vars]
-SITE_NAME = "EasyInstallVPS"
-VERSION = "7.0"
+APP_NAME = "EasyInstallVPS"
+APP_VERSION = "1.0.0"
 GITHUB_REPO_OWNER = "sugan0927"
 GITHUB_REPO_NAME = "easyinstallvps"
-GITHUB_BRANCH = "main"
 
-# R2 optional — files are embedded in worker now
-# If you want R2 for updated files without redeploying:
-# Step 1: wrangler r2 bucket create easyinstall-files
-# Step 2: Uncomment below
-# [[r2_buckets]]
-# binding = "FILES_BUCKET"
-# bucket_name = "easyinstall-files"
+# Production environment
+[env.production]
+vars = { ENVIRONMENT = "production" }
+
+# Development environment
+[env.development]
+vars = { ENVIRONMENT = "development" }
