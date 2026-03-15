@@ -1,8 +1,4 @@
 name = "easyinstallvps"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
-
-# Only use one compatibility flag
 compatibility_flags = ["nodejs_compat"]
-
-# No need for nodejs_compat_v2
