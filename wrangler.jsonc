@@ -1,0 +1,52 @@
+{
+  // EasyInstall VPS — Cloudflare Worker Config
+  // Deploy: wrangler deploy
+  "name": "easyinstall-vps",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+
+  // Environment variables — code में env.VAR_NAME से access होती हैं
+  "vars": {
+    "SITE_NAME":    "EasyInstallVPS",
+    "VERSION":      "7.0",
+    "GITHUB_RAW":   "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main"
+  },
+
+  // R2 Bucket — engine files store करने के लिए (optional, GitHub fallback है)
+  // Step 1: wrangler r2 bucket create easyinstall-files
+  // Step 2: Uncomment below
+  // "r2_buckets": [
+  //   {
+  //     "binding":     "FILES_BUCKET",
+  //     "bucket_name": "easyinstall-files"
+  //   }
+  // ],
+
+  // Custom domain (CF Dashboard में add करें)
+  // "routes": [
+  //   {
+  //     "pattern":   "easyinstallvps.yourdomain.com/*",
+  //     "zone_name": "yourdomain.com"
+  //   }
+  // ],
+
+  // Production environment
+  "env": {
+    "production": {
+      "name": "easyinstall-vps",
+      "vars": {
+        "SITE_NAME":  "EasyInstallVPS",
+        "VERSION":    "7.0",
+        "GITHUB_RAW": "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main"
+      }
+    },
+    "preview": {
+      "name": "easyinstall-vps-preview",
+      "vars": {
+        "SITE_NAME":  "EasyInstallVPS Preview",
+        "VERSION":    "7.0-preview",
+        "GITHUB_RAW": "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/dev"
+      }
+    }
+  }
+}
