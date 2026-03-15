@@ -1,34 +1,36 @@
-// src/index.js - EasyInstallVPS Cloudflare Worker
+// src/index.js - EasyInstallVPS Cloudflare Worker (FIXED VERSION)
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    
-    // Handle different paths
+    const path = url.pathname;
+
+    // 1. सबसे पहले /install.sh पाथ को हैंडल करें
+    if (path === '/install.sh' || path === '/install') {
+      return serveInstallScript();
+    }
+
+    // 2. दूसरे फाइल्स के लिए रूटिंग
     const files = {
       '/': 'index.html',
-      '/install': 'install.sh',
-      '/install.sh': 'install.sh',
-      '/master': 'install.sh',
-      '/easyinstall_wp.php': 'easyinstall_wp.php',
-      '/easyinstall_core.py': 'easyinstall_core.py',
-      '/easyinstall.sh': 'easyinstall.sh',
       '/wp': 'easyinstall_wp.php',
       '/python': 'easyinstall_core.py',
       '/shell': 'easyinstall.sh',
+      '/easyinstall_wp.php': 'easyinstall_wp.php',
+      '/easyinstall_core.py': 'easyinstall_core.py',
+      '/easyinstall.sh': 'easyinstall.sh',
       '/health': 'health',
       '/status': 'health'
     };
 
-    // Get requested file
-    const file = files[url.pathname];
-    
-    // Handle health check
+    const file = files[path];
+
+    // Health check
     if (file === 'health') {
-      return new Response(JSON.stringify({
+      return new Response(JSON.stringify({ 
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        worker: 'easyinstallvps',
-        version: '1.0.0'
+        worker: 'easyinstallvps'
       }), {
         headers: { 
           'Content-Type': 'application/json',
@@ -36,39 +38,18 @@ export default {
         }
       });
     }
-    
-    // Handle install script request
-    if (file === 'install.sh') {
-      return serveInstallScript();
+
+    // Redirect to GitHub for other files
+    if (file && file !== 'index.html') {
+      return Response.redirect(`https://raw.githubusercontent.com/sugan0927/easyinstallvps/main/${file}`, 302);
     }
-    
-    // Handle PHP file request
-    if (file === 'easyinstall_wp.php') {
-      return redirectToGitHub('easyinstall_wp.php');
-    }
-    
-    // Handle Python file request
-    if (file === 'easyinstall_core.py') {
-      return redirectToGitHub('easyinstall_core.py');
-    }
-    
-    // Handle Shell file request
-    if (file === 'easyinstall.sh') {
-      return redirectToGitHub('easyinstall.sh');
-    }
-    
+
     // Default: Serve main page
     return serveMainPage();
   }
 };
 
-// Function to redirect to GitHub raw content
-function redirectToGitHub(filename) {
-  const rawUrl = `https://raw.githubusercontent.com/sugan0927/easyinstallvps/main/${filename}`;
-  return Response.redirect(rawUrl, 302);
-}
-
-// Function to serve the master installation script
+// यह फंक्शन install.sh स्क्रिप्ट को सर्व करेगा
 function serveInstallScript() {
   const installScript = `#!/bin/bash
 
@@ -257,19 +238,18 @@ echo -e "  • \${YELLOW}cd /opt/easyinstallvps\${NC} - Go to installation direc
 echo ""
 echo -e "\${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\${NC}"
 echo -e "\${GREEN}🚀 To reinstall anytime, run:\${NC}"
-echo -e "\${YELLOW}sudo bash -c \"\$(curl -fsSL https://\$(curl -s ifconfig.me)/install.sh)\"\${NC}"
+echo -e "\${YELLOW}sudo bash -c \"\$(curl -fsSL https://easyinstallvps.aidoor-co-in.workers.dev/install.sh)\"\${NC}"
 echo -e "\${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\${NC}"
 `;
 
   return new Response(installScript, {
     headers: {
-      'Content-Type': 'text/plain;charset=UTF-8',
+      'Content-Type': 'text/plain; charset=utf-8',
       'Cache-Control': 'public, max-age=3600'
     }
   });
 }
 
-// Function to serve main HTML page
 function serveMainPage() {
   const mainCommand = 'sudo bash -c "$(curl -fsSL https://easyinstallvps.aidoor-co-in.workers.dev/install.sh)"';
   
@@ -590,7 +570,7 @@ function serveMainPage() {
         function copyCommand() {
             const command = document.getElementById('installCommand').innerText;
             navigator.clipboard.writeText(command).then(() => {
-                alert('✅ कमांड कॉपी हो गया!\n\nअब VPS पर पेस्ट करें और चलाएं:\n' + command);
+                alert('✅ कमांड कॉपी हो गया!\\n\\nअब VPS पर पेस्ट करें और चलाएं:\\n' + command);
             }).catch(() => {
                 // Fallback
                 const textarea = document.createElement('textarea');
