@@ -1299,11 +1299,32 @@ def cmd_self_update(args):
 def cmd_self_check(args):
     cyan("══════ Version Status ══════")
     def ver(cmd): return cmd_out(cmd) or "?"
-    print(f"  Nginx   : {ver('nginx -v 2>&1 | grep -oP [0-9]+\\.[0-9]+\\.[0-9]+')}")
-    print(f"  PHP     : {ver('php --version 2>/dev/null | head -1 | grep -oP [0-9]+\\.[0-9]+\\.[0-9]+')}")
-    print(f"  Redis   : {ver('redis-server --version 2>/dev/null | grep -oP v=\\K[0-9.]+')}")
-    print(f"  MariaDB : {ver('mysql --version 2>/dev/null | grep -oP Distrib\\ \\K[0-9.]+')}")
-    print(f"  WP-CLI  : {ver('wp --allow-root --version 2>/dev/null')}")
+    # FIX: Backslashes cannot appear inside f-string expressions (Python 3.11+).
+    # Extract commands into plain variables first, then embed in f-string.
+    nginx_cmd   = "nginx -v 2>&1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"
+    php_cmd     = "php --version 2>/dev/null | head -1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"
+    redis_cmd   = "redis-server --version 2>/dev/null | grep -oP 'v=\\K[0-9.]+'"
+    mariadb_cmd = "mysql --version 2>/dev/null | grep -oP 'Distrib \\K[0-9.]+'"
+    wpcli_cmd   = "wp --allow-root --version 2>/dev/null"
+    nginx_v   = ver(nginx_cmd)
+    php_v     = ver(php_cmd)
+    redis_v   = ver(redis_cmd)
+    mariadb_v = ver(mariadb_cmd)
+    wpcli_v   = ver(wpcli_cmd)
+    certbot_v = ver("certbot --version 2>/dev/null | awk '{print $2}'")
+    python_v  = ver("python3 --version 2>/dev/null | awk '{print $2}'")
+    print(f"  Nginx   : {nginx_v}")
+    print(f"  PHP     : {php_v}")
+    print(f"  Redis   : {redis_v}")
+    print(f"  MariaDB : {mariadb_v}")
+    print(f"  WP-CLI  : {wpcli_v}")
+    print(f"  Certbot : {certbot_v}")
+    print(f"  Python  : {python_v}")
+    # Show active PHP versions
+    for v in ["8.4", "8.3", "8.2", "8.1"]:
+        if svc_active(f"php{v}-fpm"):
+            sock_ok = "✅" if php_sock(v).exists() else "❌"
+            print(f"  PHP{v}-FPM : ✅  socket {sock_ok}")
 
 # =============================================================================
 # BACKUP
@@ -1327,7 +1348,7 @@ def cmd_backup(args):
 def cmd_optimize(args):
     step("Running optimization")
     run("mysqlcheck --auto-repair --all-databases --silent 2>/dev/null || true", check=False)
-    run("php {PHP_HELPER} optimize-tables 2>/dev/null || true", check=False)
+    run(f"php {PHP_HELPER} optimize-tables 2>/dev/null || true", check=False)
     for v in ["8.4","8.3","8.2"]:
         if svc_active(f"php{v}-fpm"): svc_reload(f"php{v}-fpm")
     ok("Optimization complete")
