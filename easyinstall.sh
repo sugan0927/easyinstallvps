@@ -94,6 +94,11 @@ AI:
 
 PAGESPEED:
   easyinstall pagespeed [optimize|score|report|images] domain.com
+
+TROUBLESHOOT:
+  easyinstall fix-apache            — Apache2 हटाएं, Nginx restore करें (502 fix)
+  easyinstall fix-nginx             — Same as fix-apache (alias)
+  easyinstall self-heal 502         — 502 Bad Gateway auto-fix
 ═══════════════════════════════════════════════
 HELP
 }
@@ -189,6 +194,10 @@ case "$CMD" in
     ai-setup)    _bootstrap; _need_python; _py ai-setup ;;
 
     pagespeed) _need_root; _bootstrap; _need_python; _need_php; _py pagespeed "$@" ;;
+
+    fix-apache|fix-nginx)
+        _need_root; _bootstrap; _need_python
+        _py fix-apache "$@" ;;
 
     help|--help|-h) _help ;;
     *)

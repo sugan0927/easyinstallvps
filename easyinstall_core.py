@@ -185,6 +185,24 @@ def cmd_install(args):
     os_id, os_ver, codename = detect_os()
     ok(f"OS: {os_id} {os_ver} ({codename})")
 
+    # FIX: सबसे पहले Apache2 हटाएं — यह PHP के साथ install होकर port 80 block करता है
+    # Nginx से पहले यह करना जरूरी है
+    step("Pre-install: Removing Apache2 to free port 80")
+    run("systemctl stop apache2 2>/dev/null || true", check=False)
+    run("systemctl disable apache2 2>/dev/null || true", check=False)
+    run("DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php* 2>/dev/null || true", check=False)
+    run("apt-get autoremove -y 2>/dev/null || true", check=False)
+    run("rm -rf /etc/apache2 2>/dev/null || true", check=False)
+    ok("Apache2 purged — port 80 is free")
+
+    # Apache को apt से block करें ताकि PHP install में वापस न आए
+    Path("/etc/apt/preferences.d/block-apache2.pref").write_text(textwrap.dedent("""\
+        Package: apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php*
+        Pin: release *
+        Pin-Priority: -1
+    """))
+    ok("Apache2 blocked in apt — will not auto-install again")
+
     T = ram_tune()
     ok(f"Tuning: PHP children={T['php_children']}  MySQL={T['mysql_buf']}  Redis={T['redis_mem']}")
 
@@ -255,6 +273,24 @@ def _kernel_tuning():
 # ── Nginx install ─────────────────────────────────────────────────────────────
 def _install_nginx(os_id, codename, T):
     step("Installing Nginx (official repo)")
+
+    # FIX: Apache2 को पूरी तरह हटाएं — यह PHP install के साथ आता है और port 80 block करता है
+    step("Removing Apache2 if present (conflicts with Nginx on port 80)")
+    run("systemctl stop apache2 2>/dev/null || true", check=False)
+    run("systemctl disable apache2 2>/dev/null || true", check=False)
+    run("apt-get remove -y --purge apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php* 2>/dev/null || true", check=False)
+    run("apt-get autoremove -y 2>/dev/null || true", check=False)
+    # Apache की कोई भी leftover config हटाएं
+    run("rm -rf /etc/apache2 2>/dev/null || true", check=False)
+    ok("Apache2 removed — port 80 is now free")
+
+    # FIX: Port 80 पर कोई और process है तो उसे भी बंद करें
+    port80_pid = cmd_out("ss -tlnp 2>/dev/null | grep ':80 ' | grep -oP 'pid=\\K[0-9]+'")
+    if port80_pid:
+        warn(f"Port 80 in use by PID {port80_pid} — killing it")
+        run(f"kill -9 {port80_pid} 2>/dev/null || true", check=False)
+        import time; time.sleep(2)
+
     run("apt-get remove -y nginx nginx-common nginx-full nginx-core 2>/dev/null || true", check=False)
     run("curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg")
     repo = f"deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/{os_id} {codename} nginx"
@@ -310,12 +346,35 @@ def _install_nginx(os_id, codename, T):
         }}
     """))
     run("systemctl enable nginx && systemctl start nginx")
-    wait_svc("nginx", 30)
-    ok("Nginx installed")
+    # FIX: Start के बाद verify करें
+    import time as _t; _t.sleep(2)
+    if not svc_active("nginx"):
+        # एक बार और Apache check करें
+        run("systemctl stop apache2 2>/dev/null || true", check=False)
+        run("apt-get remove -y --purge apache2 apache2-bin apache2-data 2>/dev/null || true", check=False)
+        run("apt-get autoremove -y 2>/dev/null || true", check=False)
+        run("systemctl start nginx 2>/dev/null || true", check=False)
+        _t.sleep(3)
+    if not wait_svc("nginx", 30):
+        # Nginx error log देखें
+        log_tail = cmd_out("journalctl -u nginx --no-pager -n 20 2>/dev/null")
+        warn(f"Nginx may not have started. Check: journalctl -u nginx\n{log_tail}")
+    else:
+        ok("Nginx installed and running")
 
 # ── PHP install ───────────────────────────────────────────────────────────────
 def _install_php(os_id, codename, T):
     step("Installing PHP (Sury/Ondrej repo)")
+
+    # FIX: Apache2 को पहले ही block करें — PHP install के साथ Apache आने से रोकें
+    # /etc/apt/preferences.d/ में Apache को pin करके hold करें
+    Path("/etc/apt/preferences.d/block-apache2.pref").write_text(textwrap.dedent("""\
+        Package: apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php*
+        Pin: release *
+        Pin-Priority: -1
+    """))
+    info("Apache2 blocked via apt preferences — will not be auto-installed")
+
     if os_id == "debian":
         run("apt-get install -y apt-transport-https lsb-release ca-certificates curl wget")
         run("wget -qO- https://packages.sury.org/php/apt.gpg | gpg --dearmor > /etc/apt/trusted.gpg.d/sury-php.gpg")
@@ -326,13 +385,16 @@ def _install_php(os_id, codename, T):
 
     installed = False
     for ver in ["8.4", "8.3", "8.2"]:
+        # FIX: --no-install-recommends से Apache automatically नहीं आएगा
         pkgs = " ".join(f"php{ver}-{e}" for e in [
             "fpm","mysql","curl","gd","mbstring","xml","xmlrpc","zip",
             "soap","intl","bcmath","redis","opcache","readline","apcu","igbinary"
         ])
-        if run_ok(f"apt-get install -y {pkgs}"):
+        if run_ok(f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {pkgs}"):
             installed = True
             info(f"PHP {ver} installed")
+            # FIX: Install के बाद Apache फिर से आया हो तो हटाएं
+            run("apt-get remove -y --purge apache2 apache2-bin apache2-data 2>/dev/null || true", check=False)
             break
 
     if not installed:
@@ -1059,6 +1121,15 @@ def cmd_self_heal(args):
 
     def _heal_nginx():
         step("Healing Nginx")
+        # FIX: Apache2 check — अगर चल रहा है तो बंद करें
+        if run_ok("systemctl is-active --quiet apache2 2>/dev/null"):
+            warn("Apache2 is running on port 80 — stopping and removing it")
+            run("systemctl stop apache2 2>/dev/null || true", check=False)
+            run("systemctl disable apache2 2>/dev/null || true", check=False)
+            run("apt-get remove -y --purge apache2 apache2-bin apache2-data 2>/dev/null || true", check=False)
+            run("apt-get autoremove -y 2>/dev/null || true", check=False)
+            ok("Apache2 removed — port 80 freed")
+
         if not run_ok("nginx -t 2>/dev/null"):
             # Fix socket paths
             running_php = detect_php()
@@ -1145,6 +1216,17 @@ def cmd_self_heal(args):
 
     def _heal_502():
         step("Fixing 502 Bad Gateway")
+        # FIX: Apache2 port 80 block कर रहा हो तो हटाएं
+        if run_ok("systemctl is-active --quiet apache2 2>/dev/null"):
+            warn("Apache2 is running — this causes 502. Removing...")
+            run("systemctl stop apache2 2>/dev/null || true", check=False)
+            run("systemctl disable apache2 2>/dev/null || true", check=False)
+            run("apt-get remove -y --purge apache2 apache2-bin apache2-data libapache2-mod-php* 2>/dev/null || true", check=False)
+            run("apt-get autoremove -y 2>/dev/null || true", check=False)
+            ok("Apache2 removed — port 80 freed")
+        # Port 80 free है तो Nginx start करें
+        if not svc_active("nginx"):
+            run("systemctl start nginx 2>/dev/null || true", check=False)
         _heal_php()
         running_php = detect_php()
         correct_sock = f"/run/php/php{running_php}-fpm.sock"
@@ -1434,6 +1516,58 @@ def cmd_pagespeed(args):
         run(f"php {PHP_HELPER} pagespeed-report {domain} 2>/dev/null || true", check=False)
 
 # =============================================================================
+# FIX-APACHE — Apache conflict को permanently fix करें
+# =============================================================================
+def cmd_fix_apache(args):
+    """Apache2 को हटाकर Nginx को port 80 पर restore करें"""
+    cyan("\n══════ Apache2 Conflict Fix ══════")
+    step("Stopping and removing Apache2")
+
+    # 1. Apache stop + disable + purge
+    run("systemctl stop apache2 2>/dev/null || true", check=False)
+    run("systemctl disable apache2 2>/dev/null || true", check=False)
+    run("DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php* 2>/dev/null || true", check=False)
+    run("apt-get autoremove -y 2>/dev/null || true", check=False)
+    run("rm -rf /etc/apache2 2>/dev/null || true", check=False)
+    ok("Apache2 purged")
+
+    # 2. Apache को apt से block करें
+    Path("/etc/apt/preferences.d/block-apache2.pref").write_text(textwrap.dedent("""\
+        Package: apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php*
+        Pin: release *
+        Pin-Priority: -1
+    """))
+    ok("Apache2 blocked in apt preferences")
+
+    # 3. Port 80 free है — Nginx start करें
+    step("Starting Nginx on port 80")
+    if not run_ok("nginx -t 2>/dev/null"):
+        warn("Nginx config has errors — run: nginx -t")
+    else:
+        run("systemctl start nginx 2>/dev/null || true", check=False)
+        run("systemctl enable nginx 2>/dev/null || true", check=False)
+        import time as _t; _t.sleep(2)
+        if svc_active("nginx"):
+            ok("Nginx is running on port 80")
+        else:
+            err("Nginx still not running — check: journalctl -u nginx -n 30")
+            return
+
+    # 4. PHP-FPM restart करें
+    step("Restarting PHP-FPM")
+    for v in ["8.4", "8.3", "8.2"]:
+        if Path(f"/etc/php/{v}").exists():
+            run(f"systemctl restart php{v}-fpm 2>/dev/null || true", check=False)
+            fix_sock(v)
+            if svc_active(f"php{v}-fpm"):
+                ok(f"PHP {v}-FPM running")
+
+    ok("Apache fix complete — site should be accessible now")
+    info("Test: curl -I http://localhost")
+    info("If still 502: easyinstall self-heal 502")
+
+
+# =============================================================================
 # MAIN DISPATCH
 # =============================================================================
 COMMANDS = {
@@ -1474,6 +1608,8 @@ COMMANDS = {
     "ai-setup":     cmd_ai_setup,
     "ai-optimize":  cmd_ai_optimize,
     "pagespeed":    cmd_pagespeed,
+    "fix-apache":   cmd_fix_apache,
+    "fix-nginx":    cmd_fix_apache,  # alias
 }
 
 if __name__ == "__main__":
