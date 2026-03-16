@@ -1299,18 +1299,13 @@ def cmd_self_update(args):
 def cmd_self_check(args):
     cyan("══════ Version Status ══════")
     def ver(cmd): return cmd_out(cmd) or "?"
-    # FIX: Backslashes cannot appear inside f-string expressions (Python 3.11+).
-    # Extract commands into plain variables first, then embed in f-string.
-    nginx_cmd   = "nginx -v 2>&1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"
-    php_cmd     = "php --version 2>/dev/null | head -1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'"
-    redis_cmd   = "redis-server --version 2>/dev/null | grep -oP 'v=\\K[0-9.]+'"
-    mariadb_cmd = "mysql --version 2>/dev/null | grep -oP 'Distrib \\K[0-9.]+'"
-    wpcli_cmd   = "wp --allow-root --version 2>/dev/null"
-    nginx_v   = ver(nginx_cmd)
-    php_v     = ver(php_cmd)
-    redis_v   = ver(redis_cmd)
-    mariadb_v = ver(mariadb_cmd)
-    wpcli_v   = ver(wpcli_cmd)
+    # FIX: Backslashes cannot appear inside f-string expressions (Python 3.11+)
+    # Store command outputs in variables first, then use them in f-strings
+    nginx_v   = ver("nginx -v 2>&1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'")
+    php_v     = ver("php --version 2>/dev/null | head -1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'")
+    redis_v   = ver("redis-server --version 2>/dev/null | grep -oP 'v=\\K[0-9.]+'")
+    mariadb_v = ver("mysql --version 2>/dev/null | grep -oP 'Distrib \\K[0-9.]+'")
+    wpcli_v   = ver("wp --allow-root --version 2>/dev/null")
     certbot_v = ver("certbot --version 2>/dev/null | awk '{print $2}'")
     python_v  = ver("python3 --version 2>/dev/null | awk '{print $2}'")
     print(f"  Nginx   : {nginx_v}")
