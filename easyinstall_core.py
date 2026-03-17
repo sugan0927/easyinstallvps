@@ -384,8 +384,8 @@ def _install_php(os_id, codename, T):
     run("apt-get update -y")
 
     installed = False
-    for ver in ["8.4", "8.3", "8.2"]:
-        # FIX: --no-install-recommends से Apache automatically नहीं आएगा
+    # Install ALL available PHP versions (8.1, 8.2, 8.3, 8.4)
+    for ver in ["8.4", "8.3", "8.2", "8.1"]:
         pkgs = " ".join(f"php{ver}-{e}" for e in [
             "fpm","mysql","curl","gd","mbstring","xml","xmlrpc","zip",
             "soap","intl","bcmath","redis","opcache","readline","apcu","igbinary"
@@ -393,14 +393,14 @@ def _install_php(os_id, codename, T):
         if run_ok(f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {pkgs}"):
             installed = True
             info(f"PHP {ver} installed")
-            # FIX: Install के बाद Apache फिर से आया हो तो हटाएं
+            # After each install, ensure Apache wasn't pulled in
             run("apt-get remove -y --purge apache2 apache2-bin apache2-data 2>/dev/null || true", check=False)
-            break
+            # Don't break — install all versions
 
     if not installed:
         raise RuntimeError("PHP installation failed for all versions")
 
-    for ver in ["8.4", "8.3", "8.2"]:
+    for ver in ["8.4", "8.3", "8.2", "8.1"]:
         php_dir = Path(f"/etc/php/{ver}")
         if not php_dir.exists(): continue
         _configure_php(ver, T)
@@ -1061,7 +1061,7 @@ def cmd_redis_ports(args):
 def cmd_status(args):
     cyan("══════ System Status ══════")
     services = ["nginx", "mariadb", "redis-server", "fail2ban",
-                "php8.4-fpm", "php8.3-fpm", "php8.2-fpm"]
+                "php8.4-fpm", "php8.3-fpm", "php8.2-fpm", "php8.1-fpm"]
     for svc in services:
         active = svc_active(svc)
         print(f"  {'✅' if active else '❌'}  {svc}")
@@ -1150,7 +1150,7 @@ def cmd_self_heal(args):
 
     def _heal_php():
         step("Healing PHP-FPM")
-        for ver in ["8.4", "8.3", "8.2"]:
+        for ver in ["8.4", "8.3", "8.2", "8.1"]:
             if not Path(f"/etc/php/{ver}").exists(): continue
             if not svc_active(f"php{ver}-fpm"):
                 svc_restart(f"php{ver}-fpm"); time.sleep(2)
@@ -1265,8 +1265,8 @@ def cmd_self_update(args):
 
     def _upd_php():
         step("Updating PHP")
-        run("apt-get install -y --only-upgrade php8.4-fpm php8.3-fpm php8.2-fpm 2>/dev/null || true", check=False)
-        for v in ["8.4","8.3","8.2"]:
+        run("apt-get install -y --only-upgrade php8.4-fpm php8.3-fpm php8.2-fpm php8.1-fpm 2>/dev/null || true", check=False)
+        for v in ["8.4","8.3","8.2","8.1"]:
             if svc_active(f"php{v}-fpm"): svc_restart(f"php{v}-fpm")
         ok("PHP updated")
 
@@ -1299,8 +1299,7 @@ def cmd_self_update(args):
 def cmd_self_check(args):
     cyan("══════ Version Status ══════")
     def ver(cmd): return cmd_out(cmd) or "?"
-    # FIX: Backslashes cannot appear inside f-string expressions (Python 3.11+)
-    # Store command outputs in variables first, then use them in f-strings
+    # Pre-compute all values first — backslashes not allowed inside f-string expressions
     nginx_v   = ver("nginx -v 2>&1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'")
     php_v     = ver("php --version 2>/dev/null | head -1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+'")
     redis_v   = ver("redis-server --version 2>/dev/null | grep -oP 'v=\\K[0-9.]+'")
@@ -1315,12 +1314,11 @@ def cmd_self_check(args):
     print(f"  WP-CLI  : {wpcli_v}")
     print(f"  Certbot : {certbot_v}")
     print(f"  Python  : {python_v}")
-    # Show active PHP versions
+    # Show all active PHP versions
     for v in ["8.4", "8.3", "8.2", "8.1"]:
         if svc_active(f"php{v}-fpm"):
             sock_ok = "✅" if php_sock(v).exists() else "❌"
             print(f"  PHP{v}-FPM : ✅  socket {sock_ok}")
-
 # =============================================================================
 # BACKUP
 # =============================================================================
@@ -1344,7 +1342,7 @@ def cmd_optimize(args):
     step("Running optimization")
     run("mysqlcheck --auto-repair --all-databases --silent 2>/dev/null || true", check=False)
     run(f"php {PHP_HELPER} optimize-tables 2>/dev/null || true", check=False)
-    for v in ["8.4","8.3","8.2"]:
+    for v in ["8.4","8.3","8.2","8.1"]:
         if svc_active(f"php{v}-fpm"): svc_reload(f"php{v}-fpm")
     ok("Optimization complete")
 
@@ -1571,7 +1569,7 @@ def cmd_fix_apache(args):
 
     # 4. PHP-FPM restart करें
     step("Restarting PHP-FPM")
-    for v in ["8.4", "8.3", "8.2"]:
+    for v in ["8.4", "8.3", "8.2", "8.1"]:
         if Path(f"/etc/php/{v}").exists():
             run(f"systemctl restart php{v}-fpm 2>/dev/null || true", check=False)
             fix_sock(v)
