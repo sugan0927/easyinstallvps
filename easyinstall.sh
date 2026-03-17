@@ -1,1165 +1,487 @@
 #!/bin/bash
-# =============================================================================
-# EasyInstall v7.1 — Full Feature Orchestrator
-# Merges v7.0 Python engine architecture + all v6.7 advanced features
-#
-# Architecture:
-#   Bash (this file)  → Python core engine  → PHP WP helper
-#                     → Bash module files   (AI, AutoTune, ML, Serverless, Sharding, PageSpeed)
-#
-# Features from v6.7 fully integrated:
-#   ✅ Self-Heal Engine v1.0  (services/configs/ssl/disk/wp/502)
-#   ✅ Self-Update Engine     (nginx/php/redis/mariadb/wpcli/script/all)
-#   ✅ Self-Check / Version Report (installed vs latest with update indicators)
-#   ✅ AI Module              (diagnose/optimize/security/report/setup/ollama)
-#   ✅ Advanced AutoTune      (10-phase: advanced-tune/perf-dashboard/warm-cache/db-optimize/wp-speed)
-#   ✅ Machine Learning       (ml-train/predict/status/model-list)
-#   ✅ Serverless Functions   (fn-deploy/invoke/list/delete/logs)
-#   ✅ Database Sharding      (shard-init/status/rebalance/add)
-#   ✅ PageSpeed Module       (optimize/score/autofix/report/all/images)
-#   ✅ WebSocket Support      (ws-enable/disable/status/test) — enhanced awk injection
-#   ✅ HTTP/3 + QUIC          (http3-enable/status)
-#   ✅ Edge Computing         (edge-setup/status/purge) — with geo per-site health
-#   ✅ Governor / Disaster Recovery (install-governor/emergency-check/autotune-rollback)
-#   ✅ nginx-extras / backup-site / redis-cli
-#   ✅ Ollama local AI install
-#
-# Compatible: Debian 12, Ubuntu 22.04/24.04  |  RAM 512 MB – 16 GB
-# =============================================================================
+# ==============================================
+# EasyInstall VPS - Master Installation Script
+# Version: 7.0 FINAL (Self-Contained)
+# Engine files embedded — zero external dependencies
+# Author: sugan0927
+# ==============================================
 set -eE
-trap 'echo -e "\033[0;31m❌ Error at line $LINENO (cmd: $BASH_COMMAND)\033[0m" >&2; exit 1' ERR
+trap 'echo -e "\033[0;31m❌ Error at line $LINENO\033[0m" >&2' ERR
 
-VERSION="7.1"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Configuration
+WORK_DIR="/opt/easyinstallvps"
 LIB_DIR="/usr/local/lib/easyinstall"
-PYTHON_ENGINE="$LIB_DIR/core.py"
-PHP_HELPER="$LIB_DIR/wp_helper.php"
+BIN_PATH="/usr/local/bin/easyinstall"
 
-# ─── Color codes ─────────────────────────────────────────────────────────────
-G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'
-B='\033[0;34m'; C='\033[0;36m'; P='\033[0;35m'; N='\033[0m'
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
+WHITE='\033[1;37m'; NC='\033[0m'
 
-# ─── Self-heal / self-update log + state paths ───────────────────────────────
-EI_SELF_LOG="/var/log/easyinstall/selfheal.log"
-EI_SELF_STATE="/var/lib/easyinstall/selfheal.state"
-EI_SELF_VERSIONS="/var/lib/easyinstall/versions.cache"
-
-# ─── Logging helpers ─────────────────────────────────────────────────────────
-sh_log() {
-    local level="$1"; shift
-    local msg="$*"
-    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
-    mkdir -p /var/log/easyinstall /var/lib/easyinstall 2>/dev/null || true
-    echo "[$ts] [$level] $msg" >> "$EI_SELF_LOG"
-    case "$level" in
-        SUCCESS) echo -e "${G}✅ $msg${N}" ;;
-        ERROR)   echo -e "${R}❌ $msg${N}" ;;
-        WARN)    echo -e "${Y}⚠️  $msg${N}" ;;
-        STEP)    echo -e "${P}🔷 $msg${N}" ;;
-        FIX)     echo -e "${C}🔧 $msg${N}" ;;
-        *)       echo -e "${B}ℹ️  $msg${N}" ;;
-    esac
-}
-
-# =============================================================================
-# BOOTSTRAP — install engine files on first run
-# =============================================================================
-_bootstrap() {
-    [ -f "$PYTHON_ENGINE" ] && [ -f "$PHP_HELPER" ] && return 0
-    echo -e "${Y}⚙  First run — installing EasyInstall engine...${N}"
-    mkdir -p "$LIB_DIR" /var/log/easyinstall /var/lib/easyinstall
-    for f in easyinstall_core.py easyinstall_wp.php; do
-        src="$SCRIPT_DIR/$f"
-        [ -f "$src" ] || { echo -e "${R}❌ Missing engine file: $src${N}"; exit 1; }
-    done
-    cp "$SCRIPT_DIR/easyinstall_core.py" "$PYTHON_ENGINE" && chmod +x "$PYTHON_ENGINE"
-    cp "$SCRIPT_DIR/easyinstall_wp.php"  "$PHP_HELPER"
-    echo -e "${G}✅ Engine installed to $LIB_DIR${N}"
-}
-
-_need_root()   { [ "$EUID" -eq 0 ] || { echo -e "${R}❌ Run as root${N}"; exit 1; }; }
-_need_python() { command -v python3 >/dev/null 2>&1 || apt-get install -y python3 --quiet; }
-_need_php()    { command -v php    >/dev/null 2>&1 || apt-get install -y php-cli --quiet 2>/dev/null || true; }
-
-_py()  { python3 "$PYTHON_ENGINE" "$@"; }
-_php() { php     "$PHP_HELPER"    "$@"; }
-
-# =============================================================================
-# SECTION A — VERSION DISCOVERY (from v6.7 sh_fetch_versions / sh_version_report)
-# =============================================================================
-sh_get_latest_nginx() {
-    local ver
-    ver=$(curl -sf --max-time 8 "https://nginx.org/en/CHANGES" 2>/dev/null \
-        | grep -oP 'Changes with nginx \K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    [ -z "$ver" ] && ver=$(curl -sf --max-time 8 "https://nginx.org/en/download.html" 2>/dev/null \
-        | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' | head -1)
-    echo "${ver:-unknown}"
-}
-
-sh_get_latest_php() {
-    apt-cache show php8.4-fpm 2>/dev/null | grep -q "^Package:" && echo "8.4" && return
-    apt-cache show php8.3-fpm 2>/dev/null | grep -q "^Package:" && echo "8.3" && return
-    echo "8.2"
-}
-
-sh_get_latest_redis() {
-    local ver
-    ver=$(curl -sf --max-time 8 "https://raw.githubusercontent.com/redis/redis/unstable/00-RELEASENOTES" 2>/dev/null \
-        | grep -oP 'Redis \K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    [ -z "$ver" ] && ver=$(redis-server --version 2>/dev/null | grep -oP 'v=\K[0-9.]+' | head -1)
-    echo "${ver:-unknown}"
-}
-
-sh_get_latest_mariadb() {
-    local ver
-    ver=$(curl -sf --max-time 8 "https://downloads.mariadb.com/MariaDB/mariadb_repo_setup" 2>/dev/null \
-        | grep -oP 'mariadb-\K[0-9]+\.[0-9]+' | sort -V | tail -1)
-    [ -z "$ver" ] && ver=$(mysql --version 2>/dev/null | grep -oP 'Distrib \K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    echo "${ver:-11.4}"
-}
-
-sh_fetch_versions() {
-    sh_log "STEP" "Discovering latest stable versions..."
-    mkdir -p /var/lib/easyinstall
-
-    local nginx_latest php_latest redis_latest mariadb_latest
-    nginx_latest=$(sh_get_latest_nginx)
-    php_latest=$(sh_get_latest_php)
-    redis_latest=$(sh_get_latest_redis)
-    mariadb_latest=$(sh_get_latest_mariadb)
-
-    local nginx_installed php_installed redis_installed mariadb_installed wpcli_installed
-    nginx_installed=$(nginx -v 2>&1 | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    php_installed=$(php --version 2>/dev/null | grep -oP '^PHP \K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    redis_installed=$(redis-server --version 2>/dev/null | grep -oP 'v=\K[0-9.]+' | head -1)
-    mariadb_installed=$(mysql --version 2>/dev/null | grep -oP 'Distrib \K[0-9.]+' | head -1)
-    wpcli_installed=$(wp --allow-root --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-
-    cat > "$EI_SELF_VERSIONS" << VEOF
-# EasyInstall version cache — $(date)
-NGINX_LATEST="$nginx_latest"
-NGINX_INSTALLED="$nginx_installed"
-PHP_LATEST="$php_latest"
-PHP_INSTALLED="$php_installed"
-REDIS_LATEST="$redis_latest"
-REDIS_INSTALLED="$redis_installed"
-MARIADB_LATEST="$mariadb_latest"
-MARIADB_INSTALLED="$mariadb_installed"
-WPCLI_INSTALLED="$wpcli_installed"
-LAST_CHECK="$(date +%s)"
-VEOF
-    sh_log "SUCCESS" "Version cache saved: $EI_SELF_VERSIONS"
-}
-
-sh_version_report() {
-    [ -f "$EI_SELF_VERSIONS" ] && . "$EI_SELF_VERSIONS" || { sh_fetch_versions; . "$EI_SELF_VERSIONS"; }
-
-    echo -e "\n${C}╔══════════════════════════════════════════════════════╗${N}"
-    echo -e "${C}║       EasyInstall v${VERSION} — Version Status             ║${N}"
-    echo -e "${C}╚══════════════════════════════════════════════════════╝${N}"
-
-    _ver_row() {
-        local name="$1" installed="$2" latest="$3"
-        local icon
-        if   [ -z "$installed" ] || [ "$installed" = "unknown" ]; then
-            icon="${R}✗ not found${N}"
-        elif [ "$installed" = "$latest" ] || [ -z "$latest" ] || [ "$latest" = "unknown" ]; then
-            icon="${G}✓ up to date${N}"
-        else
-            icon="${Y}↑ update available ($latest)${N}"
-        fi
-        printf "  %-12s  installed: %-14s  latest: %-12s  " "$name" "${installed:-none}" "${latest:-unknown}"
-        echo -e "$icon"
-    }
-
+print_banner() {
+    clear
+    echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${GREEN}                    EasyInstall VPS v7.0                     ${BLUE}║${NC}"
+    echo -e "${BLUE}║${YELLOW}           Complete VPS Setup - WordPress + LEMP            ${BLUE}║${NC}"
+    echo -e "${BLUE}║${WHITE}              Self-Contained — Zero Dependencies              ${BLUE}║${NC}"
+    echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    _ver_row "Nginx"    "$NGINX_INSTALLED"   "$NGINX_LATEST"
-    _ver_row "PHP"      "$PHP_INSTALLED"     "$PHP_LATEST"
-    _ver_row "Redis"    "$REDIS_INSTALLED"   "$REDIS_LATEST"
-    _ver_row "MariaDB"  "$MARIADB_INSTALLED" "$MARIADB_LATEST"
-    _ver_row "WP-CLI"   "$WPCLI_INSTALLED"   "latest"
-    echo ""
-
-    local age=$(( $(date +%s) - ${LAST_CHECK:-0} ))
-    echo -e "  ${B}Cache age: ${age}s  |  File: $EI_SELF_VERSIONS${N}\n"
 }
-
-# =============================================================================
-# SECTION B — SELF-HEAL ENGINE (from v6.7 sh_heal_* functions)
-# =============================================================================
-sh_heal_service() {
-    local svc="$1" max="${2:-3}"
-    systemctl list-units --type=service --all 2>/dev/null | grep -q "${svc}.service" || {
-        sh_log "INFO" "$svc not installed — skipping"; return 0
-    }
-    systemctl is-active --quiet "$svc" 2>/dev/null && { sh_log "INFO" "$svc healthy"; return 0; }
-    sh_log "WARN" "$svc is down — auto-healing"
-    local i=1
-    while [ "$i" -le "$max" ]; do
-        sh_log "FIX" "Restart attempt $i/$max for $svc"
-        systemctl restart "$svc" 2>/dev/null && sleep 2
-        systemctl is-active --quiet "$svc" 2>/dev/null && { sh_log "SUCCESS" "$svc restored"; return 0; }
-        i=$(( i + 1 )); sleep $(( i * 2 ))
-    done
-    sh_log "ERROR" "$svc failed after $max attempts"
-    journalctl -u "$svc" --no-pager -n 20 2>/dev/null >> "$EI_SELF_LOG" || true
-    return 1
+print_section() {
+    echo ""; echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}► $1${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo ""
 }
+print_success() { echo -e "${GREEN}✅ $1${NC}"; }
+print_info()    { echo -e "${YELLOW}ℹ️  $1${NC}"; }
+print_error()   { echo -e "${RED}❌ $1${NC}"; }
+print_warning() { echo -e "${MAGENTA}⚠️  $1${NC}"; }
 
-sh_heal_nginx() {
-    sh_log "STEP" "Nginx self-heal"
-    if ! nginx -t 2>/dev/null; then
-        sh_log "FIX" "Nginx config invalid — auto-fixing"
-        local broken; broken=$(nginx -t 2>&1 | grep -oP '/etc/nginx/sites-enabled/\S+' | head -1)
-        [ -n "$broken" ] && [ -f "$broken" ] && mv "$broken" "${broken}.broken.$(date +%s)" 2>/dev/null || true
-        find /etc/nginx/sites-enabled/ -type l ! -e {} -delete 2>/dev/null || true
-        if ! nginx -t 2>/dev/null; then
-            sh_log "WARN" "Creating minimal fallback nginx.conf"
-            cat > /etc/nginx/conf.d/easyinstall-fallback.conf << 'NGXFB'
-# EasyInstall fallback — self-heal generated
-server {
-    listen 80 default_server;
-    root /var/www/html;
-    index index.php index.html;
-    server_name _;
-    location / { try_files $uri $uri/ =404; }
-}
-NGXFB
-        fi
+check_root() {
+    print_section "Checking Privileges"
+    if [[ $EUID -ne 0 ]]; then
+        print_error "Run as root: sudo bash install.sh"; exit 1
     fi
-    local workers; workers=$(nproc 2>/dev/null || echo 1)
-    grep -q "worker_processes ${workers}" /etc/nginx/nginx.conf 2>/dev/null || \
-        sed -i "s/^worker_processes.*/worker_processes ${workers};/" /etc/nginx/nginx.conf 2>/dev/null || true
-    for d in /var/cache/nginx /var/log/nginx; do
-        [ -d "$d" ] && chown -R nginx:nginx "$d" 2>/dev/null || true
-    done
-    sh_heal_service "nginx"
+    print_success "Running as root"
 }
 
-sh_heal_php() {
-    sh_log "STEP" "PHP-FPM self-heal"
-    local v
-    for v in 8.4 8.3 8.2; do
-        systemctl list-units --type=service --all 2>/dev/null | grep -q "php${v}-fpm" || continue
-        local sock="/run/php/php${v}-fpm.sock"
-        "php${v}-fpm" --test 2>/dev/null || {
-            sh_log "FIX" "PHP $v config invalid — resetting pool"
-            cat > "/etc/php/${v}/fpm/pool.d/www.conf" << PHPPOOL
-[www]
-user = www-data
-group = www-data
-listen = $sock
-listen.owner = www-data
-listen.group = www-data
-listen.mode = 0660
-pm = dynamic
-pm.max_children = 10
-pm.start_servers = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-pm.max_requests = 500
-PHPPOOL
-        }
-        sh_heal_service "php${v}-fpm"
-        [ -S "$sock" ] && chmod 660 "$sock" 2>/dev/null && chown www-data:www-data "$sock" 2>/dev/null || true
-        local oc="/etc/php/${v}/fpm/conf.d/10-opcache.ini"
-        if [ -f "$oc" ] && ! grep -q "^opcache.enable=1" "$oc" 2>/dev/null; then
-            sed -i 's/^;opcache.enable=/opcache.enable=/' "$oc" 2>/dev/null || true
-            sed -i 's/^opcache.enable=0/opcache.enable=1/' "$oc" 2>/dev/null || true
-            systemctl reload "php${v}-fpm" 2>/dev/null || true
-            sh_log "FIX" "PHP $v OPcache enabled"
-        fi
-    done
-}
-
-sh_heal_redis() {
-    sh_log "STEP" "Redis self-heal"
-    sh_heal_service "redis-server"
-    redis-cli -p 6379 ping 2>/dev/null | grep -q "PONG" || { systemctl restart redis-server 2>/dev/null || true; sleep 2; }
-    local maxmem; maxmem=$(free -m | awk '/Mem:/{printf "%dmb", $2*0.1}')
-    grep -q "^maxmemory " /etc/redis/redis.conf 2>/dev/null || \
-        echo "maxmemory ${maxmem}" >> /etc/redis/redis.conf 2>/dev/null || true
-    for cf in /etc/redis/redis-*.conf; do
-        [ -f "$cf" ] || continue
-        local slug port; slug=$(basename "$cf" .conf | sed 's/redis-//'); port=$(grep "^port" "$cf" | awk '{print $2}')
-        [ -n "$port" ] && ! redis-cli -p "$port" ping 2>/dev/null | grep -q "PONG" && \
-            systemctl restart "redis-${slug}" 2>/dev/null || true
-    done
-}
-
-sh_heal_mariadb() {
-    sh_log "STEP" "MariaDB self-heal"
-    if ! systemctl is-active --quiet mariadb 2>/dev/null; then
-        mysqld --tc-heuristic-recover ROLLBACK 2>/dev/null || true
-        sh_heal_service "mariadb"
-    fi
-    systemctl is-active --quiet mariadb && \
-        mysql -e "SELECT 1" 2>/dev/null && sh_log "SUCCESS" "MariaDB OK" || sh_log "ERROR" "MariaDB unreachable"
-}
-
-sh_heal_fail2ban() {
-    sh_log "STEP" "Fail2ban self-heal"
-    sh_heal_service "fail2ban"
-}
-
-sh_heal_repos() {
-    sh_log "STEP" "APT repository self-heal"
-    apt-get update -y 2>/dev/null || {
-        sh_log "WARN" "apt-get update failed — cleaning lists"
-        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
-        dpkg --configure -a 2>/dev/null || true
-        apt-get update -y 2>/dev/null || sh_log "ERROR" "apt-get update still failing"
-    }
-}
-
-sh_heal_ssl() {
-    sh_log "STEP" "SSL certificate self-heal"
-    [ -d /etc/letsencrypt/live ] || { sh_log "INFO" "No SSL certs found"; return 0; }
-    local dom_dir
-    for dom_dir in /etc/letsencrypt/live/*/; do
-        [ -f "${dom_dir}cert.pem" ] || continue
-        local dom; dom=$(basename "$dom_dir")
-        [ "$dom" = "README" ] && continue
-        local exp_date days
-        exp_date=$(openssl x509 -enddate -noout -in "${dom_dir}cert.pem" 2>/dev/null | cut -d= -f2)
-        days=$(( ( $(date -d "${exp_date}" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
-        if [ "${days:-100}" -lt 14 ]; then
-            sh_log "FIX" "Renewing cert for $dom ($days days left)"
-            certbot renew --cert-name "$dom" --nginx --non-interactive 2>/dev/null || \
-                sh_log "WARN" "Cert renewal failed for $dom"
-        else
-            sh_log "INFO" "SSL $dom: $days days remaining — OK"
-        fi
-    done
-}
-
-sh_heal_disk() {
-    sh_log "STEP" "Disk self-heal"
-    local used; used=$(df / | awk 'NR==2{gsub(/%/,"",$5);print $5}')
-    sh_log "INFO" "Disk usage: ${used}%"
-    if [ "${used:-0}" -gt 85 ]; then
-        sh_log "WARN" "Disk >85% — emergency cleanup"
-        apt-get autoremove -y 2>/dev/null || true
-        apt-get autoclean   2>/dev/null || true
-        journalctl --vacuum-size=100M 2>/dev/null || true
-        find /var/log -name "*.gz" -mtime +7 -delete 2>/dev/null || true
-        find /tmp -type f -mtime +1 -delete 2>/dev/null || true
-        find /var/log/nginx -name "*.log" -size +100M -exec truncate -s 50M {} \; 2>/dev/null || true
-        sh_log "SUCCESS" "Disk cleanup done"
-    fi
-}
-
-sh_heal_wp_permissions() {
-    sh_log "STEP" "WordPress permissions self-heal"
-    for site_dir in /var/www/html/*/; do
-        [ -f "${site_dir}wp-config.php" ] || continue
-        local dom; dom=$(basename "$site_dir")
-        find "$site_dir" -type d -exec chmod 755 {} \; 2>/dev/null || true
-        find "$site_dir" -type f -exec chmod 644 {} \; 2>/dev/null || true
-        chmod 600 "${site_dir}wp-config.php" 2>/dev/null || true
-        chown -R www-data:www-data "$site_dir" 2>/dev/null || true
-        sh_log "SUCCESS" "$dom permissions fixed"
-    done
-}
-
-sh_fix_nginx_configs() {
-    sh_log "STEP" "Nginx config auto-fix"
-    local running_php=""
-    for v in 8.4 8.3 8.2; do
-        systemctl is-active --quiet "php${v}-fpm" 2>/dev/null && running_php="$v" && break
-    done
-    [ -z "$running_php" ] && { sh_log "WARN" "No PHP-FPM running — skipping socket fix"; return 0; }
-    local correct_sock="/run/php/php${running_php}-fpm.sock"
-    local cf
-    for cf in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/*; do
-        [ -f "$cf" ] || continue
-        if grep -q "php[0-9.]*-fpm.sock" "$cf" 2>/dev/null; then
-            sed -i "s|php[0-9.]*-fpm\.sock|php${running_php}-fpm.sock|g" "$cf" 2>/dev/null || true
-            sh_log "FIX" "Socket path updated in $(basename "$cf") → php${running_php}"
-        fi
-    done
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null && sh_log "SUCCESS" "Nginx reloaded" || \
-        sh_log "ERROR" "Nginx config still invalid after socket fix"
-}
-
-sh_fix_php_configs() {
-    sh_log "STEP" "PHP config auto-fix"
-    local ram_mb; ram_mb=$(free -m | awk '/Mem:/{print $2}')
-    local mem_limit="256M"
-    [ "$ram_mb" -ge 4096 ] && mem_limit="512M"
-    [ "$ram_mb" -ge 8192 ] && mem_limit="1G"
-    local v
-    for v in 8.4 8.3 8.2; do
-        local ini="/etc/php/${v}/fpm/php.ini"
-        [ -f "$ini" ] || continue
-        sed -i "s/^memory_limit.*/memory_limit = ${mem_limit}/" "$ini" 2>/dev/null || true
-        grep -q "^max_execution_time" "$ini" || echo "max_execution_time = 300" >> "$ini" 2>/dev/null || true
-        grep -q "^upload_max_filesize" "$ini" || echo "upload_max_filesize = 64M" >> "$ini" 2>/dev/null || true
-        grep -q "^post_max_size" "$ini"       || echo "post_max_size = 64M"       >> "$ini" 2>/dev/null || true
-        sh_log "FIX" "PHP $v memory_limit → $mem_limit"
-    done
-}
-
-sh_fix_redis_configs() {
-    sh_log "STEP" "Redis config auto-fix"
-    local maxmem; maxmem=$(free -m | awk '/Mem:/{printf "%dmb", $2*0.1}')
-    grep -q "^maxmemory " /etc/redis/redis.conf 2>/dev/null || \
-        echo "maxmemory ${maxmem}" >> /etc/redis/redis.conf 2>/dev/null || true
-    grep -q "^maxmemory-policy" /etc/redis/redis.conf 2>/dev/null || \
-        echo "maxmemory-policy allkeys-lru" >> /etc/redis/redis.conf 2>/dev/null || true
-    systemctl is-active --quiet redis-server && systemctl reload redis-server 2>/dev/null || true
-    sh_log "SUCCESS" "Redis config verified"
-}
-
-sh_fix_mariadb_configs() {
-    sh_log "STEP" "MariaDB config auto-fix"
-    local cnf="/etc/mysql/mariadb.conf.d/99-wordpress.cnf"
-    if [ ! -f "$cnf" ]; then
-        local ram_mb; ram_mb=$(free -m | awk '/Mem:/{print $2}')
-        local buf="128M"; [ "$ram_mb" -ge 2048 ] && buf="256M"; [ "$ram_mb" -ge 4096 ] && buf="512M"
-        cat > "$cnf" << MYCNF
-[mysqld]
-innodb_buffer_pool_size = $buf
-max_connections = 200
-max_allowed_packet = 256M
-innodb_flush_log_at_trx_commit = 2
-innodb_file_per_table = 1
-character-set-server = utf8mb4
-collation-server = utf8mb4_unicode_ci
-MYCNF
-        sh_log "FIX" "Created MariaDB config with innodb_buffer_pool=$buf"
-    fi
-    systemctl is-active --quiet mariadb && systemctl reload mariadb 2>/dev/null || true
-}
-
-sh_update_all_wp_sites() {
-    sh_log "STEP" "Updating all WordPress sites"
-    for site_dir in /var/www/html/*/; do
-        [ -f "${site_dir}wp-config.php" ] || continue
-        local dom; dom=$(basename "$site_dir")
-        sh_log "INFO" "Updating WP: $dom"
-        sudo -u www-data wp core update   --path="$site_dir" --allow-root --quiet 2>/dev/null || true
-        sudo -u www-data wp plugin update --all --path="$site_dir" --allow-root --quiet 2>/dev/null || true
-        sudo -u www-data wp theme  update --all --path="$site_dir" --allow-root --quiet 2>/dev/null || true
-        sudo -u www-data wp core  update-db --path="$site_dir" --allow-root --quiet 2>/dev/null || true
-        sh_log "SUCCESS" "$dom updated"
-    done
-}
-
-# =============================================================================
-# SECTION C — SELF-UPDATE ENGINE (from v6.7 sh_upgrade_* + sh_self_update)
-# =============================================================================
-sh_upgrade_nginx() {
-    sh_log "STEP" "Upgrading Nginx"
-    apt-get install -y --only-upgrade nginx 2>/dev/null && \
-        { systemctl restart nginx 2>/dev/null || true; sh_log "SUCCESS" "Nginx upgraded"; } || \
-        sh_log "WARN" "Nginx upgrade failed or already latest"
-}
-
-sh_upgrade_php() {
-    sh_log "STEP" "Upgrading PHP"
-    apt-get install -y --only-upgrade php8.4-fpm php8.3-fpm php8.2-fpm 2>/dev/null || true
-    for v in 8.4 8.3 8.2; do
-        systemctl is-active --quiet "php${v}-fpm" 2>/dev/null && \
-            systemctl restart "php${v}-fpm" 2>/dev/null || true
-    done
-    sh_log "SUCCESS" "PHP upgraded"
-}
-
-sh_upgrade_redis() {
-    sh_log "STEP" "Upgrading Redis"
-    apt-get install -y --only-upgrade redis-server redis-tools 2>/dev/null && \
-        { systemctl restart redis-server 2>/dev/null || true; sh_log "SUCCESS" "Redis upgraded"; } || \
-        sh_log "WARN" "Redis upgrade failed or already latest"
-}
-
-sh_upgrade_mariadb() {
-    sh_log "STEP" "Upgrading MariaDB (safe minor update)"
-    apt-get install -y --only-upgrade mariadb-server mariadb-client 2>/dev/null && \
-        { mysql_upgrade --silent 2>/dev/null || true; sh_log "SUCCESS" "MariaDB upgraded"; } || \
-        sh_log "WARN" "MariaDB upgrade failed or already latest"
-}
-
-sh_upgrade_wpcli() {
-    sh_log "STEP" "Upgrading WP-CLI"
-    wp cli update --yes --allow-root 2>/dev/null && sh_log "SUCCESS" "WP-CLI upgraded" || \
-        sh_log "WARN" "WP-CLI upgrade failed or already latest"
-}
-
-sh_self_update() {
-    sh_log "STEP" "Updating easyinstall script itself"
-    local dest="/usr/local/bin/easyinstall"
-    local tmp; tmp=$(mktemp)
-    # Try to self-update from known upstream URL or from installed script
-    if cp "$0" "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-        cp "$tmp" "$dest" && chmod +x "$dest" && sh_log "SUCCESS" "easyinstall binary updated"
+detect_os() {
+    print_section "Detecting Operating System"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release; OS=$ID; VER=$VERSION_ID; OS_NAME=$NAME
     else
-        sh_log "WARN" "Self-update skipped — run installer again to get latest"
+        OS=$(uname -s); VER=$(uname -r); OS_NAME=$OS
     fi
-    rm -f "$tmp"
+    echo -e "OS: ${GREEN}$OS_NAME $VER${NC}"
+    [[ "$OS" == "ubuntu" || "$OS" == "debian" ]] && print_success "Supported OS" || print_warning "Proceeding on unsupported OS"
 }
 
-# =============================================================================
-# SECTION D — RUN_SELF_HEAL / RUN_SELF_UPDATE orchestrators
-# =============================================================================
-run_self_heal() {
-    local mode="${1:-full}"
-    local start_ts; start_ts=$(date +%s)
-
-    echo -e "\n${C}╔═══════════════════════════════════════════════════════╗${N}"
-    echo -e "${C}║  EasyInstall Self-Heal Engine v1.0 — $(date '+%H:%M:%S')     ║${N}"
-    echo -e "${C}╚═══════════════════════════════════════════════════════╝${N}\n"
-    sh_log "STEP" "Self-heal started (mode: $mode)"
-
-    case "$mode" in
-        services|quick)
-            sh_heal_nginx; sh_heal_php; sh_heal_redis; sh_heal_mariadb; sh_heal_fail2ban ;;
-        configs)
-            sh_fix_nginx_configs; sh_fix_php_configs; sh_fix_redis_configs; sh_fix_mariadb_configs ;;
-        repos)
-            sh_heal_repos ;;
-        ssl)
-            sh_heal_ssl ;;
-        disk)
-            sh_heal_disk ;;
-        wp)
-            sh_heal_wp_permissions; sh_update_all_wp_sites ;;
-        502|nginx-502|bad-gateway)
-            sh_log "STEP" "502 Bad Gateway targeted fix"
-            echo -e "${C}🩹 Diagnosing and fixing 502 Bad Gateway...${N}"
-            sh_fix_nginx_configs
-            sh_heal_php
-            for v in 8.4 8.3 8.2; do
-                local sock="/run/php/php${v}-fpm.sock"
-                [ -S "$sock" ] && chmod 660 "$sock" 2>/dev/null && chown www-data:www-data "$sock" 2>/dev/null && \
-                    sh_log "FIX" "Socket permissions fixed: $sock"
-            done
-            sh_heal_nginx
-            sleep 2
-            local rpv=""
-            for v in 8.4 8.3 8.2; do
-                systemctl is-active --quiet "php${v}-fpm" 2>/dev/null && rpv="$v" && break
-            done
-            [ -n "$rpv" ] && sh_log "SUCCESS" "PHP ${rpv}-FPM running" || sh_log "ERROR" "No PHP-FPM running"
-            nginx -t 2>/dev/null && sh_log "SUCCESS" "Nginx config OK" || sh_log "ERROR" "Nginx config invalid"
-            ;;
-        full|*)
-            sh_heal_repos
-            sh_heal_nginx; sh_heal_php; sh_heal_redis; sh_heal_mariadb; sh_heal_fail2ban
-            sh_heal_ssl; sh_heal_disk; sh_heal_wp_permissions
-            sh_fix_nginx_configs; sh_fix_php_configs; sh_fix_redis_configs; sh_fix_mariadb_configs
-            ;;
-    esac
-
-    local elapsed=$(( $(date +%s) - start_ts ))
-    sh_log "SUCCESS" "Self-heal completed in ${elapsed}s"
-    echo -e "\n${G}✅ Self-heal complete (${elapsed}s) — log: $EI_SELF_LOG${N}\n"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') mode=$mode duration=${elapsed}s" >> "$EI_SELF_STATE"
+check_disk_space() {
+    print_section "Checking Disk Space"
+    DISK_AVAIL=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+    echo -e "Available: ${GREEN}${DISK_AVAIL}GB${NC}"
+    [ "$DISK_AVAIL" -lt 3 ] && { print_error "Need 3GB+ free space"; exit 1; }
+    print_success "Sufficient disk space"
 }
 
-run_self_update() {
-    local mode="${1:-all}"
-    echo -e "\n${C}🚀 EasyInstall Self-Update Engine${N}"
-
-    case "$mode" in
-        nginx)    sh_heal_repos; sh_upgrade_nginx ;;
-        php)      sh_heal_repos; sh_upgrade_php ;;
-        redis)    sh_heal_repos; sh_upgrade_redis ;;
-        mariadb)  sh_heal_repos; sh_upgrade_mariadb ;;
-        wpcli)    sh_upgrade_wpcli ;;
-        wp-sites) sh_update_all_wp_sites ;;
-        script)   sh_self_update ;;
-        versions) sh_fetch_versions; sh_version_report ;;
-        all|*)
-            sh_log "STEP" "Full auto-update started"
-            sh_heal_repos
-            sh_upgrade_nginx; sh_upgrade_php; sh_upgrade_redis
-            sh_upgrade_mariadb; sh_upgrade_wpcli
-            sh_update_all_wp_sites; sh_self_update
-            sh_fetch_versions; sh_version_report
-            sh_log "SUCCESS" "Full auto-update complete"
-            ;;
-    esac
+check_internet() {
+    print_section "Checking Internet Connection"
+    if curl -s --connect-timeout 5 https://deb.debian.org > /dev/null 2>&1; then
+        print_success "Internet connection active"
+    else
+        print_error "No internet connection"; exit 1
+    fi
 }
 
-# =============================================================================
-# SECTION E — HELP TEXT
-# =============================================================================
-_help() {
-cat << 'HELP'
-EasyInstall v7.1 — WordPress Performance Stack
-═══════════════════════════════════════════════════════════════════
-
-INSTALL:
-  easyinstall install                       Full stack (Nginx+PHP+MariaDB+Redis)
-
-SITE MANAGEMENT:
-  easyinstall create domain.com [--ssl] [--php=8.3|8.4]
-  easyinstall delete domain.com
-  easyinstall list
-  easyinstall site-info domain.com
-  easyinstall update-site domain.com [--core|--plugins|--themes|--db|--langs|--check|--backup]
-  easyinstall update-site all
-  easyinstall clone src.com dst.com
-  easyinstall php-switch domain.com 8.4
-  easyinstall backup-site domain.com        Backup specific site files + DB
-
-SSL:
-  easyinstall ssl domain.com
-  easyinstall ssl-renew
-
-REDIS:
-  easyinstall redis-status
-  easyinstall redis-restart [domain.com]
-  easyinstall redis-ports
-  easyinstall redis-cli domain.com          Direct Redis CLI for a site
-
-MONITORING:
-  easyinstall status
-  easyinstall health
-  easyinstall monitor
-  easyinstall logs [domain.com]
-  easyinstall perf
-  easyinstall version
-
-BACKUP / OPTIMIZE:
-  easyinstall backup [domain.com]
-  easyinstall optimize
-  easyinstall clean
-
-SELF-HEAL  (v6.7/v7.1):
-  easyinstall self-heal                     Full heal (services+configs+ssl+disk+wp)
-  easyinstall self-heal 502                 Fix 502 Bad Gateway (PHP socket + nginx)
-  easyinstall self-heal services            Restart failed services
-  easyinstall self-heal configs             Auto-correct all config files
-  easyinstall self-heal ssl                 Renew expiring SSL certs
-  easyinstall self-heal disk                Free disk space, clean logs
-  easyinstall self-heal wp                  Fix WP permissions + update all sites
-  easyinstall self-heal repos               Fix broken APT repositories
-
-SELF-UPDATE  (v6.7/v7.1):
-  easyinstall self-update                   Update all packages + WP-CLI + script
-  easyinstall self-update nginx             Upgrade Nginx to latest
-  easyinstall self-update php               Upgrade PHP to latest
-  easyinstall self-update redis             Upgrade Redis to latest
-  easyinstall self-update mariadb           Safe MariaDB minor upgrade
-  easyinstall self-update wpcli             Upgrade WP-CLI
-  easyinstall self-update wp-sites          Update all WP core/plugins/themes
-  easyinstall self-update script            Self-update easyinstall binary
-  easyinstall self-update versions          Refresh version cache
-  easyinstall self-check                    Version status (installed vs latest)
-
-WEBSOCKET  (v6.4):
-  easyinstall ws-enable domain.com [port]
-  easyinstall ws-disable domain.com
-  easyinstall ws-status [domain.com]
-  easyinstall ws-test domain.com
-
-HTTP/3 + QUIC  (v6.4):
-  easyinstall http3-enable
-  easyinstall http3-status
-
-EDGE COMPUTING  (v6.4):
-  easyinstall edge-setup
-  easyinstall edge-status
-  easyinstall edge-purge domain.com [/path]
-
-AI FEATURES  (v6.3+):
-  easyinstall ai-setup                      Configure AI API key & provider
-  easyinstall ai-install-ollama             Install Ollama (free local AI)
-  easyinstall ai-diagnose [domain.com]      AI log analysis & fix suggestions
-  easyinstall ai-optimize                   AI performance tuning advice
-  easyinstall ai-security                   AI security audit
-  easyinstall ai-report                     AI-generated server health report
-
-ADVANCED AUTO-TUNE  (v6.6):
-  easyinstall advanced-tune                 Full 10-phase auto-tune
-  easyinstall perf-dashboard                Live performance dashboard
-  easyinstall warm-cache                    Pre-warm all site caches
-  easyinstall db-optimize                   Optimize WordPress databases
-  easyinstall wp-speed                      Apply WordPress speed tweaks
-  easyinstall install-governor              Install 15-min resource governor
-  easyinstall emergency-check               Check/trigger emergency mode
-  easyinstall autotune-rollback             Rollback last autotune changes
-  easyinstall nginx-extras                  Install Brotli + Cloudflare real-IP
-
-MACHINE LEARNING  (v6.5):
-  easyinstall ml-train domain.com
-  easyinstall ml-predict domain.com
-  easyinstall ml-status
-  easyinstall ml-model-list
-
-SERVERLESS FUNCTIONS  (v6.5):
-  easyinstall fn-deploy name /path/fn.sh
-  easyinstall fn-invoke name [args]
-  easyinstall fn-list
-  easyinstall fn-delete name
-  easyinstall fn-logs name
-
-DATABASE SHARDING  (v6.5):
-  easyinstall shard-init domain.com
-  easyinstall shard-status
-  easyinstall shard-rebalance
-  easyinstall shard-add host port
-
-PAGESPEED  (v6.6):
-  easyinstall pagespeed optimize domain.com
-  easyinstall pagespeed score domain.com
-  easyinstall pagespeed autofix domain.com
-  easyinstall pagespeed report domain.com
-  easyinstall pagespeed all domain.com
-  easyinstall pagespeed images domain.com
-
-TROUBLESHOOT:
-  easyinstall fix-apache                    Remove Apache2, restore Nginx (502 fix)
-  easyinstall fix-nginx                     Alias for fix-apache
-  easyinstall self-heal 502                 PHP socket + nginx 502 auto-fix
-
-═══════════════════════════════════════════════════════════════════
-HELP
+block_apache() {
+    print_section "Checking Apache2"
+    mkdir -p /etc/apt/preferences.d
+    cat > /etc/apt/preferences.d/block-apache2.pref << 'APACHEPREF'
+Package: apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php*
+Pin: release *
+Pin-Priority: -1
+APACHEPREF
+    if dpkg -l 2>/dev/null | grep -q "^ii.*apache2 "; then
+        print_info "Apache2 found — removing..."
+        systemctl stop apache2 2>/dev/null || true
+        systemctl disable apache2 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge \
+            apache2 apache2-bin apache2-data apache2-utils \
+            libapache2-mod-php* 2>/dev/null || true
+        apt-get autoremove -y 2>/dev/null || true
+        rm -rf /etc/apache2 2>/dev/null || true
+        print_success "Apache2 removed"
+    else
+        print_success "Apache2 not installed — port 80 is free"
+    fi
 }
 
-# =============================================================================
-# MAIN DISPATCH
-# =============================================================================
+update_system() {
+    print_section "Updating System Packages"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get upgrade -y
+    print_success "System updated"
+}
+
+install_base_deps() {
+    print_section "Installing Base Dependencies"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends \
+        curl wget git unzip zip tar gzip \
+        python3 python3-pip \
+        software-properties-common apt-transport-https \
+        ca-certificates gnupg lsb-release \
+        ufw fail2ban htop tree vim nano jq
+    print_success "Base dependencies installed"
+}
+
+install_php() {
+    print_section "Installing PHP FPM (no Apache)"
+    cat > /etc/apt/preferences.d/block-apache2.pref << 'APACHEPREF'
+Package: apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php*
+Pin: release *
+Pin-Priority: -1
+APACHEPREF
+    if [[ "$OS" == "debian" ]]; then
+        apt-get install -y --no-install-recommends wget apt-transport-https lsb-release
+        wget -qO- https://packages.sury.org/php/apt.gpg | \
+            gpg --dearmor > /etc/apt/trusted.gpg.d/sury-php.gpg
+        echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" \
+            > /etc/apt/sources.list.d/sury-php.list
+        apt-get update -y
+    elif [[ "$OS" == "ubuntu" ]]; then
+        add-apt-repository -y ppa:ondrej/php; apt-get update -y
+    fi
+    PHP_VER=""
+    # Install ALL available PHP versions (8.1, 8.2, 8.3, 8.4)
+    for ver in 8.4 8.3 8.2 8.1; do
+        PKGS="php${ver}-fpm php${ver}-mysql php${ver}-curl php${ver}-gd php${ver}-mbstring"
+        PKGS="$PKGS php${ver}-xml php${ver}-xmlrpc php${ver}-zip php${ver}-bcmath"
+        PKGS="$PKGS php${ver}-soap php${ver}-intl php${ver}-opcache php${ver}-readline"
+        PKGS="$PKGS php${ver}-redis php${ver}-apcu"
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $PKGS 2>/dev/null; then
+            [ -z "$PHP_VER" ] && PHP_VER="$ver"
+            apt-get remove -y --purge apache2 apache2-bin apache2-data 2>/dev/null || true
+            print_success "PHP $ver FPM installed"
+            # Don't break — install all versions
+        fi
+    done
+    if [ -z "$PHP_VER" ]; then
+        print_warning "Versioned PHP failed — trying system php-fpm"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            php-fpm php-mysql php-curl php-gd php-mbstring php-xml php-zip php-opcache
+    fi
+    command -v php >/dev/null 2>&1 && print_success "PHP $(php -v 2>/dev/null | head -1 | cut -d' ' -f2) ready" || print_info "PHP-FPM installed (no CLI)"
+}
+
+install_nginx() {
+    print_section "Installing Nginx (official mainline)"
+    apt-get remove -y nginx nginx-common nginx-full nginx-core 2>/dev/null || true
+    curl -fsSL https://nginx.org/keys/nginx_signing.key | \
+        gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+    NGINX_OS="debian"; [[ "$OS" == "ubuntu" ]] && NGINX_OS="ubuntu"
+    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+http://nginx.org/packages/mainline/${NGINX_OS} $(lsb_release -sc) nginx" \
+        > /etc/apt/sources.list.d/nginx.list
+    apt-get update -y && apt-get install -y nginx
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled \
+             /etc/nginx/conf.d /var/cache/nginx/fastcgi /var/log/nginx
+    systemctl enable nginx && systemctl start nginx
+    sleep 2
+    if systemctl is-active --quiet nginx; then
+        print_success "Nginx installed and running"
+    else
+        print_error "Nginx failed — check: journalctl -u nginx"
+        exit 1
+    fi
+}
+
+install_mysql() {
+    print_section "Installing MariaDB 11.4"
+    curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | \
+        bash -s -- --mariadb-server-version=mariadb-11.4 --skip-maxscale 2>/dev/null || true
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client
+    systemctl enable mariadb && systemctl start mariadb
+    MYSQL_ROOT_PASS=$(openssl rand -base64 32 | tr -d /=+ | cut -c -20)
+    mysql --user=root << _MYSQL_EOF_ 2>/dev/null || true
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASS}';
+DELETE FROM mysql.user WHERE User='';
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+_MYSQL_EOF_
+    printf "MySQL Root Password: %s\nHost: localhost\nPort: 3306\nDate: %s\n" \
+        "$MYSQL_ROOT_PASS" "$(date)" > /root/.mysql_info
+    chmod 600 /root/.mysql_info
+    print_success "MariaDB installed — password in /root/.mysql_info"
+}
+
+install_redis() {
+    print_section "Installing Redis"
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server redis-tools 2>/dev/null; then
+        systemctl enable redis-server && systemctl start redis-server
+        print_success "Redis installed"
+    else
+        print_warning "Redis install failed — continuing"
+    fi
+}
+
+install_certbot() {
+    print_section "Installing Certbot"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
+    print_success "Certbot installed"
+}
+
+install_python_deps() {
+    print_section "Installing Python Dependencies"
+    pip3 install --quiet --upgrade pip 2>/dev/null || true
+    pip3 install --quiet --break-system-packages requests colorama psutil 2>/dev/null || \
+    pip3 install --quiet requests colorama psutil 2>/dev/null || true
+    print_success "Python dependencies installed"
+}
+
+configure_firewall() {
+    print_section "Configuring Firewall"
+    ufw --force disable 2>/dev/null || true
+    ufw --force reset   2>/dev/null || true
+    ufw default deny incoming; ufw default allow outgoing
+    ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp
+    ufw allow 443/udp; ufw limit ssh/tcp
+    echo "y" | ufw enable 2>/dev/null || true
+    print_success "Firewall configured"
+}
+
+configure_fail2ban() {
+    print_section "Configuring Fail2ban"
+    cat > /etc/fail2ban/jail.local << 'F2BEOF'
+[DEFAULT]
+bantime  = 3600
+findtime = 600
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+[sshd]
+enabled  = true
+logpath  = /var/log/auth.log
+maxretry = 3
+bantime  = 86400
+[nginx-http-auth]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/error.log
+F2BEOF
+    systemctl restart fail2ban 2>/dev/null || true
+    print_success "Fail2ban configured"
+}
+
+create_aliases() {
+    print_section "Creating Command Aliases"
+    sed -i '/# EasyInstall VPS Aliases/,/# End EasyInstall/d' ~/.bashrc 2>/dev/null || true
+    cat >> ~/.bashrc << 'ALIASEOF'
+# EasyInstall VPS Aliases
+alias easyvps='easyinstall help'
+alias easyupdate='easyinstall self-update all'
+alias easylist='easyinstall list'
+alias easywp='php /usr/local/lib/easyinstall/wp_helper.php'
+alias easypy='python3 /usr/local/lib/easyinstall/core.py'
+alias easybackup='easyinstall backup'
+alias easyopt='easyinstall optimize'
+alias easysec='easyinstall self-heal full'
+alias easylogs='tail -f /var/log/nginx/access.log'
+alias easystatus='easyinstall status'
+alias easyhealth='easyinstall health'
+# End EasyInstall
+ALIASEOF
+    print_success "Aliases created"
+}
+
+show_summary() {
+    print_section "Installation Summary"
+    IP_ADDR=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${WHITE}                    INSTALLATION COMPLETE!                    ${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  OS: ${GREEN}$OS_NAME $VER${NC}"
+    echo -e "  PHP: ${GREEN}$(php -v 2>/dev/null | head -1|cut -d' ' -f2||echo '?')${NC}"
+    echo -e "  Nginx: ${GREEN}$(nginx -v 2>&1|grep -oP '[0-9]+\.[0-9]+\.[0-9]+'||echo '?')${NC}"
+    echo -e "  MariaDB: ${GREEN}$(mysql --version 2>/dev/null|grep -oP '[0-9]+\.[0-9]+\.[0-9]+'|head -1||echo '?')${NC}"
+    echo -e "  Python: ${GREEN}$(python3 --version 2>/dev/null|cut -d' ' -f2||echo '?')${NC}"
+    echo ""
+    echo -e "  IP: ${YELLOW}http://$IP_ADDR${NC}"
+    echo -e "  MySQL: ${YELLOW}/root/.mysql_info${NC}"
+    echo -e "  Engine: ${YELLOW}$LIB_DIR/${NC}"
+    echo ""
+    echo -e "${CYAN}⚡ Next steps:${NC}"
+    echo -e "  ${GREEN}easyinstall install${NC}                   Full stack fine-tune"
+    echo -e "  ${GREEN}easyinstall create yourdomain.com --ssl${NC}  WordPress site"
+    echo -e "  ${GREEN}easyinstall help${NC}                      All commands"
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${WHITE}                🚀 SYSTEM READY FOR PRODUCTION!                ${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+show_help() {
+    echo "EasyInstall VPS v7.0 — Self-Contained Master Script"
+    echo "Usage: bash install.sh [OPTION]"
+    echo "  --help        This help"
+    echo "  --no-stack    Only extract engine files (skip LEMP install)"
+    echo "After install:  easyinstall help"
+}
+
+# ==============================================
+# CORE FIX: Extract engine files (embedded base64)
+# This completely replaces the GitHub download approach
+# ==============================================
+extract_engine_files() {
+    print_section "Extracting EasyInstall Engine Files (Embedded)"
+
+    mkdir -p "$LIB_DIR" /var/log/easyinstall /var/lib/easyinstall "$WORK_DIR"
+
+    # easyinstall_core.py — Python engine
+    CORE_B64="IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgRWFzeUluc3RhbGwgdjcuMCDigJQgUHl0aG9uIENvcmUgRW5naW5lCiMgSGFuZGxlczogaW5zdGFsbCwgY3JlYXRlLCBkZWxldGUsIGhlYWwsIHVwZGF0ZSwgbW9uaXRvciwgcmVkaXMsIHNzbCwgd3MsIGVkZ2UKIyBDb21wYXRpYmxlOiBEZWJpYW4gMTIgLyBVYnVudHUgMjIuMDQgLyAyNC4wNCAgfCAgUkFNIDUxMiBNQiDigJMgMTYgR0IKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQppbXBvcnQgc3lzLCBvcywgcmUsIGpzb24sIHRpbWUsIHNodXRpbCwgc29ja2V0LCBzdWJwcm9jZXNzLCB0ZXh0d3JhcCwgZmNudGwKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmZyb20gZGF0ZXRpbWUgaW1wb3J0IGRhdGV0aW1lCgojIOKUgOKUgOKUgCBQYXRocyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKTElCX0RJUiAgICAgPSBQYXRoKCIvdXNyL2xvY2FsL2xpYi9lYXN5aW5zdGFsbCIpCkxPR19ESVIgICAgID0gUGF0aCgiL3Zhci9sb2cvZWFzeWluc3RhbGwiKQpTVEFURV9ESVIgICA9IFBhdGgoIi92YXIvbGliL2Vhc3lpbnN0YWxsIikKUEhQX0hFTFBFUiAgPSBMSUJfRElSIC8gIndwX2hlbHBlci5waHAiClJFRElTX1BPUlRTID0gU1RBVEVfRElSIC8gInVzZWRfcmVkaXNfcG9ydHMudHh0IgpTU0xfRU1BSUwgICA9IFBhdGgoIi9yb290Ly5zc2wtZW1haWwiKQpMT0NLX0ZJTEUgICA9IFBhdGgoIi92YXIvcnVuL2Vhc3lpbnN0YWxsLmxvY2siKQpMT0dfRklMRSAgICA9IExPR19ESVIgLyAiaW5zdGFsbC5sb2ciCkVSUl9MT0cgICAgID0gTE9HX0RJUiAvICJlcnJvci5sb2ciCgpWRVJTSU9OID0gIjcuMCIKCiMg4pSA4pSA4pSAIFRlcm1pbmFsIGNvbG9ycyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKRz0iXDAzM1swOzMybSI7IFk9IlwwMzNbMTszM20iOyBSPSJcMDMzWzA7MzFtIgpCPSJcMDMzWzA7MzRtIjsgQz0iXDAzM1swOzM2bSI7IE49IlwwMzNbMG0iOyBQPSJcMDMzWzA7MzVtIgoKZGVmIG9rKG1zZyk6ICAgcHJpbnQoZiJ7R33inIUgIHttc2d9e059IikKZGVmIHdhcm4obXNnKTogcHJpbnQoZiJ7WX3imqDvuI8gICB7bXNnfXtOfSIpCmRlZiBlcnIobXNnKTogIHByaW50KGYie1J94p2MICB7bXNnfXtOfSIpCmRlZiBpbmZvKG1zZyk6IHByaW50KGYie0J94oS577iPICAge21zZ317Tn0iKQpkZWYgc3RlcChtc2cpOiBwcmludChmIntQffCflLcgIHttc2d9e059IikKZGVmIGN5YW4obXNnKTogcHJpbnQoZiJ7Q317bXNnfXtOfSIpCgpkZWYgX2xvZyhsZXZlbCwgbXNnKToKICAgIExPR19ESVIubWtkaXIocGFyZW50cz1UcnVlLCBleGlzdF9vaz1UcnVlKQogICAgdHMgPSBkYXRldGltZS5ub3coKS5zdHJmdGltZSgiJVktJW0tJWQgJUg6JU06JVMiKQogICAgd2l0aCBvcGVuKExPR19GSUxFLCAiYSIpIGFzIGY6CiAgICAgICAgZi53cml0ZShmIlt7dHN9XSBbe2xldmVsfV0ge21zZ31cbiIpCgojIOKUgOKUgOKUgCBTaGVsbCBoZWxwZXJzIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgcnVuKGNtZCwgY2hlY2s9VHJ1ZSwgY2FwdHVyZT1GYWxzZSwgdGltZW91dD0zMDAsIGVudj1Ob25lKToKICAgICIiIlJ1biBzaGVsbCBjb21tYW5kLiBSZXR1cm5zIChyYywgc3Rkb3V0LCBzdGRlcnIpLiIiIgogICAgX2xvZygiQ01EIiwgY21kWzoxMjBdKQogICAgciA9IHN1YnByb2Nlc3MucnVuKAogICAgICAgIGNtZCwgc2hlbGw9VHJ1ZSwgY2FwdHVyZV9vdXRwdXQ9Y2FwdHVyZSwKICAgICAgICB0aW1lb3V0PXRpbWVvdXQsIHRleHQ9VHJ1ZSwKICAgICAgICBlbnY9eyoqb3MuZW52aXJvbiwgKiooZW52IG9yIHt9KX0KICAgICkKICAgIGlmIGNoZWNrIGFuZCByLnJldHVybmNvZGUgIT0gMDoKICAgICAgICBlID0gci5zdGRlcnIuc3RyaXAoKSBpZiBjYXB0dXJlIGVsc2UgIiIKICAgICAgICBfbG9nKCJFUlIiLCBmInJjPXtyLnJldHVybmNvZGV9IGNtZD17Y21kWzo4MF19IHtlfSIpCiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKGYiQ29tbWFuZCBmYWlsZWQgKHJjPXtyLnJldHVybmNvZGV9KToge2NtZFs6ODBdfSIpCiAgICByZXR1cm4gci5yZXR1cm5jb2RlLCAoci5zdGRvdXQgb3IgIiIpLCAoci5zdGRlcnIgb3IgIiIpCgpkZWYgcnVuX29rKGNtZCwgKiprdyk6CiAgICAiIiJSdW4gYW5kIHJldHVybiBUcnVlL0ZhbHNlLiIiIgogICAgdHJ5OiBydW4oY21kLCBjaGVjaz1UcnVlLCAqKmt3KTsgcmV0dXJuIFRydWUKICAgIGV4Y2VwdDogcmV0dXJuIEZhbHNlCgpkZWYgY21kX291dChjbWQpOgogICAgIiIiUmV0dXJuIHN0ZG91dCBvZiBjb21tYW5kIG9yICcnLiIiIgogICAgdHJ5OiBfLCBvdXQsIF8gPSBydW4oY21kLCBjYXB0dXJlPVRydWUsIGNoZWNrPUZhbHNlKTsgcmV0dXJuIG91dC5zdHJpcCgpCiAgICBleGNlcHQ6IHJldHVybiAiIgoKZGVmIHN2Y19hY3RpdmUobmFtZSk6CiAgICByZXR1cm4gcnVuX29rKGYic3lzdGVtY3RsIGlzLWFjdGl2ZSAtLXF1aWV0IHtuYW1lfSAyPi9kZXYvbnVsbCIpCgpkZWYgc3ZjX3Jlc3RhcnQobmFtZSk6CiAgICByZXR1cm4gcnVuX29rKGYic3lzdGVtY3RsIHJlc3RhcnQge25hbWV9IDI+L2Rldi9udWxsIikKCmRlZiBzdmNfcmVsb2FkKG5hbWUpOgogICAgcmV0dXJuIHJ1bl9vayhmInN5c3RlbWN0bCByZWxvYWQge25hbWV9IDI+L2Rldi9udWxsIikKCmRlZiB3YWl0X3N2YyhuYW1lLCBzZWNzPTMwKToKICAgIGZvciBfIGluIHJhbmdlKHNlY3MgLy8gMik6CiAgICAgICAgaWYgc3ZjX2FjdGl2ZShuYW1lKTogcmV0dXJuIFRydWUKICAgICAgICB0aW1lLnNsZWVwKDIpCiAgICByZXR1cm4gRmFsc2UKCiMg4pSA4pSA4pSAIE9TIERldGVjdGlvbiDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKZGVmIGRldGVjdF9vcygpOgogICAgaW5mb19maWxlID0gUGF0aCgiL2V0Yy9vcy1yZWxlYXNlIikKICAgIGRhdGEgPSB7fQogICAgaWYgaW5mb19maWxlLmV4aXN0cygpOgogICAgICAgIGZvciBsaW5lIGluIGluZm9fZmlsZS5yZWFkX3RleHQoKS5zcGxpdGxpbmVzKCk6CiAgICAgICAgICAgIGlmICI9IiBpbiBsaW5lOgogICAgICAgICAgICAgICAgaywgdiA9IGxpbmUuc3BsaXQoIj0iLCAxKQogICAgICAgICAgICAgICAgZGF0YVtrXSA9IHYuc3RyaXAoJyInKQogICAgb3NfaWQgICAgICA9IGRhdGEuZ2V0KCJJRCIsICJkZWJpYW4iKQogICAgb3NfdmVyc2lvbiA9IGRhdGEuZ2V0KCJWRVJTSU9OX0lEIiwgIjEyIikKICAgIGNvZGVuYW1lICAgPSBkYXRhLmdldCgiVkVSU0lPTl9DT0RFTkFNRSIsICIiKQogICAgaWYgbm90IGNvZGVuYW1lOgogICAgICAgIGlmIG9zX2lkID09ICJ1YnVudHUiOgogICAgICAgICAgICBjb2RlbmFtZSA9IGNtZF9vdXQoImxzYl9yZWxlYXNlIC1zYyIpIG9yICJqYW1teSIKICAgICAgICBlbHNlOgogICAgICAgICAgICBkdiA9IGNtZF9vdXQoImNhdCAvZXRjL2RlYmlhbl92ZXJzaW9uIikuc3BsaXQoIi4iKVswXQogICAgICAgICAgICBjb2RlbmFtZSA9IHsiMTAiOiJidXN0ZXIiLCIxMSI6ImJ1bGxzZXllIiwiMTIiOiJib29rd29ybSJ9LmdldChkdiwgImJvb2t3b3JtIikKICAgIHJldHVybiBvc19pZCwgb3NfdmVyc2lvbiwgY29kZW5hbWUKCiMg4pSA4pSA4pSAIFJBTS1iYXNlZCB0dW5pbmcgKGNvcmUgZnVuY3Rpb24g4oCUIHVuY2hhbmdlZCBsb2dpYykg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiByYW1fdHVuZSgpOgogICAgdG90YWxfcmFtICAgPSBpbnQoY21kX291dCgiZnJlZSAtbSB8IGF3ayAnL01lbTove3ByaW50ICQyfSciKSBvciAiNTEyIikKICAgIHRvdGFsX2NvcmVzID0gaW50KGNtZF9vdXQoIm5wcm9jIikgb3IgIjEiKQogICAgc3RlcChmIlJBTT17dG90YWxfcmFtfU1CICBDb3Jlcz17dG90YWxfY29yZXN9IikKCiAgICBpZiAgIHRvdGFsX3JhbSA8PSA1MTI6CiAgICAgICAgcmV0dXJuIGRpY3QocGhwX2NoaWxkcmVuPTUsICBwaHBfc3RhcnQ9MiwgIHBocF9taW49MSwgIHBocF9tYXg9MywKICAgICAgICAgICAgICAgICAgICBwaHBfbWVtPSIxMjhNIiwgIHBocF9leGVjPTYwLCAgIG15c3FsX2J1Zj0iNjRNIiwgIG15c3FsX2xvZz0iMzJNIiwKICAgICAgICAgICAgICAgICAgICByZWRpc19tZW09IjY0bWIiLCAgbmdpbnhfY29ubj01MTIsICBjb3Jlcz10b3RhbF9jb3JlcywgcmFtPXRvdGFsX3JhbSkKICAgIGVsaWYgdG90YWxfcmFtIDw9IDEwMjQ6CiAgICAgICAgcmV0dXJuIGRpY3QocGhwX2NoaWxkcmVuPTEwLCBwaHBfc3RhcnQ9MywgIHBocF9taW49MiwgIHBocF9tYXg9NSwKICAgICAgICAgICAgICAgICAgICBwaHBfbWVtPSIyNTZNIiwgIHBocF9leGVjPTEyMCwgIG15c3FsX2J1Zj0iMTI4TSIsIG15c3FsX2xvZz0iNjRNIiwKICAgICAgICAgICAgICAgICAgICByZWRpc19tZW09IjEyOG1iIiwgbmdpbnhfY29ubj0xMDI0LCBjb3Jlcz10b3RhbF9jb3JlcywgcmFtPXRvdGFsX3JhbSkKICAgIGVsaWYgdG90YWxfcmFtIDw9IDIwNDg6CiAgICAgICAgcmV0dXJuIGRpY3QocGhwX2NoaWxkcmVuPTIwLCBwaHBfc3RhcnQ9NSwgIHBocF9taW49MywgIHBocF9tYXg9OCwKICAgICAgICAgICAgICAgICAgICBwaHBfbWVtPSIyNTZNIiwgIHBocF9leGVjPTE4MCwgIG15c3FsX2J1Zj0iMjU2TSIsIG15c3FsX2xvZz0iMTI4TSIsCiAgICAgICAgICAgICAgICAgICAgcmVkaXNfbWVtPSIyNTZtYiIsIG5naW54X2Nvbm49MjA0OCwgY29yZXM9dG90YWxfY29yZXMsIHJhbT10b3RhbF9yYW0pCiAgICBlbGlmIHRvdGFsX3JhbSA8PSA0MDk2OgogICAgICAgIHJldHVybiBkaWN0KHBocF9jaGlsZHJlbj00MCwgcGhwX3N0YXJ0PTgsICBwaHBfbWluPTQsICBwaHBfbWF4PTEyLAogICAgICAgICAgICAgICAgICAgIHBocF9tZW09IjUxMk0iLCAgcGhwX2V4ZWM9MjQwLCAgbXlzcWxfYnVmPSI1MTJNIiwgbXlzcWxfbG9nPSIyNTZNIiwKICAgICAgICAgICAgICAgICAgICByZWRpc19tZW09IjUxMm1iIiwgbmdpbnhfY29ubj00MDk2LCBjb3Jlcz10b3RhbF9jb3JlcywgcmFtPXRvdGFsX3JhbSkKICAgIGVsaWYgdG90YWxfcmFtIDw9IDgxOTI6CiAgICAgICAgcmV0dXJuIGRpY3QocGhwX2NoaWxkcmVuPTgwLCBwaHBfc3RhcnQ9MTIsIHBocF9taW49NiwgIHBocF9tYXg9MTgsCiAgICAgICAgICAgICAgICAgICAgcGhwX21lbT0iNTEyTSIsICBwaHBfZXhlYz0zMDAsICBteXNxbF9idWY9IjFHIiwgICBteXNxbF9sb2c9IjUxMk0iLAogICAgICAgICAgICAgICAgICAgIHJlZGlzX21lbT0iMWdiIiwgICBuZ2lueF9jb25uPTgxOTIsIGNvcmVzPXRvdGFsX2NvcmVzLCByYW09dG90YWxfcmFtKQogICAgZWxzZToKICAgICAgICByZXR1cm4gZGljdChwaHBfY2hpbGRyZW49MTYwLHBocF9zdGFydD0yMCwgcGhwX21pbj0xMCwgcGhwX21heD0zMCwKICAgICAgICAgICAgICAgICAgICBwaHBfbWVtPSIxRyIsICAgIHBocF9leGVjPTM2MCwgIG15c3FsX2J1Zj0iMkciLCAgIG15c3FsX2xvZz0iMUciLAogICAgICAgICAgICAgICAgICAgIHJlZGlzX21lbT0iMmdiIiwgICBuZ2lueF9jb25uPTE2Mzg0LGNvcmVzPXRvdGFsX2NvcmVzLCByYW09dG90YWxfcmFtKQoKIyDilIDilIDilIAgUEhQIHZlcnNpb24gZGV0ZWN0aW9uIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgZGV0ZWN0X3BocChwcmVmZXJyZWQ9IjguNCIpOgogICAgZm9yIHYgaW4gW3ByZWZlcnJlZCwgIjguNCIsICI4LjMiLCAiOC4yIiwgIjguMSJdOgogICAgICAgIGlmIHN2Y19hY3RpdmUoZiJwaHB7dn0tZnBtIik6IHJldHVybiB2CiAgICBmb3IgdiBpbiBbIjguNCIsICI4LjMiLCAiOC4yIiwgIjguMSJdOgogICAgICAgIGlmIHNodXRpbC53aGljaChmInBocHt2fSIpOiByZXR1cm4gdgogICAgcmV0dXJuICI4LjIiCgojIOKUgOKUgOKUgCBSZWRpcyBwb3J0IHJlZ2lzdHJ5IOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgX3VzZWRfcG9ydHMoKToKICAgIFNUQVRFX0RJUi5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICBpZiBub3QgUkVESVNfUE9SVFMuZXhpc3RzKCk6IFJFRElTX1BPUlRTLndyaXRlX3RleHQoIjYzNzlcbiIpCiAgICByZXR1cm4gc2V0KGludCh4KSBmb3IgeCBpbiBSRURJU19QT1JUUy5yZWFkX3RleHQoKS5zcGxpdGxpbmVzKCkgaWYgeC5zdHJpcCgpLmlzZGlnaXQoKSkKCmRlZiBfYWRkX3BvcnQocG9ydCk6CiAgICBTVEFURV9ESVIubWtkaXIocGFyZW50cz1UcnVlLCBleGlzdF9vaz1UcnVlKQogICAgd2l0aCBvcGVuKFJFRElTX1BPUlRTLCAiYSIpIGFzIGY6CiAgICAgICAgZmNudGwuZmxvY2soZiwgZmNudGwuTE9DS19FWCkKICAgICAgICBmLndyaXRlKGYie3BvcnR9XG4iKQogICAgICAgIGZjbnRsLmZsb2NrKGYsIGZjbnRsLkxPQ0tfVU4pCgpkZWYgbmV4dF9yZWRpc19wb3J0KCk6CiAgICB1c2VkID0gX3VzZWRfcG9ydHMoKQogICAgcG9ydCA9IDYzNzkKICAgIHdoaWxlIHBvcnQgaW4gdXNlZCBvciBydW5fb2soZiJzcyAtdGxucCAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgJzp7cG9ydH0gJyIpOgogICAgICAgIHBvcnQgKz0gMQogICAgICAgIGlmIHBvcnQgPiA2NTAwMDogcmV0dXJuIDYzNzkKICAgIHJldHVybiBwb3J0CgpkZWYgc3NsX2VtYWlsKGRvbWFpbik6CiAgICBpZiBTU0xfRU1BSUwuZXhpc3RzKCkgYW5kIFNTTF9FTUFJTC5zdGF0KCkuc3Rfc2l6ZSA+IDA6CiAgICAgICAgcmV0dXJuIFNTTF9FTUFJTC5yZWFkX3RleHQoKS5zdHJpcCgpLnNwbGl0bGluZXMoKVswXQogICAgcmV0dXJuIGYiYWRtaW5Ae2RvbWFpbn0iCgojIOKUgOKUgOKUgCBTb2NrZXQgaGVscGVycyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKZGVmIHBocF9zb2NrKHZlcik6IHJldHVybiBQYXRoKGYiL3J1bi9waHAvcGhwe3Zlcn0tZnBtLnNvY2siKQoKZGVmIGZpeF9zb2NrKHZlcik6CiAgICBzID0gcGhwX3NvY2sodmVyKQogICAgaWYgcy5leGlzdHMoKToKICAgICAgICBvcy5jaG1vZChzLCAwbzY2MCkKICAgICAgICBydW4oZiJjaG93biB3d3ctZGF0YTp3d3ctZGF0YSB7c30iLCBjaGVjaz1GYWxzZSkKICAgICAgICByZXR1cm4gVHJ1ZQogICAgcmV0dXJuIEZhbHNlCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgSU5TVEFMTCDigJQgRnVsbCBTdGFjawojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfaW5zdGFsbChhcmdzKToKICAgIHN0ZXAoIkVhc3lJbnN0YWxsIHY3LjAg4oCUIEZ1bGwgU3RhY2sgSW5zdGFsbGF0aW9uIikKICAgIFNUQVRFX0RJUi5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICBMT0dfRElSLm1rZGlyKHBhcmVudHM9VHJ1ZSwgZXhpc3Rfb2s9VHJ1ZSkKCiAgICBvc19pZCwgb3NfdmVyLCBjb2RlbmFtZSA9IGRldGVjdF9vcygpCiAgICBvayhmIk9TOiB7b3NfaWR9IHtvc192ZXJ9ICh7Y29kZW5hbWV9KSIpCgogICAgIyBGSVg6IOCkuOCkrOCkuOClhyDgpKrgpLngpLLgpYcgQXBhY2hlMiDgpLngpJ/gpL7gpI/gpIIg4oCUIOCkr+CkuSBQSFAg4KSV4KWHIOCkuOCkvuCkpSBpbnN0YWxsIOCkueCli+CkleCksCBwb3J0IDgwIGJsb2NrIOCkleCksOCkpOCkviDgpLngpYgKICAgICMgTmdpbngg4KS44KWHIOCkquCkueCksuClhyDgpK/gpLkg4KSV4KSw4KSo4KS+IOCknOCksOClguCksOClgCDgpLngpYgKICAgIHN0ZXAoIlByZS1pbnN0YWxsOiBSZW1vdmluZyBBcGFjaGUyIHRvIGZyZWUgcG9ydCA4MCIpCiAgICBydW4oInN5c3RlbWN0bCBzdG9wIGFwYWNoZTIgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKCJzeXN0ZW1jdGwgZGlzYWJsZSBhcGFjaGUyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiREVCSUFOX0ZST05URU5EPW5vbmludGVyYWN0aXZlIGFwdC1nZXQgcmVtb3ZlIC15IC0tcHVyZ2UgYXBhY2hlMiBhcGFjaGUyLWJpbiBhcGFjaGUyLWRhdGEgYXBhY2hlMi11dGlscyBsaWJhcGFjaGUyLW1vZC1waHAqIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiYXB0LWdldCBhdXRvcmVtb3ZlIC15IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigicm0gLXJmIC9ldGMvYXBhY2hlMiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBvaygiQXBhY2hlMiBwdXJnZWQg4oCUIHBvcnQgODAgaXMgZnJlZSIpCgogICAgIyBBcGFjaGUg4KSV4KWLIGFwdCDgpLjgpYcgYmxvY2sg4KSV4KSw4KWH4KSCIOCkpOCkvuCkleCkvyBQSFAgaW5zdGFsbCDgpK7gpYfgpIIg4KS14KS+4KSq4KS4IOCkqCDgpIbgpI8KICAgIFBhdGgoIi9ldGMvYXB0L3ByZWZlcmVuY2VzLmQvYmxvY2stYXBhY2hlMi5wcmVmIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoIiIiXAogICAgICAgIFBhY2thZ2U6IGFwYWNoZTIgYXBhY2hlMi1iaW4gYXBhY2hlMi1kYXRhIGFwYWNoZTItdXRpbHMgbGliYXBhY2hlMi1tb2QtcGhwKgogICAgICAgIFBpbjogcmVsZWFzZSAqCiAgICAgICAgUGluLVByaW9yaXR5OiAtMQogICAgIiIiKSkKICAgIG9rKCJBcGFjaGUyIGJsb2NrZWQgaW4gYXB0IOKAlCB3aWxsIG5vdCBhdXRvLWluc3RhbGwgYWdhaW4iKQoKICAgIFQgPSByYW1fdHVuZSgpCiAgICBvayhmIlR1bmluZzogUEhQIGNoaWxkcmVuPXtUWydwaHBfY2hpbGRyZW4nXX0gIE15U1FMPXtUWydteXNxbF9idWYnXX0gIFJlZGlzPXtUWydyZWRpc19tZW0nXX0iKQoKICAgIF9zZXR1cF9zd2FwKFQpCiAgICBfa2VybmVsX3R1bmluZygpCiAgICBfaW5zdGFsbF9uZ2lueChvc19pZCwgY29kZW5hbWUsIFQpCiAgICBfaW5zdGFsbF9waHAob3NfaWQsIGNvZGVuYW1lLCBUKQogICAgX2luc3RhbGxfbWFyaWFkYihUKQogICAgX2luc3RhbGxfcmVkaXMoVCkKICAgIF9pbnN0YWxsX3dwY2xpKCkKICAgIF9pbnN0YWxsX2NlcnRib3QoKQogICAgX2NvbmZpZ3VyZV9maXJld2FsbCgpCiAgICBfY29uZmlndXJlX2ZhaWwyYmFuKCkKICAgIF9pbnN0YWxsX2Nyb25zKCkKCiAgICBvayhmIuKcqCBFYXN5SW5zdGFsbCB2e1ZFUlNJT059IGluc3RhbGxhdGlvbiBjb21wbGV0ZSEiKQogICAgaW5mbygiTmV4dDogZWFzeWluc3RhbGwgY3JlYXRlIHlvdXJkb21haW4uY29tIC0tc3NsIikKCiMg4pSA4pSAIFN3YXAg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiBfc2V0dXBfc3dhcChUKToKICAgIGlmIFBhdGgoIi9zd2FwZmlsZSIpLmV4aXN0cygpOgogICAgICAgIGluZm8oIlN3YXAgYWxyZWFkeSBleGlzdHMg4oCUIHNraXBwaW5nIik7IHJldHVybgogICAgcmFtID0gVFsncmFtJ10KICAgIHNpemUgPSAiMUciIGlmIHJhbTw9NTEyIGVsc2UgIjJHIiBpZiByYW08PTEwMjQgZWxzZSAiM0ciIGlmIHJhbTw9MjA0OCBlbHNlICI0RyIKICAgIHN0ZXAoZiJDcmVhdGluZyB7c2l6ZX0gc3dhcCIpCiAgICBpZiBub3QgcnVuX29rKGYiZmFsbG9jYXRlIC1sIHtzaXplfSAvc3dhcGZpbGUiKToKICAgICAgICBydW4oZiJkZCBpZj0vZGV2L3plcm8gb2Y9L3N3YXBmaWxlIGJzPTFNIGNvdW50PTQwOTYgc3RhdHVzPXByb2dyZXNzIikKICAgIHJ1bigiY2htb2QgNjAwIC9zd2FwZmlsZSAmJiBta3N3YXAgL3N3YXBmaWxlICYmIHN3YXBvbiAvc3dhcGZpbGUiKQogICAgZnN0YWIgPSBQYXRoKCIvZXRjL2ZzdGFiIikKICAgIGlmICIvc3dhcGZpbGUiIG5vdCBpbiBmc3RhYi5yZWFkX3RleHQoKToKICAgICAgICBmc3RhYi53cml0ZV90ZXh0KGZzdGFiLnJlYWRfdGV4dCgpICsgIlxuL3N3YXBmaWxlIG5vbmUgc3dhcCBzdyAwIDBcbiIpCiAgICBydW4oInN5c2N0bCAtdyB2bS5zd2FwcGluZXNzPTEwIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIG9rKCJTd2FwIGNyZWF0ZWQiKQoKIyDilIDilIAgS2VybmVsIHR1bmluZyAoY29yZSDigJQgdW5jaGFuZ2VkIHZhbHVlcykg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiBfa2VybmVsX3R1bmluZygpOgogICAgc3RlcCgiS2VybmVsIHR1bmluZyIpCiAgICBQYXRoKCIvZXRjL3N5c2N0bC5kLzk5LXdvcmRwcmVzcy5jb25mIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoIiIiXAogICAgICAgIG5ldC5jb3JlLnJtZW1fbWF4ID0gMTM0MjE3NzI4CiAgICAgICAgbmV0LmNvcmUud21lbV9tYXggPSAxMzQyMTc3MjgKICAgICAgICBuZXQuaXB2NC50Y3Bfcm1lbSA9IDQwOTYgODczODAgMTM0MjE3NzI4CiAgICAgICAgbmV0LmlwdjQudGNwX3dtZW0gPSA0MDk2IDY1NTM2IDEzNDIxNzcyOAogICAgICAgIG5ldC5jb3JlLm5ldGRldl9tYXhfYmFja2xvZyA9IDUwMDAKICAgICAgICBuZXQuaXB2NC50Y3BfY29uZ2VzdGlvbl9jb250cm9sID0gYmJyCiAgICAgICAgbmV0LmNvcmUuZGVmYXVsdF9xZGlzYyA9IGZxCiAgICAgICAgbmV0LmlwdjQudGNwX2Zpbl90aW1lb3V0ID0gMTAKICAgICAgICBuZXQuaXB2NC50Y3BfdHdfcmV1c2UgPSAxCiAgICAgICAgbmV0LmlwdjQudGNwX21heF9zeW5fYmFja2xvZyA9IDQwOTYKICAgICAgICBuZXQuY29yZS5zb21heGNvbm4gPSAxMDI0CiAgICAgICAgbmV0LmlwdjQudGNwX3N5bmNvb2tpZXMgPSAxCiAgICAgICAgbmV0LmlwdjQudGNwX21heF90d19idWNrZXRzID0gMjAwMDAwMAogICAgICAgIG5ldC5pcHY0LnRjcF9rZWVwYWxpdmVfdGltZSA9IDMwMAogICAgICAgIGZzLmZpbGUtbWF4ID0gMjA5NzE1MgogICAgICAgIGZzLmlub3RpZnkubWF4X3VzZXJfd2F0Y2hlcyA9IDUyNDI4OAogICAgICAgIHZtLnN3YXBwaW5lc3MgPSAxMAogICAgICAgIHZtLnZmc19jYWNoZV9wcmVzc3VyZSA9IDUwCiAgICAgICAgdm0uZGlydHlfcmF0aW8gPSAzMAogICAgICAgIHZtLmRpcnR5X2JhY2tncm91bmRfcmF0aW8gPSA1CiAgICAgICAgdm0ub3ZlcmNvbW1pdF9tZW1vcnkgPSAxCiAgICAgICAga2VybmVsLnBpZF9tYXggPSA2NTUzNgogICAgIiIiKSkKICAgIHJ1bigic3lzY3RsIC1wIC9ldGMvc3lzY3RsLmQvOTktd29yZHByZXNzLmNvbmYgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgbGltaXRzID0gUGF0aCgiL2V0Yy9zZWN1cml0eS9saW1pdHMuY29uZiIpCiAgICBleHRyYSA9ICJcbiogc29mdCBub2ZpbGUgMTA0ODU3NlxuKiBoYXJkIG5vZmlsZSAxMDQ4NTc2XG5yb290IHNvZnQgbm9maWxlIDEwNDg1NzZcbnJvb3QgaGFyZCBub2ZpbGUgMTA0ODU3NlxuIgogICAgaWYgIjEwNDg1NzYiIG5vdCBpbiBsaW1pdHMucmVhZF90ZXh0KCk6IGxpbWl0cy53cml0ZV90ZXh0KGxpbWl0cy5yZWFkX3RleHQoKSArIGV4dHJhKQogICAgb2soIktlcm5lbCB0dW5lZCIpCgojIOKUgOKUgCBOZ2lueCBpbnN0YWxsIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgX2luc3RhbGxfbmdpbngob3NfaWQsIGNvZGVuYW1lLCBUKToKICAgIHN0ZXAoIkluc3RhbGxpbmcgTmdpbnggKG9mZmljaWFsIHJlcG8pIikKCiAgICAjIEZJWDogQXBhY2hlMiDgpJXgpYsg4KSq4KWC4KSw4KWAIOCkpOCksOCkuSDgpLngpJ/gpL7gpI/gpIIg4oCUIOCkr+CkuSBQSFAgaW5zdGFsbCDgpJXgpYcg4KS44KS+4KSlIOCkhuCkpOCkviDgpLngpYgg4KSU4KSwIHBvcnQgODAgYmxvY2sg4KSV4KSw4KSk4KS+IOCkueCliAogICAgc3RlcCgiUmVtb3ZpbmcgQXBhY2hlMiBpZiBwcmVzZW50IChjb25mbGljdHMgd2l0aCBOZ2lueCBvbiBwb3J0IDgwKSIpCiAgICBydW4oInN5c3RlbWN0bCBzdG9wIGFwYWNoZTIgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKCJzeXN0ZW1jdGwgZGlzYWJsZSBhcGFjaGUyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiYXB0LWdldCByZW1vdmUgLXkgLS1wdXJnZSBhcGFjaGUyIGFwYWNoZTItYmluIGFwYWNoZTItZGF0YSBhcGFjaGUyLXV0aWxzIGxpYmFwYWNoZTItbW9kLXBocCogMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKCJhcHQtZ2V0IGF1dG9yZW1vdmUgLXkgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgIyBBcGFjaGUg4KSV4KWAIOCkleCli+CkiCDgpK3gpYAgbGVmdG92ZXIgY29uZmlnIOCkueCkn+CkvuCkj+CkggogICAgcnVuKCJybSAtcmYgL2V0Yy9hcGFjaGUyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIG9rKCJBcGFjaGUyIHJlbW92ZWQg4oCUIHBvcnQgODAgaXMgbm93IGZyZWUiKQoKICAgICMgRklYOiBQb3J0IDgwIOCkquCksCDgpJXgpYvgpIgg4KSU4KSwIHByb2Nlc3Mg4KS54KWIIOCkpOCliyDgpIngpLjgpYcg4KSt4KWAIOCkrOCkguCkpiDgpJXgpLDgpYfgpIIKICAgIHBvcnQ4MF9waWQgPSBjbWRfb3V0KCJzcyAtdGxucCAyPi9kZXYvbnVsbCB8IGdyZXAgJzo4MCAnIHwgZ3JlcCAtb1AgJ3BpZD1cXEtbMC05XSsnIikKICAgIGlmIHBvcnQ4MF9waWQ6CiAgICAgICAgd2FybihmIlBvcnQgODAgaW4gdXNlIGJ5IFBJRCB7cG9ydDgwX3BpZH0g4oCUIGtpbGxpbmcgaXQiKQogICAgICAgIHJ1bihmImtpbGwgLTkge3BvcnQ4MF9waWR9IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBpbXBvcnQgdGltZTsgdGltZS5zbGVlcCgyKQoKICAgIHJ1bigiYXB0LWdldCByZW1vdmUgLXkgbmdpbnggbmdpbngtY29tbW9uIG5naW54LWZ1bGwgbmdpbngtY29yZSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBydW4oImN1cmwgLWZzU0wgaHR0cHM6Ly9uZ2lueC5vcmcva2V5cy9uZ2lueF9zaWduaW5nLmtleSB8IGdwZyAtLWRlYXJtb3IgLW8gL3Vzci9zaGFyZS9rZXlyaW5ncy9uZ2lueC1hcmNoaXZlLWtleXJpbmcuZ3BnIikKICAgIHJlcG8gPSBmImRlYiBbc2lnbmVkLWJ5PS91c3Ivc2hhcmUva2V5cmluZ3MvbmdpbngtYXJjaGl2ZS1rZXlyaW5nLmdwZ10gaHR0cDovL25naW54Lm9yZy9wYWNrYWdlcy9tYWlubGluZS97b3NfaWR9IHtjb2RlbmFtZX0gbmdpbngiCiAgICBQYXRoKCIvZXRjL2FwdC9zb3VyY2VzLmxpc3QuZC9uZ2lueC5saXN0Iikud3JpdGVfdGV4dChyZXBvICsgIlxuIikKICAgIHJ1bigiYXB0LWdldCB1cGRhdGUgLXkgJiYgYXB0LWdldCBpbnN0YWxsIC15IG5naW54IikKCiAgICBmb3IgZCBpbiBbIi9ldGMvbmdpbngvc2l0ZXMtYXZhaWxhYmxlIiwgIi9ldGMvbmdpbngvc2l0ZXMtZW5hYmxlZCIsCiAgICAgICAgICAgICAgIi9ldGMvbmdpbngvY29uZi5kIiwgIi9ldGMvbmdpbngvc3NsIiwKICAgICAgICAgICAgICAiL3Zhci9jYWNoZS9uZ2lueC9mYXN0Y2dpIiwgIi92YXIvbG9nL25naW54Il06CiAgICAgICAgUGF0aChkKS5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCgogICAgUGF0aCgiL2V0Yy9uZ2lueC9uZ2lueC5jb25mIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoZiIiIlwKICAgICAgICB1c2VyIG5naW54OwogICAgICAgIHdvcmtlcl9wcm9jZXNzZXMgYXV0bzsKICAgICAgICB3b3JrZXJfcmxpbWl0X25vZmlsZSAxMDQ4NTc2OwogICAgICAgIHBpZCAvcnVuL25naW54LnBpZDsKICAgICAgICBldmVudHMge3sKICAgICAgICAgICAgd29ya2VyX2Nvbm5lY3Rpb25zIHtUWyduZ2lueF9jb25uJ119OwogICAgICAgICAgICB1c2UgZXBvbGw7CiAgICAgICAgICAgIG11bHRpX2FjY2VwdCBvbjsKICAgICAgICB9fQogICAgICAgIGh0dHAge3sKICAgICAgICAgICAgc2VuZGZpbGUgb247IHRjcF9ub3B1c2ggb247IHRjcF9ub2RlbGF5IG9uOwogICAgICAgICAgICBrZWVwYWxpdmVfdGltZW91dCAzMDsga2VlcGFsaXZlX3JlcXVlc3RzIDEwMDA7CiAgICAgICAgICAgIHNlcnZlcl90b2tlbnMgb2ZmOyBjbGllbnRfbWF4X2JvZHlfc2l6ZSAxMjhNOwogICAgICAgICAgICBpbmNsdWRlIC9ldGMvbmdpbngvbWltZS50eXBlczsKICAgICAgICAgICAgZGVmYXVsdF90eXBlIGFwcGxpY2F0aW9uL29jdGV0LXN0cmVhbTsKICAgICAgICAgICAgbG9nX2Zvcm1hdCBtYWluICckcmVtb3RlX2FkZHIgLSAkcmVtb3RlX3VzZXIgWyR0aW1lX2xvY2FsXSAiJHJlcXVlc3QiICcKICAgICAgICAgICAgICAgICAgICAgICAgICAgICckc3RhdHVzICRib2R5X2J5dGVzX3NlbnQgIiRodHRwX3JlZmVyZXIiICcKICAgICAgICAgICAgICAgICAgICAgICAgICAgICciJGh0dHBfdXNlcl9hZ2VudCIgcnQ9JHJlcXVlc3RfdGltZSc7CiAgICAgICAgICAgIGFjY2Vzc19sb2cgL3Zhci9sb2cvbmdpbngvYWNjZXNzLmxvZyBtYWluIGJ1ZmZlcj0zMmsgZmx1c2g9NXM7CiAgICAgICAgICAgIGVycm9yX2xvZyAgL3Zhci9sb2cvbmdpbngvZXJyb3IubG9nIHdhcm47CiAgICAgICAgICAgIGd6aXAgb247IGd6aXBfdmFyeSBvbjsgZ3ppcF9jb21wX2xldmVsIDY7IGd6aXBfbWluX2xlbmd0aCAxMDAwOwogICAgICAgICAgICBnemlwX3R5cGVzIHRleHQvcGxhaW4gdGV4dC9jc3MgYXBwbGljYXRpb24vanNvbiBhcHBsaWNhdGlvbi9qYXZhc2NyaXB0CiAgICAgICAgICAgICAgICAgICAgICAgYXBwbGljYXRpb24veG1sIHRleHQveG1sIGltYWdlL3N2Zyt4bWw7CiAgICAgICAgICAgIGZhc3RjZ2lfY2FjaGVfcGF0aCAvdmFyL2NhY2hlL25naW54L2Zhc3RjZ2kgbGV2ZWxzPTE6MgogICAgICAgICAgICAgICAga2V5c196b25lPVdPUkRQUkVTUzoyNTZtIGluYWN0aXZlPTYwbSBtYXhfc2l6ZT0yZzsKICAgICAgICAgICAgZmFzdGNnaV9jYWNoZV9rZXkgIiRzY2hlbWUkcmVxdWVzdF9tZXRob2QkaG9zdCRyZXF1ZXN0X3VyaSI7CiAgICAgICAgICAgIGZhc3RjZ2lfY2FjaGVfdXNlX3N0YWxlIGVycm9yIHRpbWVvdXQgdXBkYXRpbmcgaW52YWxpZF9oZWFkZXIgaHR0cF81MDAgaHR0cF81MDM7CiAgICAgICAgICAgIGZhc3RjZ2lfY2FjaGVfbG9jayBvbjsKICAgICAgICAgICAgc3NsX3Byb3RvY29scyBUTFN2MS4yIFRMU3YxLjM7CiAgICAgICAgICAgIHNzbF9wcmVmZXJfc2VydmVyX2NpcGhlcnMgb2ZmOwogICAgICAgICAgICBzc2xfc2Vzc2lvbl9jYWNoZSBzaGFyZWQ6U1NMOjUwbTsKICAgICAgICAgICAgc3NsX3Nlc3Npb25fdGltZW91dCAxZDsKICAgICAgICAgICAgbGltaXRfcmVxX3pvbmUgJGJpbmFyeV9yZW1vdGVfYWRkciB6b25lPWxvZ2luOjEwbSByYXRlPTEwci9tOwogICAgICAgICAgICBtYXAgJGh0dHBfY29va2llICRub19jYWNoZSB7ewogICAgICAgICAgICAgICAgZGVmYXVsdCAwOwogICAgICAgICAgICAgICAgfip3b3JkcHJlc3NfbG9nZ2VkX2luIDE7CiAgICAgICAgICAgICAgICB+KndwLXBvc3RwYXNzIDE7CiAgICAgICAgICAgIH19CiAgICAgICAgICAgIGluY2x1ZGUgL2V0Yy9uZ2lueC9jb25mLmQvKi5jb25mOwogICAgICAgICAgICBpbmNsdWRlIC9ldGMvbmdpbngvc2l0ZXMtZW5hYmxlZC8qOwogICAgICAgIH19CiAgICAiIiIpKQogICAgcnVuKCJzeXN0ZW1jdGwgZW5hYmxlIG5naW54ICYmIHN5c3RlbWN0bCBzdGFydCBuZ2lueCIpCiAgICAjIEZJWDogU3RhcnQg4KSV4KWHIOCkrOCkvuCkpiB2ZXJpZnkg4KSV4KSw4KWH4KSCCiAgICBpbXBvcnQgdGltZSBhcyBfdDsgX3Quc2xlZXAoMikKICAgIGlmIG5vdCBzdmNfYWN0aXZlKCJuZ2lueCIpOgogICAgICAgICMg4KSP4KSVIOCkrOCkvuCksCDgpJTgpLAgQXBhY2hlIGNoZWNrIOCkleCksOClh+CkggogICAgICAgIHJ1bigic3lzdGVtY3RsIHN0b3AgYXBhY2hlMiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgcnVuKCJhcHQtZ2V0IHJlbW92ZSAteSAtLXB1cmdlIGFwYWNoZTIgYXBhY2hlMi1iaW4gYXBhY2hlMi1kYXRhIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBydW4oImFwdC1nZXQgYXV0b3JlbW92ZSAteSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgcnVuKCJzeXN0ZW1jdGwgc3RhcnQgbmdpbnggMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgIF90LnNsZWVwKDMpCiAgICBpZiBub3Qgd2FpdF9zdmMoIm5naW54IiwgMzApOgogICAgICAgICMgTmdpbnggZXJyb3IgbG9nIOCkpuClh+CkluClh+CkggogICAgICAgIGxvZ190YWlsID0gY21kX291dCgiam91cm5hbGN0bCAtdSBuZ2lueCAtLW5vLXBhZ2VyIC1uIDIwIDI+L2Rldi9udWxsIikKICAgICAgICB3YXJuKGYiTmdpbnggbWF5IG5vdCBoYXZlIHN0YXJ0ZWQuIENoZWNrOiBqb3VybmFsY3RsIC11IG5naW54XG57bG9nX3RhaWx9IikKICAgIGVsc2U6CiAgICAgICAgb2soIk5naW54IGluc3RhbGxlZCBhbmQgcnVubmluZyIpCgojIOKUgOKUgCBQSFAgaW5zdGFsbCDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKZGVmIF9pbnN0YWxsX3BocChvc19pZCwgY29kZW5hbWUsIFQpOgogICAgc3RlcCgiSW5zdGFsbGluZyBQSFAgKFN1cnkvT25kcmVqIHJlcG8pIikKCiAgICAjIEZJWDogQXBhY2hlMiDgpJXgpYsg4KSq4KS54KSy4KWHIOCkueClgCBibG9jayDgpJXgpLDgpYfgpIIg4oCUIFBIUCBpbnN0YWxsIOCkleClhyDgpLjgpL7gpKUgQXBhY2hlIOCkhuCkqOClhyDgpLjgpYcg4KSw4KWL4KSV4KWH4KSCCiAgICAjIC9ldGMvYXB0L3ByZWZlcmVuY2VzLmQvIOCkruClh+CkgiBBcGFjaGUg4KSV4KWLIHBpbiDgpJXgpLDgpJXgpYcgaG9sZCDgpJXgpLDgpYfgpIIKICAgIFBhdGgoIi9ldGMvYXB0L3ByZWZlcmVuY2VzLmQvYmxvY2stYXBhY2hlMi5wcmVmIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoIiIiXAogICAgICAgIFBhY2thZ2U6IGFwYWNoZTIgYXBhY2hlMi1iaW4gYXBhY2hlMi1kYXRhIGFwYWNoZTItdXRpbHMgbGliYXBhY2hlMi1tb2QtcGhwKgogICAgICAgIFBpbjogcmVsZWFzZSAqCiAgICAgICAgUGluLVByaW9yaXR5OiAtMQogICAgIiIiKSkKICAgIGluZm8oIkFwYWNoZTIgYmxvY2tlZCB2aWEgYXB0IHByZWZlcmVuY2VzIOKAlCB3aWxsIG5vdCBiZSBhdXRvLWluc3RhbGxlZCIpCgogICAgaWYgb3NfaWQgPT0gImRlYmlhbiI6CiAgICAgICAgcnVuKCJhcHQtZ2V0IGluc3RhbGwgLXkgYXB0LXRyYW5zcG9ydC1odHRwcyBsc2ItcmVsZWFzZSBjYS1jZXJ0aWZpY2F0ZXMgY3VybCB3Z2V0IikKICAgICAgICBydW4oIndnZXQgLXFPLSBodHRwczovL3BhY2thZ2VzLnN1cnkub3JnL3BocC9hcHQuZ3BnIHwgZ3BnIC0tZGVhcm1vciA+IC9ldGMvYXB0L3RydXN0ZWQuZ3BnLmQvc3VyeS1waHAuZ3BnIikKICAgICAgICBQYXRoKCIvZXRjL2FwdC9zb3VyY2VzLmxpc3QuZC9zdXJ5LXBocC5saXN0Iikud3JpdGVfdGV4dChmImRlYiBodHRwczovL3BhY2thZ2VzLnN1cnkub3JnL3BocC8ge2NvZGVuYW1lfSBtYWluXG4iKQogICAgZWxzZToKICAgICAgICBydW4oImFkZC1hcHQtcmVwb3NpdG9yeSAteSBwcGE6b25kcmVqL3BocCIpCiAgICBydW4oImFwdC1nZXQgdXBkYXRlIC15IikKCiAgICBpbnN0YWxsZWQgPSBGYWxzZQogICAgIyBJbnN0YWxsIEFMTCBhdmFpbGFibGUgUEhQIHZlcnNpb25zICg4LjEsIDguMiwgOC4zLCA4LjQpCiAgICBmb3IgdmVyIGluIFsiOC40IiwgIjguMyIsICI4LjIiLCAiOC4xIl06CiAgICAgICAgcGtncyA9ICIgIi5qb2luKGYicGhwe3Zlcn0te2V9IiBmb3IgZSBpbiBbCiAgICAgICAgICAgICJmcG0iLCJteXNxbCIsImN1cmwiLCJnZCIsIm1ic3RyaW5nIiwieG1sIiwieG1scnBjIiwiemlwIiwKICAgICAgICAgICAgInNvYXAiLCJpbnRsIiwiYmNtYXRoIiwicmVkaXMiLCJvcGNhY2hlIiwicmVhZGxpbmUiLCJhcGN1IiwiaWdiaW5hcnkiCiAgICAgICAgXSkKICAgICAgICBpZiBydW5fb2soZiJERUJJQU5fRlJPTlRFTkQ9bm9uaW50ZXJhY3RpdmUgYXB0LWdldCBpbnN0YWxsIC15IC0tbm8taW5zdGFsbC1yZWNvbW1lbmRzIHtwa2dzfSIpOgogICAgICAgICAgICBpbnN0YWxsZWQgPSBUcnVlCiAgICAgICAgICAgIGluZm8oZiJQSFAge3Zlcn0gaW5zdGFsbGVkIikKICAgICAgICAgICAgIyBBZnRlciBlYWNoIGluc3RhbGwsIGVuc3VyZSBBcGFjaGUgd2Fzbid0IHB1bGxlZCBpbgogICAgICAgICAgICBydW4oImFwdC1nZXQgcmVtb3ZlIC15IC0tcHVyZ2UgYXBhY2hlMiBhcGFjaGUyLWJpbiBhcGFjaGUyLWRhdGEgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICAjIERvbid0IGJyZWFrIOKAlCBpbnN0YWxsIGFsbCB2ZXJzaW9ucwoKICAgIGlmIG5vdCBpbnN0YWxsZWQ6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJQSFAgaW5zdGFsbGF0aW9uIGZhaWxlZCBmb3IgYWxsIHZlcnNpb25zIikKCiAgICBmb3IgdmVyIGluIFsiOC40IiwgIjguMyIsICI4LjIiLCAiOC4xIl06CiAgICAgICAgcGhwX2RpciA9IFBhdGgoZiIvZXRjL3BocC97dmVyfSIpCiAgICAgICAgaWYgbm90IHBocF9kaXIuZXhpc3RzKCk6IGNvbnRpbnVlCiAgICAgICAgX2NvbmZpZ3VyZV9waHAodmVyLCBUKQoKZGVmIF9jb25maWd1cmVfcGhwKHZlciwgVCk6CiAgICBwb29sX2NvbmYgPSBQYXRoKGYiL2V0Yy9waHAve3Zlcn0vZnBtL3Bvb2wuZC93d3cuY29uZiIpCiAgICBwb29sX2NvbmYud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoZiIiIlwKICAgICAgICBbd3d3XQogICAgICAgIHVzZXIgPSB3d3ctZGF0YQogICAgICAgIGdyb3VwID0gd3d3LWRhdGEKICAgICAgICBsaXN0ZW4gPSAvcnVuL3BocC9waHB7dmVyfS1mcG0uc29jawogICAgICAgIGxpc3Rlbi5vd25lciA9IHd3dy1kYXRhCiAgICAgICAgbGlzdGVuLmdyb3VwID0gd3d3LWRhdGEKICAgICAgICBsaXN0ZW4ubW9kZSA9IDA2NjAKICAgICAgICBsaXN0ZW4uYmFja2xvZyA9IDY1NTM1CiAgICAgICAgcG0gPSBkeW5hbWljCiAgICAgICAgcG0ubWF4X2NoaWxkcmVuID0ge1RbJ3BocF9jaGlsZHJlbiddfQogICAgICAgIHBtLnN0YXJ0X3NlcnZlcnMgPSB7VFsncGhwX3N0YXJ0J119CiAgICAgICAgcG0ubWluX3NwYXJlX3NlcnZlcnMgPSB7VFsncGhwX21pbiddfQogICAgICAgIHBtLm1heF9zcGFyZV9zZXJ2ZXJzID0ge1RbJ3BocF9tYXgnXX0KICAgICAgICBwbS5tYXhfcmVxdWVzdHMgPSAxMDAwMAogICAgICAgIHBtLnN0YXR1c19wYXRoID0gL3N0YXR1cwogICAgICAgIHJlcXVlc3RfdGVybWluYXRlX3RpbWVvdXQgPSB7VFsncGhwX2V4ZWMnXX1zCiAgICAgICAgY2F0Y2hfd29ya2Vyc19vdXRwdXQgPSB5ZXMKICAgICAgICBzZWN1cml0eS5saW1pdF9leHRlbnNpb25zID0gLnBocCAucGhwMyAucGhwNCAucGhwNSAucGhwNwogICAgIiIiKSkKICAgICMgcGhwLmluaSB0d2Vha3MKICAgIGluaSA9IFBhdGgoZiIvZXRjL3BocC97dmVyfS9mcG0vcGhwLmluaSIpCiAgICBpZiBpbmkuZXhpc3RzKCk6CiAgICAgICAgdHh0ID0gaW5pLnJlYWRfdGV4dCgpCiAgICAgICAgZm9yIHBhdCwgcmVwIGluIFsKICAgICAgICAgICAgKHIibWVtb3J5X2xpbWl0ID0gLioiLCAgICAgICAgIGYibWVtb3J5X2xpbWl0ID0ge1RbJ3BocF9tZW0nXX0iKSwKICAgICAgICAgICAgKHIidXBsb2FkX21heF9maWxlc2l6ZSA9IC4qIiwgICJ1cGxvYWRfbWF4X2ZpbGVzaXplID0gNjRNIiksCiAgICAgICAgICAgIChyInBvc3RfbWF4X3NpemUgPSAuKiIsICAgICAgICAicG9zdF9tYXhfc2l6ZSA9IDY0TSIpLAogICAgICAgICAgICAociJtYXhfZXhlY3V0aW9uX3RpbWUgPSAuKiIsICAgZiJtYXhfZXhlY3V0aW9uX3RpbWUgPSB7VFsncGhwX2V4ZWMnXX0iKSwKICAgICAgICAgICAgKHIiO2RhdGVcLnRpbWV6b25lLioiLCAgICAgICAgICJkYXRlLnRpbWV6b25lID0gVVRDIiksCiAgICAgICAgICAgIChyIjttYXhfaW5wdXRfdmFycyA9IC4qIiwgICAgICAibWF4X2lucHV0X3ZhcnMgPSA1MDAwIiksCiAgICAgICAgICAgIChyIjtyZWFscGF0aF9jYWNoZV9zaXplID0gLioiLCAicmVhbHBhdGhfY2FjaGVfc2l6ZSA9IDQwOTZrIiksCiAgICAgICAgXToKICAgICAgICAgICAgdHh0ID0gcmUuc3ViKHBhdCwgcmVwLCB0eHQpCiAgICAgICAgaW5pLndyaXRlX3RleHQodHh0KQogICAgIyBPUGNhY2hlCiAgICBQYXRoKGYiL2V0Yy9waHAve3Zlcn0vZnBtL2NvbmYuZC8xMC1vcGNhY2hlLmluaSIpLndyaXRlX3RleHQodGV4dHdyYXAuZGVkZW50KCIiIlwKICAgICAgICBvcGNhY2hlLmVuYWJsZT0xCiAgICAgICAgb3BjYWNoZS5tZW1vcnlfY29uc3VtcHRpb249MjU2CiAgICAgICAgb3BjYWNoZS5pbnRlcm5lZF9zdHJpbmdzX2J1ZmZlcj0xNgogICAgICAgIG9wY2FjaGUubWF4X2FjY2VsZXJhdGVkX2ZpbGVzPTIwMDAwCiAgICAgICAgb3BjYWNoZS5yZXZhbGlkYXRlX2ZyZXE9NjAKICAgICAgICBvcGNhY2hlLmZhc3Rfc2h1dGRvd249MQogICAgICAgIG9wY2FjaGUuZW5hYmxlX2NsaT0xCiAgICAgICAgb3BjYWNoZS52YWxpZGF0ZV90aW1lc3RhbXBzPTAKICAgICAgICBvcGNhY2hlLnNhdmVfY29tbWVudHM9MQogICAgIiIiKSkKICAgIHJ1bihmInN5c3RlbWN0bCBlbmFibGUgcGhwe3Zlcn0tZnBtICYmIHN5c3RlbWN0bCBzdGFydCBwaHB7dmVyfS1mcG0iKQogICAgd2FpdF9zdmMoZiJwaHB7dmVyfS1mcG0iLCAyMCkKICAgIGZpeF9zb2NrKHZlcikKICAgIG9rKGYiUEhQIHt2ZXJ9IGNvbmZpZ3VyZWQiKQoKIyDilIDilIAgTWFyaWFEQiBpbnN0YWxsIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgX2luc3RhbGxfbWFyaWFkYihUKToKICAgIHN0ZXAoIkluc3RhbGxpbmcgTWFyaWFEQiAxMS54IikKICAgIHJ1bigic3lzdGVtY3RsIHN0b3AgbWFyaWFkYiBteXNxbCAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBydW4oImN1cmwgLWZzU0wgaHR0cHM6Ly9kb3dubG9hZHMubWFyaWFkYi5jb20vTWFyaWFEQi9tYXJpYWRiX3JlcG9fc2V0dXAgfCBiYXNoIC1zIC0tIC0tbWFyaWFkYi1zZXJ2ZXItdmVyc2lvbj1tYXJpYWRiLTExLjQgLS1za2lwLW1heHNjYWxlIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiYXB0LWdldCB1cGRhdGUgLXkgJiYgYXB0LWdldCBpbnN0YWxsIC15IG1hcmlhZGItc2VydmVyIG1hcmlhZGItY2xpZW50IikKCiAgICBQYXRoKCIvZXRjL215c3FsL21hcmlhZGIuY29uZi5kLzk5LXdvcmRwcmVzcy5jbmYiKS53cml0ZV90ZXh0KHRleHR3cmFwLmRlZGVudChmIiIiXAogICAgICAgIFtteXNxbGRdCiAgICAgICAgYmluZC1hZGRyZXNzICAgICAgICAgICAgPSAxMjcuMC4wLjEKICAgICAgICBtYXhfY29ubmVjdGlvbnMgICAgICAgICA9IDUwMAogICAgICAgIG1heF9hbGxvd2VkX3BhY2tldCAgICAgID0gMjU2TQogICAgICAgIGlubm9kYl9idWZmZXJfcG9vbF9zaXplID0ge1RbJ215c3FsX2J1ZiddfQogICAgICAgIGlubm9kYl9sb2dfZmlsZV9zaXplICAgID0ge1RbJ215c3FsX2xvZyddfQogICAgICAgIGlubm9kYl9mbHVzaF9tZXRob2QgICAgID0gT19ESVJFQ1QKICAgICAgICBpbm5vZGJfZmlsZV9wZXJfdGFibGUgICA9IDEKICAgICAgICBpbm5vZGJfZmx1c2hfbG9nX2F0X3RyeF9jb21taXQgPSAyCiAgICAgICAgaW5ub2RiX2lvX2NhcGFjaXR5ICAgICAgPSAyMDAwCiAgICAgICAgdGFibGVfb3Blbl9jYWNoZSAgICAgICAgPSAyMDAwMAogICAgICAgIHRhYmxlX2RlZmluaXRpb25fY2FjaGUgID0gMjAwMDAKICAgICAgICBvcGVuX2ZpbGVzX2xpbWl0ICAgICAgICA9IDEwMDAwMAogICAgICAgIHNsb3dfcXVlcnlfbG9nICAgICAgICAgID0gMQogICAgICAgIHNsb3dfcXVlcnlfbG9nX2ZpbGUgICAgID0gL3Zhci9sb2cvbXlzcWwvc2xvdy5sb2cKICAgICAgICBsb25nX3F1ZXJ5X3RpbWUgICAgICAgICA9IDIKICAgICAgICBjaGFyYWN0ZXItc2V0LXNlcnZlciAgICA9IHV0ZjhtYjQKICAgICAgICBjb2xsYXRpb24tc2VydmVyICAgICAgICA9IHV0ZjhtYjRfdW5pY29kZV9jaQogICAgICAgIHRocmVhZF9jYWNoZV9zaXplICAgICAgID0gMjU2CiAgICAiIiIpKQogICAgcnVuKCJzeXN0ZW1jdGwgZW5hYmxlIG1hcmlhZGIgJiYgc3lzdGVtY3RsIHN0YXJ0IG1hcmlhZGIiKQogICAgd2FpdF9zdmMoIm1hcmlhZGIiLCAzMCkKICAgICMgU2VjdXJlCiAgICBydW4oIiIibXlzcWwgLWUgIkRFTEVURSBGUk9NIG15c3FsLnVzZXIgV0hFUkUgVXNlcj0nJzsgRFJPUCBEQVRBQkFTRSBJRiBFWElTVFMgdGVzdDsgRkxVU0ggUFJJVklMRUdFUzsiIDI+L2Rldi9udWxsIHx8IHRydWUiIiIsIGNoZWNrPUZhbHNlKQogICAgb2soIk1hcmlhREIgaW5zdGFsbGVkIikKCiMg4pSA4pSAIFJlZGlzIGluc3RhbGwg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiBfaW5zdGFsbF9yZWRpcyhUKToKICAgIHN0ZXAoIkluc3RhbGxpbmcgUmVkaXMgNy54IikKICAgIHJ1bigiY3VybCAtZnNTTCBodHRwczovL3BhY2thZ2VzLnJlZGlzLmlvL2dwZyB8IGdwZyAtLWRlYXJtb3IgLW8gL3Vzci9zaGFyZS9rZXlyaW5ncy9yZWRpcy1hcmNoaXZlLWtleXJpbmcuZ3BnIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIF8sIF8sIF8gPSBkZXRlY3Rfb3MoKQogICAgb3NfaWQsIG9zX3ZlciwgY29kZW5hbWUgPSBkZXRlY3Rfb3MoKQogICAgUGF0aCgiL2V0Yy9hcHQvc291cmNlcy5saXN0LmQvcmVkaXMubGlzdCIpLndyaXRlX3RleHQoCiAgICAgICAgZiJkZWIgW3NpZ25lZC1ieT0vdXNyL3NoYXJlL2tleXJpbmdzL3JlZGlzLWFyY2hpdmUta2V5cmluZy5ncGddIGh0dHBzOi8vcGFja2FnZXMucmVkaXMuaW8vZGViIHtjb2RlbmFtZX0gbWFpblxuIgogICAgKQogICAgcnVuKCJhcHQtZ2V0IHVwZGF0ZSAteSAyPi9kZXYvbnVsbCB8fCB0cnVlICYmIGFwdC1nZXQgaW5zdGFsbCAteSByZWRpcy1zZXJ2ZXIgcmVkaXMtdG9vbHMiKQogICAgUGF0aCgiL2V0Yy9yZWRpcy9yZWRpcy5jb25mIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoZiIiIlwKICAgICAgICBiaW5kIDEyNy4wLjAuMQogICAgICAgIHBvcnQgNjM3OQogICAgICAgIGRhZW1vbml6ZSB5ZXMKICAgICAgICBzdXBlcnZpc2VkIHN5c3RlbWQKICAgICAgICBwaWRmaWxlIC92YXIvcnVuL3JlZGlzL3JlZGlzLXNlcnZlci5waWQKICAgICAgICBsb2dsZXZlbCBub3RpY2UKICAgICAgICBsb2dmaWxlIC92YXIvbG9nL3JlZGlzL3JlZGlzLXNlcnZlci5sb2cKICAgICAgICBkYXRhYmFzZXMgMTYKICAgICAgICBtYXhtZW1vcnkge1RbJ3JlZGlzX21lbSddfQogICAgICAgIG1heG1lbW9yeS1wb2xpY3kgYWxsa2V5cy1scnUKICAgICAgICBtYXhtZW1vcnktc2FtcGxlcyAxMAogICAgICAgIHNhdmUgIiIKICAgICAgICBhcHBlbmRvbmx5IG5vCiAgICAgICAgbWF4Y2xpZW50cyAxMDAwMAogICAgICAgIHRjcC1iYWNrbG9nIDY1NTM1CiAgICAgICAgdGltZW91dCAwCiAgICAgICAgdGNwLWtlZXBhbGl2ZSAzMDAKICAgICIiIikpCiAgICBydW4oInN5c3RlbWN0bCBlbmFibGUgcmVkaXMtc2VydmVyICYmIHN5c3RlbWN0bCBzdGFydCByZWRpcy1zZXJ2ZXIiKQogICAgd2FpdF9zdmMoInJlZGlzLXNlcnZlciIsIDIwKQogICAgU1RBVEVfRElSLm1rZGlyKHBhcmVudHM9VHJ1ZSwgZXhpc3Rfb2s9VHJ1ZSkKICAgIFJFRElTX1BPUlRTLndyaXRlX3RleHQoIjYzNzlcbiIpCiAgICBvaygiUmVkaXMgaW5zdGFsbGVkIikKCiMg4pSA4pSAIFdQLUNMSSBpbnN0YWxsIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgX2luc3RhbGxfd3BjbGkoKToKICAgIHN0ZXAoIkluc3RhbGxpbmcgV1AtQ0xJIikKICAgIHJ1bigiY3VybCAtTyBodHRwczovL3Jhdy5naXRodWJ1c2VyY29udGVudC5jb20vd3AtY2xpL2J1aWxkcy9naC1wYWdlcy9waGFyL3dwLWNsaS5waGFyIikKICAgIHJ1bigiY2htb2QgK3ggd3AtY2xpLnBoYXIgJiYgbXYgd3AtY2xpLnBoYXIgL3Vzci9sb2NhbC9iaW4vd3AiKQogICAgb2soIldQLUNMSSBpbnN0YWxsZWQiKQoKIyDilIDilIAgQ2VydGJvdCBpbnN0YWxsIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgX2luc3RhbGxfY2VydGJvdCgpOgogICAgc3RlcCgiSW5zdGFsbGluZyBDZXJ0Ym90IikKICAgIHJ1bigiYXB0LWdldCBpbnN0YWxsIC15IGNlcnRib3QgcHl0aG9uMy1jZXJ0Ym90LW5naW54IikKICAgIG9rKCJDZXJ0Ym90IGluc3RhbGxlZCIpCgojIOKUgOKUgCBGaXJld2FsbCDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKZGVmIF9jb25maWd1cmVfZmlyZXdhbGwoKToKICAgIHN0ZXAoIkNvbmZpZ3VyaW5nIFVGVyBmaXJld2FsbCIpCiAgICBmb3IgY21kIGluIFsidWZ3IC0tZm9yY2UgZGlzYWJsZSIsICJ1ZncgLS1mb3JjZSByZXNldCIsCiAgICAgICAgICAgICAgICAidWZ3IGRlZmF1bHQgZGVueSBpbmNvbWluZyIsICJ1ZncgZGVmYXVsdCBhbGxvdyBvdXRnb2luZyIsCiAgICAgICAgICAgICAgICAidWZ3IGFsbG93IDIyL3RjcCIsICJ1ZncgYWxsb3cgODAvdGNwIiwgInVmdyBhbGxvdyA0NDMvdGNwIiwKICAgICAgICAgICAgICAgICJ1ZncgYWxsb3cgNDQzL3VkcCIsICJ1ZncgbGltaXQgc3NoL3RjcCJdOgogICAgICAgIHJ1bihmIntjbWR9IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiZWNobyAneScgfCB1ZncgZW5hYmxlIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIG9rKCJGaXJld2FsbCBjb25maWd1cmVkIikKCiMg4pSA4pSAIEZhaWwyYmFuIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgX2NvbmZpZ3VyZV9mYWlsMmJhbigpOgogICAgc3RlcCgiQ29uZmlndXJpbmcgRmFpbDJiYW4iKQogICAgUGF0aCgiL2V0Yy9mYWlsMmJhbi9qYWlsLmxvY2FsIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoIiIiXAogICAgICAgIFtERUZBVUxUXQogICAgICAgIGJhbnRpbWUgID0gMzYwMAogICAgICAgIGZpbmR0aW1lID0gNjAwCiAgICAgICAgbWF4cmV0cnkgPSA1CiAgICAgICAgaWdub3JlaXAgPSAxMjcuMC4wLjEvOCA6OjEKCiAgICAgICAgW3NzaGRdCiAgICAgICAgZW5hYmxlZCA9IHRydWUKICAgICAgICBwb3J0ICAgID0gc3NoCiAgICAgICAgZmlsdGVyICA9IHNzaGQKICAgICAgICBsb2dwYXRoID0gL3Zhci9sb2cvYXV0aC5sb2cKICAgICAgICBtYXhyZXRyeSA9IDMKICAgICAgICBiYW50aW1lICA9IDg2NDAwCgogICAgICAgIFtuZ2lueC1odHRwLWF1dGhdCiAgICAgICAgZW5hYmxlZCA9IHRydWUKICAgICAgICBmaWx0ZXIgID0gbmdpbngtaHR0cC1hdXRoCiAgICAgICAgcG9ydCAgICA9IGh0dHAsaHR0cHMKICAgICAgICBsb2dwYXRoID0gL3Zhci9sb2cvbmdpbngvZXJyb3IubG9nCgogICAgICAgIFt3b3JkcHJlc3NdCiAgICAgICAgZW5hYmxlZCA9IHRydWUKICAgICAgICBmaWx0ZXIgID0gd29yZHByZXNzCiAgICAgICAgcG9ydCAgICA9IGh0dHAsaHR0cHMKICAgICAgICBsb2dwYXRoID0gL3Zhci9sb2cvbmdpbngvYWNjZXNzLmxvZwogICAgICAgIG1heHJldHJ5ID0gNQogICAgIiIiKSkKICAgIFBhdGgoIi9ldGMvZmFpbDJiYW4vZmlsdGVyLmQvd29yZHByZXNzLmNvbmYiKS53cml0ZV90ZXh0KHRleHR3cmFwLmRlZGVudCgiIiJcCiAgICAgICAgW0RlZmluaXRpb25dCiAgICAgICAgZmFpbHJlZ2V4ID0gXjxIT1NUPiAuKiAiUE9TVCAuKndwLWxvZ2luXFwucGhwLioiIDIwMAogICAgICAgICAgICAgICAgICAgIF48SE9TVD4gLiogIlBPU1QgLip4bWxycGNcXC5waHAuKiIgMjAwCiAgICAgICAgaWdub3JlcmVnZXggPQogICAgIiIiKSkKICAgIHJ1bigic3lzdGVtY3RsIGVuYWJsZSBmYWlsMmJhbiAmJiBzeXN0ZW1jdGwgcmVzdGFydCBmYWlsMmJhbiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBvaygiRmFpbDJiYW4gY29uZmlndXJlZCIpCgojIOKUgOKUgCBDcm9uIGpvYnMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiBfaW5zdGFsbF9jcm9ucygpOgogICAgUGF0aCgiL2V0Yy9jcm9uLmQvZWFzeWluc3RhbGwtc2VsZmhlYWwiKS53cml0ZV90ZXh0KHRleHR3cmFwLmRlZGVudCgiIiJcCiAgICAgICAgMCAzICogKiAqICAgcm9vdCAvdXNyL2xvY2FsL2Jpbi9lYXN5aW5zdGFsbCBzZWxmLWhlYWwgZnVsbCA+PiAvdmFyL2xvZy9lYXN5aW5zdGFsbC9zZWxmaGVhbC1jcm9uLmxvZyAyPiYxCiAgICAgICAgMCA0ICogKiAwICAgcm9vdCAvdXNyL2xvY2FsL2Jpbi9lYXN5aW5zdGFsbCBzZWxmLXVwZGF0ZSBhbGwgPj4gL3Zhci9sb2cvZWFzeWluc3RhbGwvc2VsZnVwZGF0ZS1jcm9uLmxvZyAyPiYxCiAgICAgICAgKi8xNSAqICogKiAqIHJvb3QgL3Vzci9sb2NhbC9iaW4vZWFzeWluc3RhbGwgc2VsZi1oZWFsIHNlcnZpY2VzID4+IC92YXIvbG9nL2Vhc3lpbnN0YWxsL3NlbGZoZWFsLWNyb24ubG9nIDI+JjEKICAgICIiIikpCiAgICBvaygiQ3JvbiBqb2JzIGluc3RhbGxlZCIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgQ1JFQVRFIOKAlCBXb3JkUHJlc3Mgc2l0ZQojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfY3JlYXRlKGFyZ3MpOgogICAgZG9tYWluID0gYXJnc1swXQogICAgZG9tYWluID0gcmUuc3ViKHIiaHR0cHM/Oi8vfF53d3dcLnwvIiwgIiIsIGRvbWFpbikKICAgIHBocF92ZXIgPSAiYXV0byI7IHVzZV9zc2wgPSBGYWxzZQogICAgZm9yIGEgaW4gYXJnc1sxOl06CiAgICAgICAgaWYgYS5zdGFydHN3aXRoKCItLXBocD0iKTogcGhwX3ZlciA9IGEuc3BsaXQoIj0iKVsxXQogICAgICAgIGlmIGEgPT0gIi0tc3NsIjogdXNlX3NzbCA9IFRydWUKCiAgICBzdGVwKGYiQ3JlYXRpbmcgV29yZFByZXNzIHNpdGU6IHtkb21haW59IikKCiAgICAjIENoZWNrIGV4aXN0aW5nCiAgICBpZiBQYXRoKGYiL3Zhci93d3cvaHRtbC97ZG9tYWlufSIpLmV4aXN0cygpOgogICAgICAgIGVycihmIlNpdGUgYWxyZWFkeSBleGlzdHM6IHtkb21haW59Iik7IHJldHVybgoKICAgICMgUEhQIHZlcnNpb24KICAgIGlmIHBocF92ZXIgPT0gImF1dG8iOiBwaHBfdmVyID0gZGV0ZWN0X3BocCgpCiAgICBpZiBub3Qgc3ZjX2FjdGl2ZShmInBocHtwaHBfdmVyfS1mcG0iKToKICAgICAgICBzdmNfcmVzdGFydChmInBocHtwaHBfdmVyfS1mcG0iKQogICAgICAgIHRpbWUuc2xlZXAoMikKICAgIGlmIG5vdCBzdmNfYWN0aXZlKGYicGhwe3BocF92ZXJ9LWZwbSIpOgogICAgICAgIGVycihmIlBIUCB7cGhwX3Zlcn0tRlBNIG5vdCBydW5uaW5nIik7IHJldHVybgoKICAgICMgU29ja2V0IGNoZWNrCiAgICBzb2NrID0gcGhwX3NvY2socGhwX3ZlcikKICAgIGlmIG5vdCBzb2NrLmV4aXN0cygpOgogICAgICAgIHN2Y19yZXN0YXJ0KGYicGhwe3BocF92ZXJ9LWZwbSIpOyB0aW1lLnNsZWVwKDMpCiAgICBpZiBub3Qgc29jay5leGlzdHMoKToKICAgICAgICBlcnIoZiJQSFAgc29ja2V0IG1pc3Npbmc6IHtzb2NrfSIpOyByZXR1cm4KICAgIGZpeF9zb2NrKHBocF92ZXIpCiAgICBvayhmIlBIUCB7cGhwX3Zlcn0gc29ja2V0OiB7c29ja30iKQoKICAgICMgUmVkaXMKICAgIHJlZGlzX3BvcnQgPSBuZXh0X3JlZGlzX3BvcnQoKQogICAgX2NyZWF0ZV9zaXRlX3JlZGlzKGRvbWFpbiwgcmVkaXNfcG9ydCkKCiAgICAjIERvd25sb2FkIFdvcmRQcmVzcyB2aWEgUEhQIGhlbHBlcgogICAgd3BfcGF0aCA9IGYiL3Zhci93d3cvaHRtbC97ZG9tYWlufSIKICAgIFBhdGgod3BfcGF0aCkubWtkaXIocGFyZW50cz1UcnVlLCBleGlzdF9vaz1UcnVlKQogICAgaW5mbygiRG93bmxvYWRpbmcgV29yZFByZXNzLi4uIikKICAgIHJ1bihmIndnZXQgLXFPLSBodHRwczovL3dvcmRwcmVzcy5vcmcvbGF0ZXN0LnRhci5neiB8IHRhciB4eiAtQyB7d3BfcGF0aH0gLS1zdHJpcC1jb21wb25lbnRzPTEiKQogICAgcnVuKGYiY2hvd24gLVIgd3d3LWRhdGE6d3d3LWRhdGEge3dwX3BhdGh9ICYmIGNobW9kIC1SIDc1NSB7d3BfcGF0aH0iKQoKICAgICMgREIgKyB3cC1jb25maWcgdmlhIFBIUCBoZWxwZXIKICAgIHJ1bihmInBocCB7UEhQX0hFTFBFUn0gY3JlYXRlLXNpdGUge2RvbWFpbn0ge3JlZGlzX3BvcnR9IHtwaHBfdmVyfSIpCgogICAgIyBOZ2lueCBjb25maWcKICAgIF93cml0ZV9uZ2lueF9zaXRlKGRvbWFpbiwgcGhwX3ZlcikKCiAgICAjIFNTTAogICAgaWYgdXNlX3NzbDoKICAgICAgICBfZW5hYmxlX3NzbChkb21haW4pCgogICAgb2soZiJXb3JkUHJlc3Mgc2l0ZSByZWFkeTogeydodHRwcycgaWYgdXNlX3NzbCBlbHNlICdodHRwJ306Ly97ZG9tYWlufS93cC1hZG1pbi9pbnN0YWxsLnBocCIpCiAgICBpbmZvKGYiQ3JlZGVudGlhbHM6IC9yb290L3tkb21haW59LWNyZWRlbnRpYWxzLnR4dCIpCgpkZWYgX2NyZWF0ZV9zaXRlX3JlZGlzKGRvbWFpbiwgcG9ydCk6CiAgICBzbHVnID0gZG9tYWluLnJlcGxhY2UoIi4iLCAiLSIpCiAgICBjb25mX3BhdGggPSBmIi9ldGMvcmVkaXMvcmVkaXMte3NsdWd9LmNvbmYiCiAgICBzdmNfcGF0aCAgPSBmIi9ldGMvc3lzdGVtZC9zeXN0ZW0vcmVkaXMte3NsdWd9LnNlcnZpY2UiCgogICAgcmVkaXNfbWVtID0gY21kX291dCgiZ3JlcCAnXm1heG1lbW9yeScgL2V0Yy9yZWRpcy9yZWRpcy5jb25mIHwgYXdrICd7cHJpbnQgJDJ9JyIpIG9yICIxMjhtYiIKICAgIFBhdGgoY29uZl9wYXRoKS53cml0ZV90ZXh0KHRleHR3cmFwLmRlZGVudChmIiIiXAogICAgICAgIHBvcnQge3BvcnR9CiAgICAgICAgZGFlbW9uaXplIHllcwogICAgICAgIHBpZGZpbGUgL3Zhci9ydW4vcmVkaXMvcmVkaXMte3NsdWd9LnBpZAogICAgICAgIGxvZ2ZpbGUgL3Zhci9sb2cvcmVkaXMvcmVkaXMte3NsdWd9LmxvZwogICAgICAgIGRpciAvdmFyL2xpYi9yZWRpcy97c2x1Z30KICAgICAgICBtYXhtZW1vcnkge3JlZGlzX21lbX0KICAgICAgICBtYXhtZW1vcnktcG9saWN5IGFsbGtleXMtbHJ1CiAgICAgICAgYXBwZW5kb25seSBubwogICAgICAgIHNhdmUgIiIKICAgICAgICBiaW5kIDEyNy4wLjAuMQogICAgIiIiKSkKICAgIFBhdGgoZiIvdmFyL2xpYi9yZWRpcy97c2x1Z30iKS5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICBydW4oZiJjaG93biByZWRpczpyZWRpcyAvdmFyL2xpYi9yZWRpcy97c2x1Z30iLCBjaGVjaz1GYWxzZSkKICAgIFBhdGgoc3ZjX3BhdGgpLndyaXRlX3RleHQodGV4dHdyYXAuZGVkZW50KGYiIiJcCiAgICAgICAgW1VuaXRdCiAgICAgICAgRGVzY3JpcHRpb249UmVkaXMgZm9yIHtkb21haW59CiAgICAgICAgQWZ0ZXI9bmV0d29yay50YXJnZXQKICAgICAgICBbU2VydmljZV0KICAgICAgICBUeXBlPWZvcmtpbmcKICAgICAgICBFeGVjU3RhcnQ9L3Vzci9iaW4vcmVkaXMtc2VydmVyIHtjb25mX3BhdGh9CiAgICAgICAgRXhlY1N0b3A9L3Vzci9iaW4vcmVkaXMtY2xpIC1wIHtwb3J0fSBzaHV0ZG93bgogICAgICAgIFVzZXI9cmVkaXMKICAgICAgICBHcm91cD1yZWRpcwogICAgICAgIFJ1bnRpbWVEaXJlY3Rvcnk9cmVkaXMKICAgICAgICBSdW50aW1lRGlyZWN0b3J5TW9kZT0wNzU1CiAgICAgICAgW0luc3RhbGxdCiAgICAgICAgV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQKICAgICIiIikpCiAgICBydW4oInN5c3RlbWN0bCBkYWVtb24tcmVsb2FkIikKICAgIHJ1bihmInN5c3RlbWN0bCBlbmFibGUgcmVkaXMte3NsdWd9ICYmIHN5c3RlbWN0bCBzdGFydCByZWRpcy17c2x1Z30iKQogICAgd2FpdF9zdmMoZiJyZWRpcy17c2x1Z30iLCAyMCkKICAgIF9hZGRfcG9ydChwb3J0KQogICAgb2soZiJSZWRpcyBpbnN0YW5jZTogcG9ydCB7cG9ydH0iKQoKZGVmIF93cml0ZV9uZ2lueF9zaXRlKGRvbWFpbiwgcGhwX3Zlcik6CiAgICBzb2NrID0gZiIvcnVuL3BocC9waHB7cGhwX3Zlcn0tZnBtLnNvY2siCiAgICBjb25mID0gdGV4dHdyYXAuZGVkZW50KGYiIiJcCiAgICAgICAgc2VydmVyIHt7CiAgICAgICAgICAgIGxpc3RlbiA4MDsKICAgICAgICAgICAgbGlzdGVuIFs6Ol06ODA7CiAgICAgICAgICAgIHNlcnZlcl9uYW1lIHtkb21haW59IHd3dy57ZG9tYWlufTsKICAgICAgICAgICAgcm9vdCAvdmFyL3d3dy9odG1sL3tkb21haW59OwogICAgICAgICAgICBpbmRleCBpbmRleC5waHAgaW5kZXguaHRtbCBpbmRleC5odG07CgogICAgICAgICAgICBhY2Nlc3NfbG9nIC92YXIvbG9nL25naW54L3tkb21haW59LmFjY2Vzcy5sb2cgbWFpbiBidWZmZXI9MzJrIGZsdXNoPTVzOwogICAgICAgICAgICBlcnJvcl9sb2cgIC92YXIvbG9nL25naW54L3tkb21haW59LmVycm9yLmxvZyB3YXJuOwoKICAgICAgICAgICAgc2V0ICRza2lwX2NhY2hlIDA7CiAgICAgICAgICAgIGlmICgkcmVxdWVzdF9tZXRob2QgPSBQT1NUKSAgICAgICAgIHt7IHNldCAkc2tpcF9jYWNoZSAxOyB9fQogICAgICAgICAgICBpZiAoJHF1ZXJ5X3N0cmluZyAhPSAiIikgICAgICAgICAgICB7eyBzZXQgJHNraXBfY2FjaGUgMTsgfX0KICAgICAgICAgICAgaWYgKCRyZXF1ZXN0X3VyaSB+KiAiL3dwLWFkbWluL3wveG1scnBjLnBocHx3cC0uKi5waHB8L2ZlZWQvfHNpdGVtYXAiKSB7eyBzZXQgJHNraXBfY2FjaGUgMTsgfX0KICAgICAgICAgICAgaWYgKCRodHRwX2Nvb2tpZSB+KiAiY29tbWVudF9hdXRob3J8d29yZHByZXNzX1thLWYwLTldK3x3cC1wb3N0cGFzc3x3b3JkcHJlc3NfbG9nZ2VkX2luIikge3sgc2V0ICRza2lwX2NhY2hlIDE7IH19CgogICAgICAgICAgICBsb2NhdGlvbiAvIHt7CiAgICAgICAgICAgICAgICB0cnlfZmlsZXMgJHVyaSAkdXJpLyAvaW5kZXgucGhwJGlzX2FyZ3MkYXJnczsKICAgICAgICAgICAgfX0KCiAgICAgICAgICAgIGxvY2F0aW9uIH4gXFwucGhwJCB7ewogICAgICAgICAgICAgICAgaW5jbHVkZSBmYXN0Y2dpX3BhcmFtczsKICAgICAgICAgICAgICAgIGZhc3RjZ2lfcGFzcyB1bml4Ontzb2NrfTsKICAgICAgICAgICAgICAgIGZhc3RjZ2lfaW5kZXggaW5kZXgucGhwOwogICAgICAgICAgICAgICAgZmFzdGNnaV9wYXJhbSBTQ1JJUFRfRklMRU5BTUUgJGRvY3VtZW50X3Jvb3QkZmFzdGNnaV9zY3JpcHRfbmFtZTsKICAgICAgICAgICAgICAgIGZhc3RjZ2lfcGFyYW0gUEFUSF9JTkZPICRmYXN0Y2dpX3BhdGhfaW5mbzsKICAgICAgICAgICAgICAgIGZhc3RjZ2lfY2FjaGUgV09SRFBSRVNTOwogICAgICAgICAgICAgICAgZmFzdGNnaV9jYWNoZV92YWxpZCAyMDAgNjBtOwogICAgICAgICAgICAgICAgZmFzdGNnaV9jYWNoZV9ieXBhc3MgJHNraXBfY2FjaGU7CiAgICAgICAgICAgICAgICBmYXN0Y2dpX25vX2NhY2hlICRza2lwX2NhY2hlOwogICAgICAgICAgICAgICAgYWRkX2hlYWRlciBYLUNhY2hlICR1cHN0cmVhbV9jYWNoZV9zdGF0dXM7CiAgICAgICAgICAgICAgICBmYXN0Y2dpX2J1ZmZlcnMgMTYgMTZrOwogICAgICAgICAgICAgICAgZmFzdGNnaV9idWZmZXJfc2l6ZSAzMms7CiAgICAgICAgICAgICAgICBmYXN0Y2dpX3JlYWRfdGltZW91dCAzMDA7CiAgICAgICAgICAgICAgICBmYXN0Y2dpX3NlbmRfdGltZW91dCAzMDA7CiAgICAgICAgICAgICAgICBmYXN0Y2dpX2Nvbm5lY3RfdGltZW91dCA2MDsKICAgICAgICAgICAgfX0KCiAgICAgICAgICAgIGxvY2F0aW9uIH4gL1xcLmh0ICAgICAgICAgICAge3sgZGVueSBhbGw7IH19CiAgICAgICAgICAgIGxvY2F0aW9uID0gL2Zhdmljb24uaWNvICAgICAge3sgbG9nX25vdF9mb3VuZCBvZmY7IGFjY2Vzc19sb2cgb2ZmOyBleHBpcmVzIG1heDsgfX0KICAgICAgICAgICAgbG9jYXRpb24gPSAvcm9ib3RzLnR4dCAgICAgICB7eyBhbGxvdyBhbGw7IGxvZ19ub3RfZm91bmQgb2ZmOyBhY2Nlc3NfbG9nIG9mZjsgfX0KICAgICAgICAgICAgbG9jYXRpb24gfiogXFwuKGpwZ3xqcGVnfHBuZ3xnaWZ8aWNvfGNzc3xqc3x3b2ZmfHdvZmYyfHR0Znxzdmd8ZW90fHdlYnApJCB7ewogICAgICAgICAgICAgICAgZXhwaXJlcyBtYXg7CiAgICAgICAgICAgICAgICBhZGRfaGVhZGVyIENhY2hlLUNvbnRyb2wgInB1YmxpYywgaW1tdXRhYmxlIjsKICAgICAgICAgICAgICAgIGxvZ19ub3RfZm91bmQgb2ZmOyBhY2Nlc3NfbG9nIG9mZjsKICAgICAgICAgICAgICAgIHRyeV9maWxlcyAkdXJpIEBmYWxsYmFjazsKICAgICAgICAgICAgfX0KICAgICAgICAgICAgbG9jYXRpb24gQGZhbGxiYWNrIHt7IHRyeV9maWxlcyAkdXJpIC9pbmRleC5waHAkYXJnczsgfX0KICAgICAgICAgICAgbG9jYXRpb24gfiAvcHVyZ2UoLy4qKT8ge3sKICAgICAgICAgICAgICAgIGZhc3RjZ2lfY2FjaGVfcHVyZ2UgV09SRFBSRVNTICIkc2NoZW1lJHJlcXVlc3RfbWV0aG9kJGhvc3QkMSI7CiAgICAgICAgICAgIH19CiAgICAgICAgfX0KICAgICIiIikKICAgIGF2YWlsID0gUGF0aChmIi9ldGMvbmdpbngvc2l0ZXMtYXZhaWxhYmxlL3tkb21haW59IikKICAgIGF2YWlsLndyaXRlX3RleHQoY29uZikKICAgIGVuYWJsZWQgPSBQYXRoKGYiL2V0Yy9uZ2lueC9zaXRlcy1lbmFibGVkL3tkb21haW59IikKICAgIGlmIG5vdCBlbmFibGVkLmV4aXN0cygpOgogICAgICAgIGVuYWJsZWQuc3ltbGlua190byhhdmFpbCkKICAgIGlmIHJ1bl9vaygibmdpbnggLXQgMj4vZGV2L251bGwiKToKICAgICAgICBzdmNfcmVsb2FkKCJuZ2lueCIpCiAgICAgICAgb2soIk5naW54IGNvbmZpZyBhcHBsaWVkIikKICAgIGVsc2U6CiAgICAgICAgZXJyKCJOZ2lueCBjb25maWcgaW52YWxpZCDigJQgY2hlY2s6IG5naW54IC10IikKCmRlZiBfZW5hYmxlX3NzbChkb21haW4pOgogICAgZW1haWwgPSBzc2xfZW1haWwoZG9tYWluKQogICAgaWYgcnVuX29rKGYiY2VydGJvdCAtLW5naW54IC1kIHtkb21haW59IC1kIHd3dy57ZG9tYWlufSAtLW5vbi1pbnRlcmFjdGl2ZSAtLWFncmVlLXRvcyAtLWVtYWlsIHtlbWFpbH0gMj4vZGV2L251bGwiKToKICAgICAgICBvayhmIlNTTCBlbmFibGVkOiBodHRwczovL3tkb21haW59IikKICAgIGVsc2U6CiAgICAgICAgd2FybigiU1NMIGZhaWxlZCDigJQgc2l0ZSBhdmFpbGFibGUgdmlhIEhUVFAiKQoKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQojIERFTEVURSDigJQgV29yZFByZXNzIHNpdGUKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpkZWYgY21kX2RlbGV0ZShhcmdzKToKICAgIGRvbWFpbiA9IGFyZ3NbMF0KICAgIHdwX3BhdGggPSBQYXRoKGYiL3Zhci93d3cvaHRtbC97ZG9tYWlufSIpCiAgICBpZiBub3Qgd3BfcGF0aC5leGlzdHMoKToKICAgICAgICBlcnIoZiJTaXRlIG5vdCBmb3VuZDoge2RvbWFpbn0iKTsgcmV0dXJuCgogICAgIyBCYWNrdXAgZmlyc3QKICAgIGJhY2t1cF9kaXIgPSBQYXRoKGYiL2JhY2t1cHMvZGVsZXRlZC97ZGF0ZXRpbWUubm93KCkuc3RyZnRpbWUoJyVZJW0lZC0lSCVNJVMnKX0iKQogICAgYmFja3VwX2Rpci5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICBydW4oZiJ0YXIgLWN6ZiB7YmFja3VwX2Rpcn0ve2RvbWFpbn0udGFyLmd6IHt3cF9wYXRofSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBpbmZvKGYiQmFja3VwOiB7YmFja3VwX2Rpcn0ve2RvbWFpbn0udGFyLmd6IikKCiAgICAjIFN0b3AgJiByZW1vdmUgUmVkaXMKICAgIHNsdWcgPSBkb21haW4ucmVwbGFjZSgiLiIsICItIikKICAgIHJ1bihmInN5c3RlbWN0bCBzdG9wIHJlZGlzLXtzbHVnfSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBydW4oZiJzeXN0ZW1jdGwgZGlzYWJsZSByZWRpcy17c2x1Z30gMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgZm9yIGYgaW4gW2YiL2V0Yy9zeXN0ZW1kL3N5c3RlbS9yZWRpcy17c2x1Z30uc2VydmljZSIsCiAgICAgICAgICAgICAgZiIvZXRjL3JlZGlzL3JlZGlzLXtzbHVnfS5jb25mIl06CiAgICAgICAgUGF0aChmKS51bmxpbmsobWlzc2luZ19vaz1UcnVlKQogICAgc2h1dGlsLnJtdHJlZShmIi92YXIvbGliL3JlZGlzL3tzbHVnfSIsIGlnbm9yZV9lcnJvcnM9VHJ1ZSkKICAgIHJ1bigic3lzdGVtY3RsIGRhZW1vbi1yZWxvYWQiLCBjaGVjaz1GYWxzZSkKCiAgICAjIFJlbW92ZSBmaWxlcyAmIG5naW54CiAgICBzaHV0aWwucm10cmVlKHN0cih3cF9wYXRoKSwgaWdub3JlX2Vycm9ycz1UcnVlKQogICAgUGF0aChmIi9ldGMvbmdpbngvc2l0ZXMtYXZhaWxhYmxlL3tkb21haW59IikudW5saW5rKG1pc3Npbmdfb2s9VHJ1ZSkKICAgIFBhdGgoZiIvZXRjL25naW54L3NpdGVzLWVuYWJsZWQve2RvbWFpbn0iKS51bmxpbmsobWlzc2luZ19vaz1UcnVlKQoKICAgICMgUmVtb3ZlIERCIHZpYSBQSFAgaGVscGVyCiAgICBydW4oZiJwaHAge1BIUF9IRUxQRVJ9IGRlbGV0ZS1zaXRlIHtkb21haW59IiwgY2hlY2s9RmFsc2UpCgogICAgaWYgcnVuX29rKCJuZ2lueCAtdCAyPi9kZXYvbnVsbCIpOgogICAgICAgIHN2Y19yZWxvYWQoIm5naW54IikKICAgIG9rKGYiU2l0ZSBkZWxldGVkOiB7ZG9tYWlufSIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgTElTVAojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfbGlzdChhcmdzKToKICAgIGN5YW4oIuKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkCIpCiAgICBjeWFuKCIgIFdvcmRQcmVzcyBTaXRlcyIpCiAgICBjeWFuKCLilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZAiKQogICAgd3Bfcm9vdCA9IFBhdGgoIi92YXIvd3d3L2h0bWwiKQogICAgaWYgbm90IHdwX3Jvb3QuZXhpc3RzKCkgb3Igbm90IGFueSh3cF9yb290Lml0ZXJkaXIoKSk6CiAgICAgICAgaW5mbygiTm8gc2l0ZXMgaW5zdGFsbGVkIik7IHJldHVybgogICAgZm9yIHNpdGUgaW4gc29ydGVkKHdwX3Jvb3QuaXRlcmRpcigpKToKICAgICAgICBpZiBub3Qgc2l0ZS5pc19kaXIoKTogY29udGludWUKICAgICAgICBkb21haW4gPSBzaXRlLm5hbWUKICAgICAgICByZWRpc19jb25mID0gUGF0aChmIi9ldGMvcmVkaXMvcmVkaXMte2RvbWFpbi5yZXBsYWNlKCcuJywgJy0nKX0uY29uZiIpCiAgICAgICAgcmVkaXNfcG9ydCA9ICIiCiAgICAgICAgaWYgcmVkaXNfY29uZi5leGlzdHMoKToKICAgICAgICAgICAgZm9yIGxuIGluIHJlZGlzX2NvbmYucmVhZF90ZXh0KCkuc3BsaXRsaW5lcygpOgogICAgICAgICAgICAgICAgaWYgbG4uc3RhcnRzd2l0aCgicG9ydCAiKTogcmVkaXNfcG9ydCA9IGxuLnNwbGl0KClbMV0KICAgICAgICBzc2xfaWNvbiA9ICLwn5SSIiBpZiBQYXRoKGYiL2V0Yy9sZXRzZW5jcnlwdC9saXZlL3tkb21haW59IikuZXhpc3RzKCkgZWxzZSAi8J+MkCIKICAgICAgICBwaHBfdmVyICA9IGNtZF9vdXQoZiJncmVwIC1vUCAncGhwWzAtOS5dKyg/PS1mcG0pJyAvZXRjL25naW54L3NpdGVzLWF2YWlsYWJsZS97ZG9tYWlufSAyPi9kZXYvbnVsbCB8IGhlYWQgLTEiKSBvciAiPyIKICAgICAgICBwcmludChmIiAge3NzbF9pY29ufSAge2RvbWFpbjo8MzV9ICBQSFAge3BocF92ZXI6PDZ9ICBSZWRpcyA6e3JlZGlzX3BvcnR9IikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBTSVRFLUlORk8KIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpkZWYgY21kX3NpdGVfaW5mbyhhcmdzKToKICAgIGRvbWFpbiA9IGFyZ3NbMF0KICAgIHdwX3BhdGggPSBQYXRoKGYiL3Zhci93d3cvaHRtbC97ZG9tYWlufSIpCiAgICBpZiBub3Qgd3BfcGF0aC5leGlzdHMoKTogZXJyKGYiU2l0ZSBub3QgZm91bmQ6IHtkb21haW59Iik7IHJldHVybgogICAgY3lhbihmIuKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkCB7ZG9tYWlufSDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZAiKQogICAgIyBTaXplCiAgICBzaXplID0gY21kX291dChmImR1IC1zaCB7d3BfcGF0aH0gMj4vZGV2L251bGwgfCBjdXQgLWYxIikKICAgIHByaW50KGYiICDwn5OBICBQYXRoICAgOiB7d3BfcGF0aH0gICh7c2l6ZX0pIikKICAgICMgUEhQCiAgICBwaHBfdmVyID0gY21kX291dChmImdyZXAgLW9QICdwaHBbMC05Ll0rKD89LWZwbSknIC9ldGMvbmdpbngvc2l0ZXMtYXZhaWxhYmxlL3tkb21haW59IDI+L2Rldi9udWxsIHwgaGVhZCAtMSIpIG9yICI/IgogICAgcHJpbnQoZiIgIPCfkJggIFBIUCAgICA6IHtwaHBfdmVyfSIpCiAgICAjIFdQIHZlcnNpb24gdmlhIFBIUCBoZWxwZXIKICAgIHdwX3ZlciA9IGNtZF9vdXQoZiJwaHAge1BIUF9IRUxQRVJ9IHdwLXZlcnNpb24ge2RvbWFpbn0gMj4vZGV2L251bGwiKSBvciAiPyIKICAgIHByaW50KGYiICDwn5SnICBXUCAgICAgOiB7d3BfdmVyfSIpCiAgICAjIERCCiAgICBkYl9pbmZvID0gY21kX291dChmInBocCB7UEhQX0hFTFBFUn0gZGItc2l6ZSB7ZG9tYWlufSAyPi9kZXYvbnVsbCIpIG9yICI/IgogICAgcHJpbnQoZiIgIPCfl4TvuI8gICBEQiAgICAgOiB7ZGJfaW5mb30iKQogICAgIyBSZWRpcwogICAgcmVkaXNfY29uZiA9IGYiL2V0Yy9yZWRpcy9yZWRpcy17ZG9tYWluLnJlcGxhY2UoJy4nLCAnLScpfS5jb25mIgogICAgcmVkaXNfcG9ydCA9IGNtZF9vdXQoZiJncmVwICdecG9ydCcge3JlZGlzX2NvbmZ9IDI+L2Rldi9udWxsIHwgYXdrICd7e3ByaW50ICQyfX0nIikgb3IgIjYzNzkiCiAgICByZWRpc19vayA9ICLinIUgcnVubmluZyIgaWYgcnVuX29rKGYicmVkaXMtY2xpIC1wIHtyZWRpc19wb3J0fSBwaW5nIDI+L2Rldi9udWxsIHwgZ3JlcCAtcSBQT05HIikgZWxzZSAi4p2MIGRvd24iCiAgICBwcmludChmIiAg4pqhICBSZWRpcyAgOiA6e3JlZGlzX3BvcnR9ICB7cmVkaXNfb2t9IikKICAgICMgU1NMCiAgICBjZXJ0ID0gUGF0aChmIi9ldGMvbGV0c2VuY3J5cHQvbGl2ZS97ZG9tYWlufS9jZXJ0LnBlbSIpCiAgICBpZiBjZXJ0LmV4aXN0cygpOgogICAgICAgIGV4cCA9IGNtZF9vdXQoZiJvcGVuc3NsIHg1MDkgLWVuZGRhdGUgLW5vb3V0IC1pbiB7Y2VydH0gMj4vZGV2L251bGwgfCBjdXQgLWQ9IC1mMiIpCiAgICAgICAgcHJpbnQoZiIgIPCflJIgIFNTTCAgICA6IEFjdGl2ZSAgKGV4cGlyZXMge2V4cH0pIikKICAgIGVsc2U6CiAgICAgICAgcHJpbnQoZiIgIPCfjJAgIFNTTCAgICA6IE5vdCBlbmFibGVkIikKICAgICMgSFRUUAogICAgaHR0cCA9IGNtZF9vdXQoZiJjdXJsIC1zIC1vIC9kZXYvbnVsbCAtdyAnJXt7aHR0cF9jb2RlfX0nIC0tbWF4LXRpbWUgNSAtSCAnSG9zdDp7ZG9tYWlufScgaHR0cDovLzEyNy4wLjAuMS8gMj4vZGV2L251bGwiKQogICAgcHJpbnQoZiIgIPCfjI0gIEhUVFAgICA6IHtodHRwfSIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgVVBEQVRFLVNJVEUKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpkZWYgY21kX3VwZGF0ZV9zaXRlKGFyZ3MpOgogICAgdGFyZ2V0ICA9IGFyZ3NbMF0KICAgIGZsYWdzICAgPSBzZXQoYXJnc1sxOl0pCiAgICBkb19hbGwgID0gIi0tYWxsIiBpbiBmbGFncyBvciBsZW4oZmxhZ3MpID09IDAKICAgIGRvX2NvcmUgICAgPSBkb19hbGwgb3IgIi0tY29yZSIgICAgaW4gZmxhZ3MKICAgIGRvX3BsdWdpbnMgPSBkb19hbGwgb3IgIi0tcGx1Z2lucyIgaW4gZmxhZ3MKICAgIGRvX3RoZW1lcyAgPSBkb19hbGwgb3IgIi0tdGhlbWVzIiAgaW4gZmxhZ3MKICAgIGRvX2RiICAgICAgPSBkb19hbGwgb3IgIi0tZGIiICAgICAgaW4gZmxhZ3MKICAgIGRvX2xhbmdzICAgPSBkb19hbGwgb3IgIi0tbGFuZ3MiICAgaW4gZmxhZ3MKICAgIGRvX2NoZWNrICAgPSAiLS1jaGVjayIgICBpbiBmbGFncwogICAgZG9fYmFja3VwICA9ICItLWJhY2t1cCIgIGluIGZsYWdzCgogICAgc2l0ZXMgPSBbXQogICAgaWYgdGFyZ2V0ID09ICJhbGwiOgogICAgICAgIHdwX3Jvb3QgPSBQYXRoKCIvdmFyL3d3dy9odG1sIikKICAgICAgICBzaXRlcyA9IFtzLm5hbWUgZm9yIHMgaW4gd3Bfcm9vdC5pdGVyZGlyKCkgaWYgcy5pc19kaXIoKSBhbmQgKHMgLyAid3AtY29uZmlnLnBocCIpLmV4aXN0cygpXQogICAgZWxzZToKICAgICAgICBzaXRlcyA9IFt0YXJnZXRdCgogICAgdG90YWxfb2sgPSAwOyB0b3RhbF9mYWlsID0gMAoKICAgIGZvciBkb21haW4gaW4gc2l0ZXM6CiAgICAgICAgd3BfcGF0aCA9IGYiL3Zhci93d3cvaHRtbC97ZG9tYWlufSIKICAgICAgICBpZiBub3QgUGF0aChmInt3cF9wYXRofS93cC1jb25maWcucGhwIikuZXhpc3RzKCk6CiAgICAgICAgICAgIHdhcm4oZiJTa2lwcGluZyB7ZG9tYWlufSDigJQgbm90IGEgV29yZFByZXNzIHNpdGUiKTsgY29udGludWUKCiAgICAgICAgY3lhbihmIlxu4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIFVwZGF0aW5nOiB7ZG9tYWlufSDilZDilZDilZDilZDilZDilZAiKQogICAgICAgIHdwID0gZiJ3cCAtLWFsbG93LXJvb3QgLS1wYXRoPXt3cF9wYXRofSIKCiAgICAgICAgIyBDaGVjayBtb2RlCiAgICAgICAgaWYgZG9fY2hlY2s6CiAgICAgICAgICAgIGluZm8oIj09PSBEUlkgUlVOICgtLWNoZWNrKSA9PT0iKQogICAgICAgICAgICBydW4oZiJzdWRvIC11IHd3dy1kYXRhIHt3cH0gY29yZSBjaGVjay11cGRhdGUgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICBydW4oZiJzdWRvIC11IHd3dy1kYXRhIHt3cH0gcGx1Z2luIGxpc3QgLS11cGRhdGU9YXZhaWxhYmxlIC0tZm9ybWF0PXRhYmxlIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKGYic3VkbyAtdSB3d3ctZGF0YSB7d3B9IHRoZW1lICBsaXN0IC0tdXBkYXRlPWF2YWlsYWJsZSAtLWZvcm1hdD10YWJsZSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIGNvbnRpbnVlCgogICAgICAgICMgQmFja3VwCiAgICAgICAgaWYgZG9fYmFja3VwOgogICAgICAgICAgICBiZGlyID0gUGF0aChmIi9iYWNrdXBzL3VwZGF0ZXMve2RhdGV0aW1lLm5vdygpLnN0cmZ0aW1lKCclWSVtJWQtJUglTSVTJyl9IikKICAgICAgICAgICAgYmRpci5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICAgICAgICAgIHN0ZXAoZiJCYWNraW5nIHVwIHtkb21haW59Li4uIikKICAgICAgICAgICAgcnVuKGYicGhwIHtQSFBfSEVMUEVSfSBiYWNrdXAtZGIge2RvbWFpbn0ge2JkaXJ9IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKGYidGFyIC1jemYge2JkaXJ9L3tkb21haW59LWZpbGVzLnRhci5neiB7d3BfcGF0aH0vd3AtY29udGVudCAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIG9rKGYiQmFja3VwOiB7YmRpcn0iKQoKICAgICAgICBzaXRlX29rID0gVHJ1ZQoKICAgICAgICBpZiBkb19jb3JlOgogICAgICAgICAgICBzdGVwKCJVcGRhdGluZyBXUCBjb3JlLi4uIikKICAgICAgICAgICAgYmVmb3JlID0gY21kX291dChmInN1ZG8gLXUgd3d3LWRhdGEge3dwfSBjb3JlIHZlcnNpb24gMj4vZGV2L251bGwiKQogICAgICAgICAgICBpZiBydW5fb2soZiJzdWRvIC11IHd3dy1kYXRhIHt3cH0gY29yZSB1cGRhdGUgLS1xdWlldCAyPi9kZXYvbnVsbCIpOgogICAgICAgICAgICAgICAgYWZ0ZXIgPSBjbWRfb3V0KGYic3VkbyAtdSB3d3ctZGF0YSB7d3B9IGNvcmUgdmVyc2lvbiAyPi9kZXYvbnVsbCIpCiAgICAgICAgICAgICAgICBvayhmIkNvcmU6IHtiZWZvcmV9IOKGkiB7YWZ0ZXJ9IikgaWYgYmVmb3JlICE9IGFmdGVyIGVsc2Ugb2soIkNvcmUgYWxyZWFkeSBsYXRlc3QiKQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgd2FybigiQ29yZSB1cGRhdGUgZmFpbGVkIG9yIGFscmVhZHkgbGF0ZXN0IikKCiAgICAgICAgaWYgZG9fcGx1Z2luczoKICAgICAgICAgICAgc3RlcCgiVXBkYXRpbmcgcGx1Z2lucy4uLiIpCiAgICAgICAgICAgIG91dCA9IGNtZF9vdXQoZiJzdWRvIC11IHd3dy1kYXRhIHt3cH0gcGx1Z2luIHVwZGF0ZSAtLWFsbCAtLWZvcm1hdD10YWJsZSAyPi9kZXYvbnVsbCIpCiAgICAgICAgICAgIG9rKCJQbHVnaW5zIHVwZGF0ZWQiKSBpZiBvdXQgZWxzZSB3YXJuKCJObyBwbHVnaW4gdXBkYXRlcyIpCgogICAgICAgIGlmIGRvX3RoZW1lczoKICAgICAgICAgICAgc3RlcCgiVXBkYXRpbmcgdGhlbWVzLi4uIikKICAgICAgICAgICAgb3V0ID0gY21kX291dChmInN1ZG8gLXUgd3d3LWRhdGEge3dwfSB0aGVtZSB1cGRhdGUgLS1hbGwgLS1mb3JtYXQ9dGFibGUgMj4vZGV2L251bGwiKQogICAgICAgICAgICBvaygiVGhlbWVzIHVwZGF0ZWQiKSBpZiBvdXQgZWxzZSB3YXJuKCJObyB0aGVtZSB1cGRhdGVzIikKCiAgICAgICAgaWYgZG9fbGFuZ3M6CiAgICAgICAgICAgIHN0ZXAoIlVwZGF0aW5nIHRyYW5zbGF0aW9ucy4uLiIpCiAgICAgICAgICAgIHJ1bihmInN1ZG8gLXUgd3d3LWRhdGEge3dwfSBsYW5ndWFnZSBjb3JlIHVwZGF0ZSAtLXF1aWV0IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKGYic3VkbyAtdSB3d3ctZGF0YSB7d3B9IGxhbmd1YWdlIHBsdWdpbiB1cGRhdGUgLS1hbGwgLS1xdWlldCAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIHJ1bihmInN1ZG8gLXUgd3d3LWRhdGEge3dwfSBsYW5ndWFnZSB0aGVtZSAgdXBkYXRlIC0tYWxsIC0tcXVpZXQgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICBvaygiTGFuZ3VhZ2VzIHVwZGF0ZWQiKQoKICAgICAgICBpZiBkb19kYjoKICAgICAgICAgICAgc3RlcCgiUnVubmluZyBEQiB1cGdyYWRlLi4uIikKICAgICAgICAgICAgaWYgcnVuX29rKGYic3VkbyAtdSB3d3ctZGF0YSB7d3B9IGNvcmUgdXBkYXRlLWRiIC0tcXVpZXQgMj4vZGV2L251bGwiKToKICAgICAgICAgICAgICAgIG9rKCJEQiB1cGdyYWRlZCIpCiAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICB3YXJuKCJEQiB1cGdyYWRlIGZhaWxlZCBvciBub3QgbmVlZGVkIikKCiAgICAgICAgdG90YWxfb2sgKz0gMQogICAgICAgIG9rKGYi4pyFIHtkb21haW59IOKAlCBkb25lIikKCiAgICBjeWFuKGYiXG7ilZDilZDilZDilZDilZDilZAgU3VtbWFyeToge3RvdGFsX29rfSB1cGRhdGVkLCB7dG90YWxfZmFpbH0gZmFpbGVkIOKVkOKVkOKVkOKVkOKVkOKVkCIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgQ0xPTkUKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpkZWYgY21kX2Nsb25lKGFyZ3MpOgogICAgc3JjLCBkc3QgPSBhcmdzWzBdLCBhcmdzWzFdCiAgICBzcmNfcGF0aCA9IFBhdGgoZiIvdmFyL3d3dy9odG1sL3tzcmN9IikKICAgIGRzdF9wYXRoID0gUGF0aChmIi92YXIvd3d3L2h0bWwve2RzdH0iKQogICAgaWYgbm90IHNyY19wYXRoLmV4aXN0cygpOiBlcnIoZiJTb3VyY2Ugbm90IGZvdW5kOiB7c3JjfSIpOyByZXR1cm4KICAgIGlmIGRzdF9wYXRoLmV4aXN0cygpOiBlcnIoZiJEZXN0aW5hdGlvbiBleGlzdHM6IHtkc3R9Iik7IHJldHVybgoKICAgIHN0ZXAoZiJDbG9uaW5nIHtzcmN9IOKGkiB7ZHN0fSIpCiAgICBydW4oZiJjcCAtYSB7c3JjX3BhdGh9IHtkc3RfcGF0aH0iKQogICAgcnVuKGYiY2hvd24gLVIgd3d3LWRhdGE6d3d3LWRhdGEge2RzdF9wYXRofSIpCgogICAgIyBDbG9uZSBEQiB2aWEgUEhQIGhlbHBlcgogICAgcnVuKGYicGhwIHtQSFBfSEVMUEVSfSBjbG9uZS1kYiB7c3JjfSB7ZHN0fSIpCgogICAgIyBOZXcgUmVkaXMgaW5zdGFuY2UKICAgIHJlZGlzX3BvcnQgPSBuZXh0X3JlZGlzX3BvcnQoKQogICAgX2NyZWF0ZV9zaXRlX3JlZGlzKGRzdCwgcmVkaXNfcG9ydCkKCiAgICAjIFVwZGF0ZSB3cC1jb25maWcKICAgIHJ1bihmInBocCB7UEhQX0hFTFBFUn0gdXBkYXRlLWNvbmZpZyB7ZHN0fSB7cmVkaXNfcG9ydH0iKQoKICAgICMgTmdpbngKICAgIHBocF92ZXIgPSBjbWRfb3V0KGYiZ3JlcCAtb1AgJ3BocFswLTkuXSsoPz0tZnBtKScgL2V0Yy9uZ2lueC9zaXRlcy1hdmFpbGFibGUve3NyY30gMj4vZGV2L251bGwgfCBoZWFkIC0xIikgb3IgZGV0ZWN0X3BocCgpCiAgICBfd3JpdGVfbmdpbnhfc2l0ZShkc3QsIHBocF92ZXIpCgogICAgb2soZiJDbG9uZSBjb21wbGV0ZTogaHR0cDovL3tkc3R9IikKICAgIGluZm8oZiJBZGQgRE5TIGZvciB7ZHN0fSB0aGVuIHJ1bjogZWFzeWluc3RhbGwgc3NsIHtkc3R9IikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBQSFAtU1dJVENICiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZGVmIGNtZF9waHBfc3dpdGNoKGFyZ3MpOgogICAgZG9tYWluLCBuZXdfdmVyID0gYXJnc1swXSwgYXJnc1sxXQogICAgY29uZiA9IFBhdGgoZiIvZXRjL25naW54L3NpdGVzLWF2YWlsYWJsZS97ZG9tYWlufSIpCiAgICBpZiBub3QgY29uZi5leGlzdHMoKTogZXJyKGYiTmdpbnggY29uZmlnIG5vdCBmb3VuZDoge2RvbWFpbn0iKTsgcmV0dXJuCiAgICBpZiBub3Qgc3ZjX2FjdGl2ZShmInBocHtuZXdfdmVyfS1mcG0iKToKICAgICAgICBlcnIoZiJQSFAge25ld192ZXJ9LUZQTSBub3QgcnVubmluZyIpOyByZXR1cm4KICAgIG9sZF92ZXIgPSBjbWRfb3V0KGYiZ3JlcCAtb1AgJ3BocFswLTkuXSsoPz0tZnBtKScge2NvbmZ9IDI+L2Rldi9udWxsIHwgaGVhZCAtMSIpIG9yICI/IgogICAgdHh0ID0gY29uZi5yZWFkX3RleHQoKQogICAgdHh0ID0gcmUuc3ViKHIicGhwWzAtOS5dKy1mcG1cLnNvY2siLCBmInBocHtuZXdfdmVyfS1mcG0uc29jayIsIHR4dCkKICAgIGNvbmYud3JpdGVfdGV4dCh0eHQpCiAgICBpZiBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6CiAgICAgICAgc3ZjX3JlbG9hZCgibmdpbngiKQogICAgICAgIG9rKGYie2RvbWFpbn06IFBIUCB7b2xkX3Zlcn0g4oaSIHtuZXdfdmVyfSIpCiAgICBlbHNlOgogICAgICAgICMgcm9sbGJhY2sKICAgICAgICB0eHQgPSByZS5zdWIociJwaHBbMC05Ll0rLWZwbVwuc29jayIsIGYicGhwe29sZF92ZXJ9LWZwbS5zb2NrIiwgdHh0KQogICAgICAgIGNvbmYud3JpdGVfdGV4dCh0eHQpCiAgICAgICAgZXJyKCJOZ2lueCBjb25maWcgaW52YWxpZCDigJQgcm9sbGVkIGJhY2siKQoKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQojIFNTTAojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfc3NsKGFyZ3MpOgogICAgZG9tYWluID0gYXJnc1swXQogICAgX2VuYWJsZV9zc2woZG9tYWluKQoKZGVmIGNtZF9zc2xfcmVuZXcoYXJncyk6CiAgICBzdGVwKCJSZW5ld2luZyBhbGwgU1NMIGNlcnRpZmljYXRlcyIpCiAgICBpZiBydW5fb2soImNlcnRib3QgcmVuZXcgLS1uZ2lueCAtLW5vbi1pbnRlcmFjdGl2ZSAyPi9kZXYvbnVsbCIpOgogICAgICAgIHN2Y19yZWxvYWQoIm5naW54Iik7IG9rKCJTU0wgcmVuZXdlZCIpCiAgICBlbHNlOiB3YXJuKCJTb21lIGNlcnRzIG1heSBub3QgaGF2ZSByZW5ld2VkIikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBSRURJUyBjb21tYW5kcwojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfcmVkaXNfc3RhdHVzKGFyZ3MpOgogICAgY3lhbigi4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIFJlZGlzIEluc3RhbmNlcyDilZDilZDilZDilZDilZDilZAiKQogICAgbWFpbl9vayA9IHJ1bl9vaygicmVkaXMtY2xpIC1wIDYzNzkgcGluZyAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgUE9ORyIpCiAgICBwcmludChmIiAgeyfinIUnIGlmIG1haW5fb2sgZWxzZSAn4p2MJ30gIE1haW4gUmVkaXMgIDo2Mzc5IikKICAgIGZvciBmIGluIHNvcnRlZChQYXRoKCIvZXRjL3JlZGlzIikuZ2xvYigicmVkaXMtKi5jb25mIikpOgogICAgICAgIHNsdWcgPSBmLnN0ZW0ucmVwbGFjZSgicmVkaXMtIiwgIiIpCiAgICAgICAgcG9ydCA9IGNtZF9vdXQoZiJncmVwICdecG9ydCcge2Z9IHwgYXdrICd7e3ByaW50ICQyfX0nIikgb3IgIj8iCiAgICAgICAgb2tfZmxhZyA9IHJ1bl9vayhmInJlZGlzLWNsaSAtcCB7cG9ydH0gcGluZyAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgUE9ORyIpIGlmIHBvcnQgIT0gIj8iIGVsc2UgRmFsc2UKICAgICAgICBzdmMgPSBmInJlZGlzLXtzbHVnfSIKICAgICAgICBwcmludChmIiAgeyfinIUnIGlmIG9rX2ZsYWcgZWxzZSAn4p2MJ30gIHtzbHVnOjwzMH0gIDp7cG9ydH0gICh7Y21kX291dChmJ3N5c3RlbWN0bCBpcy1hY3RpdmUge3N2Y30gMj4vZGV2L251bGwnKSBvciAndW5rbm93bid9KSIpCgpkZWYgY21kX3JlZGlzX3Jlc3RhcnQoYXJncyk6CiAgICBkb21haW4gPSBhcmdzWzBdIGlmIGFyZ3MgZWxzZSAiIgogICAgaWYgZG9tYWluOgogICAgICAgIHNsdWcgPSBkb21haW4ucmVwbGFjZSgiLiIsICItIikKICAgICAgICBzdmNfcmVzdGFydChmInJlZGlzLXtzbHVnfSIpCiAgICAgICAgb2soZiJSZWRpcyByZXN0YXJ0ZWQgZm9yIHtkb21haW59IikKICAgIGVsc2U6CiAgICAgICAgc3ZjX3Jlc3RhcnQoInJlZGlzLXNlcnZlciIpOyBvaygiTWFpbiBSZWRpcyByZXN0YXJ0ZWQiKQoKZGVmIGNtZF9yZWRpc19wb3J0cyhhcmdzKToKICAgIGN5YW4oIuKVkOKVkOKVkOKVkOKVkOKVkCBSZWRpcyBQb3J0cyDilZDilZDilZDilZDilZDilZAiKQogICAgaWYgUkVESVNfUE9SVFMuZXhpc3RzKCk6CiAgICAgICAgZm9yIHAgaW4gc29ydGVkKHNldChSRURJU19QT1JUUy5yZWFkX3RleHQoKS5zcGxpdGxpbmVzKCkpKToKICAgICAgICAgICAgaWYgcC5zdHJpcCgpLmlzZGlnaXQoKToKICAgICAgICAgICAgICAgIGFjdGl2ZSA9IHJ1bl9vayhmInNzIC10bG5wIDI+L2Rldi9udWxsIHwgZ3JlcCAtcSAnOntwfSAnIikKICAgICAgICAgICAgICAgIHByaW50KGYiICB7J+KchScgaWYgYWN0aXZlIGVsc2UgJ+KdjCd9ICA6e3B9IikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBTVEFUVVMgLyBIRUFMVEggLyBNT05JVE9SCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZGVmIGNtZF9zdGF0dXMoYXJncyk6CiAgICBjeWFuKCLilZDilZDilZDilZDilZDilZAgU3lzdGVtIFN0YXR1cyDilZDilZDilZDilZDilZDilZAiKQogICAgc2VydmljZXMgPSBbIm5naW54IiwgIm1hcmlhZGIiLCAicmVkaXMtc2VydmVyIiwgImZhaWwyYmFuIiwKICAgICAgICAgICAgICAgICJwaHA4LjQtZnBtIiwgInBocDguMy1mcG0iLCAicGhwOC4yLWZwbSIsICJwaHA4LjEtZnBtIl0KICAgIGZvciBzdmMgaW4gc2VydmljZXM6CiAgICAgICAgYWN0aXZlID0gc3ZjX2FjdGl2ZShzdmMpCiAgICAgICAgcHJpbnQoZiIgIHsn4pyFJyBpZiBhY3RpdmUgZWxzZSAn4p2MJ30gIHtzdmN9IikKICAgICMgRGlzawogICAgZGlzayA9IGNtZF9vdXQoImRmIC1oIC8gfCBhd2sgJ05SPT0ye3ByaW50ICQzXCIvXCIkMlwiIChcIiQ1XCIpXCJ9JyIpCiAgICBwcmludChmIiAg8J+SviAgRGlzazoge2Rpc2t9IikKICAgICMgTWVtCiAgICBtZW0gPSBjbWRfb3V0KCJmcmVlIC1oIHwgYXdrICcvTWVtOi97cHJpbnQgJDNcIi9cIiQyfSciKQogICAgcHJpbnQoZiIgIPCfp6AgIFJBTTogIHttZW19IikKCmRlZiBjbWRfaGVhbHRoKGFyZ3MpOgogICAgY21kX3N0YXR1cyhhcmdzKQogICAgY3lhbigiXG7ilZDilZDilZDilZDilZDilZAgU2l0ZXMg4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIikKICAgIHdwX3Jvb3QgPSBQYXRoKCIvdmFyL3d3dy9odG1sIikKICAgIGlmIHdwX3Jvb3QuZXhpc3RzKCk6CiAgICAgICAgZm9yIHNpdGUgaW4gc29ydGVkKHdwX3Jvb3QuaXRlcmRpcigpKToKICAgICAgICAgICAgaWYgbm90IHNpdGUuaXNfZGlyKCk6IGNvbnRpbnVlCiAgICAgICAgICAgIGRvbWFpbiA9IHNpdGUubmFtZQogICAgICAgICAgICBodHRwID0gY21kX291dChmImN1cmwgLXMgLW8gL2Rldi9udWxsIC13ICcle3todHRwX2NvZGV9fScgLS1tYXgtdGltZSA1IC1IICdIb3N0Ontkb21haW59JyBodHRwOi8vMTI3LjAuMC4xLyAyPi9kZXYvbnVsbCIpCiAgICAgICAgICAgIGljb24gPSAi4pyFIiBpZiBodHRwID09ICIyMDAiIGVsc2UgIuKaoO+4jyAiCiAgICAgICAgICAgIHByaW50KGYiICB7aWNvbn0gIHtkb21haW46PDM1fSAgSFRUUCB7aHR0cH0iKQoKZGVmIGNtZF9tb25pdG9yKGFyZ3MpOgogICAgaW1wb3J0IHRpbWUgYXMgX3QKICAgIHRyeToKICAgICAgICB3aGlsZSBUcnVlOgogICAgICAgICAgICBvcy5zeXN0ZW0oImNsZWFyIikKICAgICAgICAgICAgY21kX3N0YXR1cyhhcmdzKQogICAgICAgICAgICBjbWRfaGVhbHRoKGFyZ3MpCiAgICAgICAgICAgIHByaW50KGYiXG4gIFJlZnJlc2hpbmcgZXZlcnkgNXPigKYgKEN0cmwrQyB0byBleGl0KSIpCiAgICAgICAgICAgIF90LnNsZWVwKDUpCiAgICBleGNlcHQgS2V5Ym9hcmRJbnRlcnJ1cHQ6CiAgICAgICAgcGFzcwoKZGVmIGNtZF9sb2dzKGFyZ3MpOgogICAgZG9tYWluID0gYXJnc1swXSBpZiBhcmdzIGVsc2UgTm9uZQogICAgaWYgZG9tYWluOgogICAgICAgIGxvZ19maWxlID0gZiIvdmFyL2xvZy9uZ2lueC97ZG9tYWlufS5lcnJvci5sb2ciCiAgICAgICAgcnVuKGYidGFpbCAtNTAge2xvZ19maWxlfSAyPi9kZXYvbnVsbCB8fCBlY2hvICdObyBsb2cgZmlsZSBmb3VuZCciLCBjaGVjaz1GYWxzZSkKICAgIGVsc2U6CiAgICAgICAgcnVuKGYidGFpbCAtNTAge0xPR19GSUxFfSAyPi9kZXYvbnVsbCB8fCBlY2hvICdObyBsb2cgZmlsZSciLCBjaGVjaz1GYWxzZSkKCmRlZiBjbWRfcGVyZihhcmdzKToKICAgIGNtZF9zdGF0dXMoYXJncykKICAgIGN5YW4oIlxu4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIFBlcmZvcm1hbmNlIOKVkOKVkOKVkOKVkOKVkOKVkCIpCiAgICBsb2FkID0gY21kX291dCgiY2F0IC9wcm9jL2xvYWRhdmcgfCBhd2sgJ3twcmludCAkMSwkMiwkM30nIikKICAgIHByaW50KGYiICDwn5OKICBMb2FkIGF2Zzoge2xvYWR9IikKICAgIGNwdSA9IGNtZF9vdXQoInRvcCAtYm4xIHwgZ3JlcCAnQ3B1KHMpJyB8IGF3ayAne3ByaW50ICQyfScgMj4vZGV2L251bGwiKSBvciAiPyIKICAgIHByaW50KGYiICDwn5al77iPICAgQ1BVOiAgICAgIHtjcHV9JSIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgU0VMRi1IRUFMIChjb3JlIGxvZ2ljIHVuY2hhbmdlZCBmcm9tIG9yaWdpbmFsKQojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfc2VsZl9oZWFsKGFyZ3MpOgogICAgbW9kZSA9IGFyZ3NbMF0gaWYgYXJncyBlbHNlICJmdWxsIgogICAgY3lhbihmIlxu4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIFNlbGYtSGVhbDoge21vZGV9IOKVkOKVkOKVkOKVkOKVkOKVkCIpCgogICAgZGVmIF9oZWFsX25naW54KCk6CiAgICAgICAgc3RlcCgiSGVhbGluZyBOZ2lueCIpCiAgICAgICAgIyBGSVg6IEFwYWNoZTIgY2hlY2sg4oCUIOCkheCkl+CksCDgpJrgpLIg4KSw4KS54KS+IOCkueCliCDgpKTgpYsg4KSs4KSC4KSmIOCkleCksOClh+CkggogICAgICAgIGlmIHJ1bl9vaygic3lzdGVtY3RsIGlzLWFjdGl2ZSAtLXF1aWV0IGFwYWNoZTIgMj4vZGV2L251bGwiKToKICAgICAgICAgICAgd2FybigiQXBhY2hlMiBpcyBydW5uaW5nIG9uIHBvcnQgODAg4oCUIHN0b3BwaW5nIGFuZCByZW1vdmluZyBpdCIpCiAgICAgICAgICAgIHJ1bigic3lzdGVtY3RsIHN0b3AgYXBhY2hlMiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIHJ1bigic3lzdGVtY3RsIGRpc2FibGUgYXBhY2hlMiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIHJ1bigiYXB0LWdldCByZW1vdmUgLXkgLS1wdXJnZSBhcGFjaGUyIGFwYWNoZTItYmluIGFwYWNoZTItZGF0YSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIHJ1bigiYXB0LWdldCBhdXRvcmVtb3ZlIC15IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgb2soIkFwYWNoZTIgcmVtb3ZlZCDigJQgcG9ydCA4MCBmcmVlZCIpCgogICAgICAgIGlmIG5vdCBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6CiAgICAgICAgICAgICMgRml4IHNvY2tldCBwYXRocwogICAgICAgICAgICBydW5uaW5nX3BocCA9IGRldGVjdF9waHAoKQogICAgICAgICAgICBjb3JyZWN0X3NvY2sgPSBmIi9ydW4vcGhwL3BocHtydW5uaW5nX3BocH0tZnBtLnNvY2siCiAgICAgICAgICAgIGZvciBjZiBpbiBsaXN0KFBhdGgoIi9ldGMvbmdpbngvc2l0ZXMtZW5hYmxlZCIpLml0ZXJkaXIoKSkgKyBcCiAgICAgICAgICAgICAgICAgICAgICBsaXN0KFBhdGgoIi9ldGMvbmdpbngvc2l0ZXMtYXZhaWxhYmxlIikuaXRlcmRpcigpKToKICAgICAgICAgICAgICAgIGlmIG5vdCBjZi5pc19maWxlKCk6IGNvbnRpbnVlCiAgICAgICAgICAgICAgICB0eHQgPSBjZi5yZWFkX3RleHQoKQogICAgICAgICAgICAgICAgbmV3X3R4dCA9IHJlLnN1YihyInVuaXg6L3J1bi9waHAvcGhwWzAtOS5dKy1mcG1cLnNvY2siLCBmInVuaXg6e2NvcnJlY3Rfc29ja30iLCB0eHQpCiAgICAgICAgICAgICAgICBpZiBuZXdfdHh0ICE9IHR4dDoKICAgICAgICAgICAgICAgICAgICBjZi53cml0ZV90ZXh0KG5ld190eHQpCiAgICAgICAgICAgICAgICAgICAgaW5mbyhmIkZpeGVkIHNvY2tldCBpbiB7Y2YubmFtZX0iKQogICAgICAgIGlmIG5vdCBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6CiAgICAgICAgICAgIHdhcm4oIk5naW54IGNvbmZpZyBzdGlsbCBpbnZhbGlkIikKICAgICAgICBlbHNlOgogICAgICAgICAgICBzdmNfcmVzdGFydCgibmdpbngiKQogICAgICAgICAgICBvaygiTmdpbnggaGVhbGVkIikKCiAgICBkZWYgX2hlYWxfcGhwKCk6CiAgICAgICAgc3RlcCgiSGVhbGluZyBQSFAtRlBNIikKICAgICAgICBmb3IgdmVyIGluIFsiOC40IiwgIjguMyIsICI4LjIiLCAiOC4xIl06CiAgICAgICAgICAgIGlmIG5vdCBQYXRoKGYiL2V0Yy9waHAve3Zlcn0iKS5leGlzdHMoKTogY29udGludWUKICAgICAgICAgICAgaWYgbm90IHN2Y19hY3RpdmUoZiJwaHB7dmVyfS1mcG0iKToKICAgICAgICAgICAgICAgIHN2Y19yZXN0YXJ0KGYicGhwe3Zlcn0tZnBtIik7IHRpbWUuc2xlZXAoMikKICAgICAgICAgICAgZml4X3NvY2sodmVyKQogICAgICAgICAgICBpZiBzdmNfYWN0aXZlKGYicGhwe3Zlcn0tZnBtIik6IG9rKGYiUEhQIHt2ZXJ9IE9LIikKICAgICAgICAgICAgZWxzZTogd2FybihmIlBIUCB7dmVyfSBjb3VsZCBub3Qgc3RhcnQiKQoKICAgIGRlZiBfaGVhbF9yZWRpcygpOgogICAgICAgIHN0ZXAoIkhlYWxpbmcgUmVkaXMiKQogICAgICAgIGlmIG5vdCBydW5fb2soInJlZGlzLWNsaSAtcCA2Mzc5IHBpbmcgMj4vZGV2L251bGwgfCBncmVwIC1xIFBPTkciKToKICAgICAgICAgICAgc3ZjX3Jlc3RhcnQoInJlZGlzLXNlcnZlciIpCiAgICAgICAgZm9yIGNmIGluIFBhdGgoIi9ldGMvcmVkaXMiKS5nbG9iKCJyZWRpcy0qLmNvbmYiKToKICAgICAgICAgICAgc2x1ZyA9IGNmLnN0ZW0ucmVwbGFjZSgicmVkaXMtIiwgIiIpCiAgICAgICAgICAgIHBvcnQgPSBjbWRfb3V0KGYiZ3JlcCAnXnBvcnQnIHtjZn0gfCBhd2sgJ3t7cHJpbnQgJDJ9fSciKQogICAgICAgICAgICBpZiBwb3J0IGFuZCBub3QgcnVuX29rKGYicmVkaXMtY2xpIC1wIHtwb3J0fSBwaW5nIDI+L2Rldi9udWxsIHwgZ3JlcCAtcSBQT05HIik6CiAgICAgICAgICAgICAgICBzdmNfcmVzdGFydChmInJlZGlzLXtzbHVnfSIpCgogICAgZGVmIF9oZWFsX21hcmlhZGIoKToKICAgICAgICBzdGVwKCJIZWFsaW5nIE1hcmlhREIiKQogICAgICAgIGlmIG5vdCBzdmNfYWN0aXZlKCJtYXJpYWRiIik6CiAgICAgICAgICAgIHN2Y19yZXN0YXJ0KCJtYXJpYWRiIik7IHRpbWUuc2xlZXAoMykKICAgICAgICBpZiBzdmNfYWN0aXZlKCJtYXJpYWRiIik6IG9rKCJNYXJpYURCIE9LIikKICAgICAgICBlbHNlOiB3YXJuKCJNYXJpYURCIGNvdWxkIG5vdCBzdGFydCIpCgogICAgZGVmIF9oZWFsX3NzbCgpOgogICAgICAgIHN0ZXAoIkhlYWxpbmcgU1NMIikKICAgICAgICBjZXJ0X2RpciA9IFBhdGgoIi9ldGMvbGV0c2VuY3J5cHQvbGl2ZSIpCiAgICAgICAgaWYgbm90IGNlcnRfZGlyLmV4aXN0cygpOiByZXR1cm4KICAgICAgICBmb3IgZG9tYWluX2RpciBpbiBjZXJ0X2Rpci5pdGVyZGlyKCk6CiAgICAgICAgICAgIGlmIGRvbWFpbl9kaXIubmFtZSA9PSAiUkVBRE1FIjogY29udGludWUKICAgICAgICAgICAgY2VydCA9IGRvbWFpbl9kaXIgLyAiY2VydC5wZW0iCiAgICAgICAgICAgIGlmIG5vdCBjZXJ0LmV4aXN0cygpOiBjb250aW51ZQogICAgICAgICAgICBleHAgPSBjbWRfb3V0KGYib3BlbnNzbCB4NTA5IC1lbmRkYXRlIC1ub291dCAtaW4ge2NlcnR9IDI+L2Rldi9udWxsIHwgY3V0IC1kPSAtZjIiKQogICAgICAgICAgICBpZiBleHA6CiAgICAgICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgICAgZnJvbSBkYXRldGltZSBpbXBvcnQgZGF0ZXRpbWUgYXMgZHQKICAgICAgICAgICAgICAgICAgICBleHBfZHQgPSBkdC5zdHJwdGltZShleHAuc3RyaXAoKSwgIiViICVkICVIOiVNOiVTICVZICVaIikKICAgICAgICAgICAgICAgICAgICBkYXlzID0gKGV4cF9kdCAtIGR0Lm5vdygpKS5kYXlzCiAgICAgICAgICAgICAgICAgICAgaWYgZGF5cyA8IDE0OgogICAgICAgICAgICAgICAgICAgICAgICBpbmZvKGYiUmVuZXdpbmcge2RvbWFpbl9kaXIubmFtZX0gKHtkYXlzfWQgbGVmdCkiKQogICAgICAgICAgICAgICAgICAgICAgICBydW4oZiJjZXJ0Ym90IHJlbmV3IC0tY2VydC1uYW1lIHtkb21haW5fZGlyLm5hbWV9IC0tbmdpbnggLS1ub24taW50ZXJhY3RpdmUgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICAgICAgZXhjZXB0OiBwYXNzCgogICAgZGVmIF9oZWFsX2Rpc2soKToKICAgICAgICBzdGVwKCJIZWFsaW5nIGRpc2siKQogICAgICAgIHVzZWQgPSBpbnQoY21kX291dCgiZGYgLyB8IGF3ayAnTlI9PTJ7Z3N1YigvJS8sXCJcIiwkNSk7cHJpbnQgJDV9JyIpIG9yICIwIikKICAgICAgICBpZiB1c2VkID4gODU6CiAgICAgICAgICAgIHJ1bigiYXB0LWdldCBhdXRvcmVtb3ZlIC15IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKCJhcHQtZ2V0IGF1dG9jbGVhbiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIHJ1bigiam91cm5hbGN0bCAtLXZhY3V1bS1zaXplPTEwME0gMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICBydW4oImZpbmQgL3Zhci9sb2cgLW5hbWUgJyouZ3onIC1tdGltZSArNyAtZGVsZXRlIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgb2soIkRpc2sgY2xlYW5lZCIpCgogICAgZGVmIF9oZWFsX3dwKCk6CiAgICAgICAgc3RlcCgiSGVhbGluZyBXb3JkUHJlc3MgcGVybWlzc2lvbnMiKQogICAgICAgIGZvciBzaXRlIGluIFBhdGgoIi92YXIvd3d3L2h0bWwiKS5pdGVyZGlyKCk6CiAgICAgICAgICAgIGlmIG5vdCAoc2l0ZSAvICJ3cC1jb25maWcucGhwIikuZXhpc3RzKCk6IGNvbnRpbnVlCiAgICAgICAgICAgIHJ1bihmImZpbmQge3NpdGV9IC10eXBlIGQgLWV4ZWMgY2htb2QgNzU1IHt7fX0gXFw7IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKGYiZmluZCB7c2l0ZX0gLXR5cGUgZiAtZXhlYyBjaG1vZCA2NDQge3t9fSBcXDsgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICBydW4oZiJjaG1vZCA2MDAge3NpdGV9L3dwLWNvbmZpZy5waHAgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICBydW4oZiJjaG93biAtUiB3d3ctZGF0YTp3d3ctZGF0YSB7c2l0ZX0gMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgIG9rKCJXUCBwZXJtaXNzaW9ucyBmaXhlZCIpCgogICAgZGVmIF9oZWFsXzUwMigpOgogICAgICAgIHN0ZXAoIkZpeGluZyA1MDIgQmFkIEdhdGV3YXkiKQogICAgICAgICMgRklYOiBBcGFjaGUyIHBvcnQgODAgYmxvY2sg4KSV4KSwIOCksOCkueCkviDgpLngpYsg4KSk4KWLIOCkueCkn+CkvuCkj+CkggogICAgICAgIGlmIHJ1bl9vaygic3lzdGVtY3RsIGlzLWFjdGl2ZSAtLXF1aWV0IGFwYWNoZTIgMj4vZGV2L251bGwiKToKICAgICAgICAgICAgd2FybigiQXBhY2hlMiBpcyBydW5uaW5nIOKAlCB0aGlzIGNhdXNlcyA1MDIuIFJlbW92aW5nLi4uIikKICAgICAgICAgICAgcnVuKCJzeXN0ZW1jdGwgc3RvcCBhcGFjaGUyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKCJzeXN0ZW1jdGwgZGlzYWJsZSBhcGFjaGUyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgcnVuKCJhcHQtZ2V0IHJlbW92ZSAteSAtLXB1cmdlIGFwYWNoZTIgYXBhY2hlMi1iaW4gYXBhY2hlMi1kYXRhIGxpYmFwYWNoZTItbW9kLXBocCogMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgICAgICBydW4oImFwdC1nZXQgYXV0b3JlbW92ZSAteSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgICAgIG9rKCJBcGFjaGUyIHJlbW92ZWQg4oCUIHBvcnQgODAgZnJlZWQiKQogICAgICAgICMgUG9ydCA4MCBmcmVlIOCkueCliCDgpKTgpYsgTmdpbnggc3RhcnQg4KSV4KSw4KWH4KSCCiAgICAgICAgaWYgbm90IHN2Y19hY3RpdmUoIm5naW54Iik6CiAgICAgICAgICAgIHJ1bigic3lzdGVtY3RsIHN0YXJ0IG5naW54IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBfaGVhbF9waHAoKQogICAgICAgIHJ1bm5pbmdfcGhwID0gZGV0ZWN0X3BocCgpCiAgICAgICAgY29ycmVjdF9zb2NrID0gZiIvcnVuL3BocC9waHB7cnVubmluZ19waHB9LWZwbS5zb2NrIgogICAgICAgIGZvciBjZiBpbiBsaXN0KFBhdGgoIi9ldGMvbmdpbngvc2l0ZXMtZW5hYmxlZCIpLml0ZXJkaXIoKSkgKyBcCiAgICAgICAgICAgICAgICAgIGxpc3QoUGF0aCgiL2V0Yy9uZ2lueC9zaXRlcy1hdmFpbGFibGUiKS5pdGVyZGlyKCkpOgogICAgICAgICAgICBpZiBub3QgY2YuaXNfZmlsZSgpOiBjb250aW51ZQogICAgICAgICAgICB0eHQgPSBjZi5yZWFkX3RleHQoKQogICAgICAgICAgICBuZXdfdHh0ID0gcmUuc3ViKHIidW5peDovcnVuL3BocC9waHBbMC05Ll0rLWZwbVwuc29jayIsIGYidW5peDp7Y29ycmVjdF9zb2NrfSIsIHR4dCkKICAgICAgICAgICAgaWYgbmV3X3R4dCAhPSB0eHQ6IGNmLndyaXRlX3RleHQobmV3X3R4dCk7IGluZm8oZiJGaXhlZCB7Y2YubmFtZX0iKQogICAgICAgIF9oZWFsX25naW54KCkKICAgICAgICBvaygiNTAyIGZpeCBhcHBsaWVkIikKCiAgICBpZiAgIG1vZGUgaW4gKCJzZXJ2aWNlcyIsICJxdWljayIpOiAgIF9oZWFsX25naW54KCk7IF9oZWFsX3BocCgpOyBfaGVhbF9yZWRpcygpOyBfaGVhbF9tYXJpYWRiKCkKICAgIGVsaWYgbW9kZSA9PSAiY29uZmlncyI6ICAgICAgICAgICAgICAgX2hlYWxfbmdpbngoKTsgX2hlYWxfcGhwKCkKICAgIGVsaWYgbW9kZSA9PSAic3NsIjogICAgICAgICAgICAgICAgICAgX2hlYWxfc3NsKCkKICAgIGVsaWYgbW9kZSA9PSAiZGlzayI6ICAgICAgICAgICAgICAgICAgX2hlYWxfZGlzaygpCiAgICBlbGlmIG1vZGUgPT0gIndwIjogICAgICAgICAgICAgICAgICAgIF9oZWFsX3dwKCkKICAgIGVsaWYgbW9kZSBpbiAoIjUwMiIsIm5naW54LTUwMiIpOiAgICAgX2hlYWxfNTAyKCkKICAgIGVsc2U6ICAjIGZ1bGwKICAgICAgICBfaGVhbF9uZ2lueCgpOyBfaGVhbF9waHAoKTsgX2hlYWxfcmVkaXMoKTsgX2hlYWxfbWFyaWFkYigpCiAgICAgICAgX2hlYWxfc3NsKCk7IF9oZWFsX2Rpc2soKTsgX2hlYWxfd3AoKQoKICAgIG9rKGYiU2VsZi1oZWFsIFt7bW9kZX1dIGNvbXBsZXRlIikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBTRUxGLVVQREFURQojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfc2VsZl91cGRhdGUoYXJncyk6CiAgICBtb2RlID0gYXJnc1swXSBpZiBhcmdzIGVsc2UgImFsbCIKICAgIGN5YW4oZiJcbuKVkOKVkOKVkOKVkOKVkOKVkCBTZWxmLVVwZGF0ZToge21vZGV9IOKVkOKVkOKVkOKVkOKVkOKVkCIpCgogICAgZGVmIF91cGRfbmdpbngoKToKICAgICAgICBzdGVwKCJVcGRhdGluZyBOZ2lueCIpCiAgICAgICAgcnVuKCJhcHQtZ2V0IGluc3RhbGwgLXkgLS1vbmx5LXVwZ3JhZGUgbmdpbnggMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgIHN2Y19yZXN0YXJ0KCJuZ2lueCIpOyBvaygiTmdpbnggdXBkYXRlZCIpCgogICAgZGVmIF91cGRfcGhwKCk6CiAgICAgICAgc3RlcCgiVXBkYXRpbmcgUEhQIikKICAgICAgICBydW4oImFwdC1nZXQgaW5zdGFsbCAteSAtLW9ubHktdXBncmFkZSBwaHA4LjQtZnBtIHBocDguMy1mcG0gcGhwOC4yLWZwbSBwaHA4LjEtZnBtIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBmb3IgdiBpbiBbIjguNCIsIjguMyIsIjguMiIsIjguMSJdOgogICAgICAgICAgICBpZiBzdmNfYWN0aXZlKGYicGhwe3Z9LWZwbSIpOiBzdmNfcmVzdGFydChmInBocHt2fS1mcG0iKQogICAgICAgIG9rKCJQSFAgdXBkYXRlZCIpCgogICAgZGVmIF91cGRfcmVkaXMoKToKICAgICAgICBzdGVwKCJVcGRhdGluZyBSZWRpcyIpCiAgICAgICAgcnVuKCJhcHQtZ2V0IGluc3RhbGwgLXkgLS1vbmx5LXVwZ3JhZGUgcmVkaXMtc2VydmVyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBzdmNfcmVzdGFydCgicmVkaXMtc2VydmVyIik7IG9rKCJSZWRpcyB1cGRhdGVkIikKCiAgICBkZWYgX3VwZF9tYXJpYWRiKCk6CiAgICAgICAgc3RlcCgiVXBkYXRpbmcgTWFyaWFEQiIpCiAgICAgICAgcnVuKCJhcHQtZ2V0IGluc3RhbGwgLXkgLS1vbmx5LXVwZ3JhZGUgbWFyaWFkYi1zZXJ2ZXIgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgIHJ1bigibXlzcWxfdXBncmFkZSAtLXNpbGVudCAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgb2soIk1hcmlhREIgdXBkYXRlZCIpCgogICAgZGVmIF91cGRfd3BjbGkoKToKICAgICAgICBzdGVwKCJVcGRhdGluZyBXUC1DTEkiKQogICAgICAgIHJ1bigid3AgY2xpIHVwZGF0ZSAtLXllcyAtLWFsbG93LXJvb3QgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgIG9rKCJXUC1DTEkgdXBkYXRlZCIpCgogICAgaWYgICBtb2RlID09ICJuZ2lueCI6ICAgX3VwZF9uZ2lueCgpCiAgICBlbGlmIG1vZGUgPT0gInBocCI6ICAgICBfdXBkX3BocCgpCiAgICBlbGlmIG1vZGUgPT0gInJlZGlzIjogICBfdXBkX3JlZGlzKCkKICAgIGVsaWYgbW9kZSA9PSAibWFyaWFkYiI6IF91cGRfbWFyaWFkYigpCiAgICBlbGlmIG1vZGUgPT0gIndwY2xpIjogICBfdXBkX3dwY2xpKCkKICAgIGVsc2U6CiAgICAgICAgcnVuKCJhcHQtZ2V0IHVwZGF0ZSAteSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgX3VwZF9uZ2lueCgpOyBfdXBkX3BocCgpOyBfdXBkX3JlZGlzKCk7IF91cGRfbWFyaWFkYigpOyBfdXBkX3dwY2xpKCkKICAgIG9rKCJTZWxmLXVwZGF0ZSBjb21wbGV0ZSIpCgpkZWYgY21kX3NlbGZfY2hlY2soYXJncyk6CiAgICBjeWFuKCLilZDilZDilZDilZDilZDilZAgVmVyc2lvbiBTdGF0dXMg4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIikKICAgIGRlZiB2ZXIoY21kKTogcmV0dXJuIGNtZF9vdXQoY21kKSBvciAiPyIKICAgICMgUHJlLWNvbXB1dGUgYWxsIHZhbHVlcyBmaXJzdCDigJQgYmFja3NsYXNoZXMgbm90IGFsbG93ZWQgaW5zaWRlIGYtc3RyaW5nIGV4cHJlc3Npb25zCiAgICBuZ2lueF92ICAgPSB2ZXIoIm5naW54IC12IDI+JjEgfCBncmVwIC1vUCAnWzAtOV0rXFwuWzAtOV0rXFwuWzAtOV0rJyIpCiAgICBwaHBfdiAgICAgPSB2ZXIoInBocCAtLXZlcnNpb24gMj4vZGV2L251bGwgfCBoZWFkIC0xIHwgZ3JlcCAtb1AgJ1swLTldK1xcLlswLTldK1xcLlswLTldKyciKQogICAgcmVkaXNfdiAgID0gdmVyKCJyZWRpcy1zZXJ2ZXIgLS12ZXJzaW9uIDI+L2Rldi9udWxsIHwgZ3JlcCAtb1AgJ3Y9XFxLWzAtOS5dKyciKQogICAgbWFyaWFkYl92ID0gdmVyKCJteXNxbCAtLXZlcnNpb24gMj4vZGV2L251bGwgfCBncmVwIC1vUCAnRGlzdHJpYiBcXEtbMC05Ll0rJyIpCiAgICB3cGNsaV92ICAgPSB2ZXIoIndwIC0tYWxsb3ctcm9vdCAtLXZlcnNpb24gMj4vZGV2L251bGwiKQogICAgY2VydGJvdF92ID0gdmVyKCJjZXJ0Ym90IC0tdmVyc2lvbiAyPi9kZXYvbnVsbCB8IGF3ayAne3ByaW50ICQyfSciKQogICAgcHl0aG9uX3YgID0gdmVyKCJweXRob24zIC0tdmVyc2lvbiAyPi9kZXYvbnVsbCB8IGF3ayAne3ByaW50ICQyfSciKQogICAgcHJpbnQoZiIgIE5naW54ICAgOiB7bmdpbnhfdn0iKQogICAgcHJpbnQoZiIgIFBIUCAgICAgOiB7cGhwX3Z9IikKICAgIHByaW50KGYiICBSZWRpcyAgIDoge3JlZGlzX3Z9IikKICAgIHByaW50KGYiICBNYXJpYURCIDoge21hcmlhZGJfdn0iKQogICAgcHJpbnQoZiIgIFdQLUNMSSAgOiB7d3BjbGlfdn0iKQogICAgcHJpbnQoZiIgIENlcnRib3QgOiB7Y2VydGJvdF92fSIpCiAgICBwcmludChmIiAgUHl0aG9uICA6IHtweXRob25fdn0iKQogICAgIyBTaG93IGFsbCBhY3RpdmUgUEhQIHZlcnNpb25zCiAgICBmb3IgdiBpbiBbIjguNCIsICI4LjMiLCAiOC4yIiwgIjguMSJdOgogICAgICAgIGlmIHN2Y19hY3RpdmUoZiJwaHB7dn0tZnBtIik6CiAgICAgICAgICAgIHNvY2tfb2sgPSAi4pyFIiBpZiBwaHBfc29jayh2KS5leGlzdHMoKSBlbHNlICLinYwiCiAgICAgICAgICAgIHByaW50KGYiICBQSFB7dn0tRlBNIDog4pyFICBzb2NrZXQge3NvY2tfb2t9IikKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQojIEJBQ0tVUAojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfYmFja3VwKGFyZ3MpOgogICAgZG9tYWluID0gYXJnc1swXSBpZiBhcmdzIGVsc2UgTm9uZQogICAgdHMgPSBkYXRldGltZS5ub3coKS5zdHJmdGltZSgiJVklbSVkLSVIJU0lUyIpCiAgICBiZGlyID0gUGF0aChmIi9iYWNrdXBzL3t0c30iKTsgYmRpci5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICBzdGVwKGYiQmFja3VwIOKGkiB7YmRpcn0iKQogICAgaWYgZG9tYWluOgogICAgICAgIHJ1bihmInBocCB7UEhQX0hFTFBFUn0gYmFja3VwLWRiIHtkb21haW59IHtiZGlyfSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgcnVuKGYidGFyIC1jemYge2JkaXJ9L3tkb21haW59LWZpbGVzLnRhci5neiAvdmFyL3d3dy9odG1sL3tkb21haW59L3dwLWNvbnRlbnQgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgZWxzZToKICAgICAgICBydW4oZiJteXNxbGR1bXAgLS1hbGwtZGF0YWJhc2VzIDI+L2Rldi9udWxsIHwgZ3ppcCA+IHtiZGlyfS9hbGwtZGF0YWJhc2VzLnNxbC5neiB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgcnVuKGYidGFyIC1jemYge2JkaXJ9L25naW54LWNvbmYudGFyLmd6IC9ldGMvbmdpbnggMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgb2soZiJCYWNrdXAgY29tcGxldGU6IHtiZGlyfSIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgT1BUSU1JWkUgLyBDTEVBTgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfb3B0aW1pemUoYXJncyk6CiAgICBzdGVwKCJSdW5uaW5nIG9wdGltaXphdGlvbiIpCiAgICBydW4oIm15c3FsY2hlY2sgLS1hdXRvLXJlcGFpciAtLWFsbC1kYXRhYmFzZXMgLS1zaWxlbnQgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKGYicGhwIHtQSFBfSEVMUEVSfSBvcHRpbWl6ZS10YWJsZXMgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgZm9yIHYgaW4gWyI4LjQiLCI4LjMiLCI4LjIiLCI4LjEiXToKICAgICAgICBpZiBzdmNfYWN0aXZlKGYicGhwe3Z9LWZwbSIpOiBzdmNfcmVsb2FkKGYicGhwe3Z9LWZwbSIpCiAgICBvaygiT3B0aW1pemF0aW9uIGNvbXBsZXRlIikKCmRlZiBjbWRfY2xlYW4oYXJncyk6CiAgICBzdGVwKCJDbGVhbmluZyBjYWNoZSBhbmQgdGVtcCBmaWxlcyIpCiAgICBydW4oImZpbmQgL3RtcCAtdHlwZSBmIC1tdGltZSArMSAtZGVsZXRlIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiZmluZCAvdmFyL2xvZy9uZ2lueCAtbmFtZSAnKi5sb2cnIC1zaXplICsxMDBNIC1leGVjIHRydW5jYXRlIC1zIDUwTSB7fSBcXDsgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKCJhcHQtZ2V0IGF1dG9yZW1vdmUgLXkgMj4vZGV2L251bGwgJiYgYXB0LWdldCBhdXRvY2xlYW4gMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKCJqb3VybmFsY3RsIC0tdmFjdXVtLXRpbWU9N2QgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgb2soIkNsZWFuIGNvbXBsZXRlIikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBXRUJTT0NLRVQKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpkZWYgY21kX3dzX2VuYWJsZShhcmdzKToKICAgIGRvbWFpbiwgcG9ydCA9IGFyZ3NbMF0sIChhcmdzWzFdIGlmIGxlbihhcmdzKSA+IDEgZWxzZSAiODA4MCIpCiAgICBjb25mID0gUGF0aChmIi9ldGMvbmdpbngvY29uZi5kL3dlYnNvY2tldC1tYXAuY29uZiIpCiAgICBpZiBub3QgY29uZi5leGlzdHMoKToKICAgICAgICBjb25mLndyaXRlX3RleHQoIm1hcCAkaHR0cF91cGdyYWRlICRjb25uZWN0aW9uX3VwZ3JhZGUge1xuICAgIGRlZmF1bHQgY2xvc2U7XG4gICAgd2Vic29ja2V0IHVwZ3JhZGU7XG4gICAgXCJcIiBjbG9zZTtcbn1cbiIpCiAgICBuZ2lueF9jb25mID0gUGF0aChmIi9ldGMvbmdpbngvc2l0ZXMtYXZhaWxhYmxlL3tkb21haW59IikKICAgIGlmIG5vdCBuZ2lueF9jb25mLmV4aXN0cygpOiBlcnIoZiJOZ2lueCBjb25maWcgbm90IGZvdW5kOiB7ZG9tYWlufSIpOyByZXR1cm4KICAgIHR4dCA9IG5naW54X2NvbmYucmVhZF90ZXh0KCkKICAgIGlmICJwcm94eV9zZXRfaGVhZGVyLipVcGdyYWRlIiBub3QgaW4gdHh0OgogICAgICAgIHdzX2Jsb2NrID0gdGV4dHdyYXAuZGVkZW50KGYiIiIKICAgICAgICAgICAgbG9jYXRpb24gfiBeLyh3c3x3c3MpKC8uKik/IHt7CiAgICAgICAgICAgICAgICBwcm94eV9wYXNzICAgICAgICAgaHR0cDovLzEyNy4wLjAuMTp7cG9ydH07CiAgICAgICAgICAgICAgICBwcm94eV9odHRwX3ZlcnNpb24gMS4xOwogICAgICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciAgIFVwZ3JhZGUgJGh0dHBfdXBncmFkZTsKICAgICAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgICBDb25uZWN0aW9uICRjb25uZWN0aW9uX3VwZ3JhZGU7CiAgICAgICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyICAgSG9zdCAkaG9zdDsKICAgICAgICAgICAgICAgIHByb3h5X3JlYWRfdGltZW91dCAzNjAwczsKICAgICAgICAgICAgICAgIHByb3h5X2J1ZmZlcmluZyAgICBvZmY7CiAgICAgICAgICAgIH19CiAgICAgICAgIiIiKQogICAgICAgIHR4dCA9IHR4dC5yc3RyaXAoKS5yc3RyaXAoIn0iKSArIHdzX2Jsb2NrICsgIlxufVxuIgogICAgICAgIG5naW54X2NvbmYud3JpdGVfdGV4dCh0eHQpCiAgICBpZiBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6IHN2Y19yZWxvYWQoIm5naW54Iik7IG9rKGYiV2ViU29ja2V0IGVuYWJsZWQgZm9yIHtkb21haW59IikKICAgIGVsc2U6IGVycigiTmdpbnggY29uZmlnIGludmFsaWQgYWZ0ZXIgV1MgZW5hYmxlIikKCmRlZiBjbWRfd3NfZGlzYWJsZShhcmdzKToKICAgIGRvbWFpbiA9IGFyZ3NbMF0KICAgIG5naW54X2NvbmYgPSBQYXRoKGYiL2V0Yy9uZ2lueC9zaXRlcy1hdmFpbGFibGUve2RvbWFpbn0iKQogICAgaWYgbm90IG5naW54X2NvbmYuZXhpc3RzKCk6IGVycihmIkNvbmZpZyBub3QgZm91bmQiKTsgcmV0dXJuCiAgICB0eHQgPSBuZ2lueF9jb25mLnJlYWRfdGV4dCgpCiAgICB0eHQgPSByZS5zdWIociJcblxzK2xvY2F0aW9uIH4gXF5cKC93c1x8L3dzc1wpLio/XH1cbiIsICIiLCB0eHQsIGZsYWdzPXJlLkRPVEFMTCkKICAgIG5naW54X2NvbmYud3JpdGVfdGV4dCh0eHQpCiAgICBpZiBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6IHN2Y19yZWxvYWQoIm5naW54Iik7IG9rKCJXZWJTb2NrZXQgZGlzYWJsZWQiKQogICAgZWxzZTogZXJyKCJOZ2lueCBjb25maWcgaW52YWxpZCIpCgpkZWYgY21kX3dzX3N0YXR1cyhhcmdzKToKICAgIGRvbWFpbiA9IGFyZ3NbMF0gaWYgYXJncyBlbHNlIE5vbmUKICAgIHNpdGVzID0gW2RvbWFpbl0gaWYgZG9tYWluIGVsc2UgW2YubmFtZSBmb3IgZiBpbiBQYXRoKCIvZXRjL25naW54L3NpdGVzLWF2YWlsYWJsZSIpLml0ZXJkaXIoKV0KICAgIGZvciBzIGluIHNpdGVzOgogICAgICAgIGNvbmYgPSBQYXRoKGYiL2V0Yy9uZ2lueC9zaXRlcy1hdmFpbGFibGUve3N9IikKICAgICAgICBpZiBjb25mLmV4aXN0cygpOgogICAgICAgICAgICBoYXNfd3MgPSAicHJveHlfc2V0X2hlYWRlciAgIFVwZ3JhZGUiIGluIGNvbmYucmVhZF90ZXh0KCkKICAgICAgICAgICAgcHJpbnQoZiIgIHsn4pyFJyBpZiBoYXNfd3MgZWxzZSAn4p2MJ30gIHtzfSAgV2ViU29ja2V0IHsnZW5hYmxlZCcgaWYgaGFzX3dzIGVsc2UgJ2Rpc2FibGVkJ30iKQoKZGVmIGNtZF93c190ZXN0KGFyZ3MpOgogICAgZG9tYWluID0gYXJnc1swXSBpZiBhcmdzIGVsc2UgIiIKICAgIGluZm8oZiJUZXN0aW5nIFdlYlNvY2tldCBmb3Ige2RvbWFpbn0iKQogICAgY29kZSA9IGNtZF9vdXQoZiJjdXJsIC1zIC1vIC9kZXYvbnVsbCAtdyAnJXt7aHR0cF9jb2RlfX0nIC0tbWF4LXRpbWUgNSAtSCAnSG9zdDp7ZG9tYWlufScgLUggJ1VwZ3JhZGU6IHdlYnNvY2tldCcgLUggJ0Nvbm5lY3Rpb246IFVwZ3JhZGUnIGh0dHA6Ly8xMjcuMC4wLjEvd3MvIDI+L2Rldi9udWxsIikKICAgIHByaW50KGYiICBIVFRQIHJlc3BvbnNlOiB7Y29kZX0iKQoKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQojIEhUVFAzCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZGVmIGNtZF9odHRwM19lbmFibGUoYXJncyk6CiAgICBoYXNfcXVpYyA9IHJ1bl9vaygibmdpbnggLVYgMj4mMSB8IGdyZXAgLXFpIHF1aWMiKQogICAgaWYgaGFzX3F1aWM6CiAgICAgICAgUGF0aCgiL2V0Yy9uZ2lueC9jb25mLmQvaHR0cDMtcXVpYy5jb25mIikud3JpdGVfdGV4dCgicXVpY19yZXRyeSBvbjtcbnF1aWNfZ3NvIG9uO1xuIikKICAgICAgICBydW4oInVmdyBhbGxvdyA0NDMvdWRwIGNvbW1lbnQgJ0hUVFAzIFFVSUMnIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBpZiBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6IHN2Y19yZWxvYWQoIm5naW54Iik7IG9rKCJIVFRQLzMgZW5hYmxlZCIpCiAgICAgICAgZWxzZTogZXJyKCJIVFRQLzMgY29uZmlnIGludmFsaWQiKQogICAgZWxzZToKICAgICAgICB3YXJuKCJOZ2lueCBiaW5hcnkgZG9lcyBub3Qgc3VwcG9ydCBRVUlDIOKAlCBpbnN0YWxsIG5naW54LXF1aWMgZmlyc3QiKQoKZGVmIGNtZF9odHRwM19zdGF0dXMoYXJncyk6CiAgICBoYXNfcXVpYyA9IHJ1bl9vaygibmdpbnggLVYgMj4mMSB8IGdyZXAgLXFpIHF1aWMiKQogICAgcHJpbnQoZiIgIFFVSUMgYmluYXJ5IHN1cHBvcnQ6IHsn4pyFJyBpZiBoYXNfcXVpYyBlbHNlICfinYwnfSIpCiAgICBwcmludChmIiAgaHR0cDMtcXVpYy5jb25mOiAgICAgeyfinIUnIGlmIFBhdGgoJy9ldGMvbmdpbngvY29uZi5kL2h0dHAzLXF1aWMuY29uZicpLmV4aXN0cygpIGVsc2UgJ+KdjCd9IikKICAgIHVkcDQ0MyA9IHJ1bl9vaygidWZ3IHN0YXR1cyAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgJzQ0My91ZHAnIikKICAgIHByaW50KGYiICBVRFAvNDQzIChmaXJld2FsbCk6ICB7J+KchScgaWYgdWRwNDQzIGVsc2UgJ+KdjCd9IikKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBFREdFCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZGVmIGNtZF9lZGdlX3NldHVwKGFyZ3MpOgogICAgc3RlcCgiU2V0dGluZyB1cCBFZGdlIENvbXB1dGluZyBsYXllciIpCiAgICBQYXRoKCIvZXRjL25naW54L2NvbmYuZC9lZGdlLWNvbXB1dGluZy5jb25mIikud3JpdGVfdGV4dCh0ZXh0d3JhcC5kZWRlbnQoIiIiXAogICAgICAgIGZhc3RjZ2lfY2FjaGVfcGF0aCAvdmFyL2NhY2hlL25naW54L2VkZ2UgbGV2ZWxzPTE6MgogICAgICAgICAgICBrZXlzX3pvbmU9RURHRV9DQUNIRTo2NG0gaW5hY3RpdmU9MTBtIG1heF9zaXplPTUxMm07CiAgICAgICAgZ2VvICRlZGdlX3JlZ2lvbiB7CiAgICAgICAgICAgIGRlZmF1bHQgIGdsb2JhbDsKICAgICAgICAgICAgMTAuMC4wLjAvOCBnbG9iYWw7IDEyNy4wLjAuMC84IGdsb2JhbDsKICAgICAgICAgICAgMS4wLjAuMC84IGFwOyAxNC4wLjAuMC84IGFwOyAyNy4wLjAuMC84IGFwOyA1OC4wLjAuMC84IGFwOyAxMDEuMC4wLjAvOCBhcDsKICAgICAgICAgICAgMi4wLjAuMC84IGV1OyA1LjAuMC4wLzggZXU7IDM3LjAuMC4wLzggZXU7IDQ2LjAuMC4wLzggZXU7IDgwLjAuMC4wLzggZXU7CiAgICAgICAgICAgIDMuMC4wLjAvOCBuYTsgNC4wLjAuMC84IG5hOyAyNC4wLjAuMC84IG5hOyA2Ny4wLjAuMC84IG5hOwogICAgICAgIH0KICAgICAgICBnZW8gJGVkZ2VfcHVyZ2VfYWxsb3dlZCB7CiAgICAgICAgICAgIGRlZmF1bHQgMDsgMTI3LjAuMC4xIDE7IDEwLjAuMC4wLzggMTsgMTcyLjE2LjAuMC8xMiAxOwogICAgICAgIH0KICAgICIiIikpCiAgICBQYXRoKCIvdmFyL2NhY2hlL25naW54L2VkZ2UiKS5ta2RpcihwYXJlbnRzPVRydWUsIGV4aXN0X29rPVRydWUpCiAgICBydW4oImNob3duIC1SIG5naW54Om5naW54IC92YXIvY2FjaGUvbmdpbngvZWRnZSAyPi9kZXYvbnVsbCB8fCBjaG93biAtUiB3d3ctZGF0YTp3d3ctZGF0YSAvdmFyL2NhY2hlL25naW54L2VkZ2UgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgaWYgcnVuX29rKCJuZ2lueCAtdCAyPi9kZXYvbnVsbCIpOiBzdmNfcmVsb2FkKCJuZ2lueCIpOyBvaygiRWRnZSBsYXllciBhY3RpdmUiKQogICAgZWxzZTogZXJyKCJFZGdlIGNvbmZpZyBpbnZhbGlkIikKCmRlZiBjbWRfZWRnZV9zdGF0dXMoYXJncyk6CiAgICBjb25mID0gUGF0aCgiL2V0Yy9uZ2lueC9jb25mLmQvZWRnZS1jb21wdXRpbmcuY29uZiIpCiAgICBwcmludChmIiAgRWRnZSBjb25maWc6IHsn4pyFJyBpZiBjb25mLmV4aXN0cygpIGVsc2UgJ+KdjCd9IikKICAgIGNhY2hlID0gUGF0aCgiL3Zhci9jYWNoZS9uZ2lueC9lZGdlIikKICAgIGlmIGNhY2hlLmV4aXN0cygpOgogICAgICAgIHN6ID0gY21kX291dChmImR1IC1zaCB7Y2FjaGV9IDI+L2Rldi9udWxsIHwgY3V0IC1mMSIpIG9yICIwIgogICAgICAgIGZjID0gY21kX291dChmImZpbmQge2NhY2hlfSAtdHlwZSBmIDI+L2Rldi9udWxsIHwgd2MgLWwiKSBvciAiMCIKICAgICAgICBwcmludChmIiAgQ2FjaGU6IHtzen0gICh7ZmN9IGZpbGVzKSIpCgpkZWYgY21kX2VkZ2VfcHVyZ2UoYXJncyk6CiAgICBkb21haW4gPSBhcmdzWzBdIGlmIGFyZ3MgZWxzZSAiIjsgcGF0aCA9IGFyZ3NbMV0gaWYgbGVuKGFyZ3MpPjEgZWxzZSAiLyIKICAgIHJ1bihmImN1cmwgLXMgLVggUFVSR0UgLUggJ0hvc3Q6e2RvbWFpbn0nIGh0dHA6Ly8xMjcuMC4wLjEvcHVyZ2V7cGF0aH0gMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgb2soZiJFZGdlIHB1cmdlOiB7ZG9tYWlufXtwYXRofSIpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgQUkKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpkZWYgY21kX2FpX2RpYWdub3NlKGFyZ3MpOgogICAgZG9tYWluID0gYXJnc1swXSBpZiBhcmdzIGVsc2UgTm9uZQogICAgaW5mbygiQUkgRGlhZ25vc2Ug4oCUIHJlYWRpbmcgbG9ncy4uLiIpCiAgICBsb2dfc3JjID0gZiIvdmFyL2xvZy9uZ2lueC97ZG9tYWlufS5lcnJvci5sb2ciIGlmIGRvbWFpbiBlbHNlIHN0cihFUlJfTE9HKQogICAgbG9ncyA9IGNtZF9vdXQoZiJ0YWlsIC01MCB7bG9nX3NyY30gMj4vZGV2L251bGwiKSBvciAiTm8gbG9ncyBmb3VuZCIKICAgIGNmZ19maWxlID0gU1RBVEVfRElSIC8gImFpLmNvbmYiCiAgICBpZiBub3QgY2ZnX2ZpbGUuZXhpc3RzKCk6IHdhcm4oIk5vIEFJIEFQSSBrZXkgY29uZmlndXJlZC4gUnVuOiBlYXN5aW5zdGFsbCBhaS1zZXR1cCIpOyByZXR1cm4KICAgIGNmZyA9IGpzb24ubG9hZHMoY2ZnX2ZpbGUucmVhZF90ZXh0KCkpCiAgICBhcGlfa2V5ID0gY2ZnLmdldCgia2V5IiwiIik7IHByb3ZpZGVyID0gY2ZnLmdldCgicHJvdmlkZXIiLCJvcGVuYWkiKQogICAgaW1wb3J0IHVybGxpYi5yZXF1ZXN0CiAgICBwYXlsb2FkID0ganNvbi5kdW1wcyh7Im1vZGVsIjoiZ3B0LTRvLW1pbmkiLCJtZXNzYWdlcyI6WwogICAgICAgIHsicm9sZSI6InN5c3RlbSIsImNvbnRlbnQiOiJZb3UgYXJlIGEgV29yZFByZXNzIHNlcnZlciBleHBlcnQuIEFuYWx5emUgbG9ncyBhbmQgc3VnZ2VzdCBmaXhlcy4ifSwKICAgICAgICB7InJvbGUiOiJ1c2VyIiwiY29udGVudCI6ZiJTZXJ2ZXIgbG9nczpcbntsb2dzfVxuRGlhZ25vc2UgYW5kIHByb3ZpZGUgc3BlY2lmaWMgZml4IGNvbW1hbmRzLiJ9CiAgICBdLCJtYXhfdG9rZW5zIjo1MDB9KS5lbmNvZGUoKQogICAgcmVxID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCgiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS92MS9jaGF0L2NvbXBsZXRpb25zIiwKICAgICAgICBkYXRhPXBheWxvYWQsIGhlYWRlcnM9eyJBdXRob3JpemF0aW9uIjpmIkJlYXJlciB7YXBpX2tleX0iLCJDb250ZW50LVR5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn0pCiAgICB0cnk6CiAgICAgICAgd2l0aCB1cmxsaWIucmVxdWVzdC51cmxvcGVuKHJlcSwgdGltZW91dD0zMCkgYXMgcmVzcDoKICAgICAgICAgICAgZGF0YSA9IGpzb24ubG9hZHMocmVzcC5yZWFkKCkpCiAgICAgICAgICAgIHByaW50KCJcbiIgKyBkYXRhWyJjaG9pY2VzIl1bMF1bIm1lc3NhZ2UiXVsiY29udGVudCJdKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGVycihmIkFJIHJlcXVlc3QgZmFpbGVkOiB7ZX0iKQoKZGVmIGNtZF9haV9zZXR1cChhcmdzKToKICAgIGtleSA9IGlucHV0KCJFbnRlciBBSSBBUEkga2V5OiAiKS5zdHJpcCgpCiAgICBwcm92aWRlciA9IGlucHV0KCJQcm92aWRlciAob3BlbmFpL2dyb3EvZ2VtaW5pKSBbb3BlbmFpXTogIikuc3RyaXAoKSBvciAib3BlbmFpIgogICAgKFNUQVRFX0RJUiAvICJhaS5jb25mIikud3JpdGVfdGV4dChqc29uLmR1bXBzKHsia2V5IjprZXksInByb3ZpZGVyIjpwcm92aWRlcn0pKQogICAgb2soIkFJIGNvbmZpZ3VyZWQiKQoKZGVmIGNtZF9haV9vcHRpbWl6ZShhcmdzKToKICAgIGluZm8oIkFJIE9wdGltaXplIOKAlCBhbmFseXppbmcgc3lzdGVtLi4uIikKICAgIFQgPSByYW1fdHVuZSgpCiAgICB0aXBzID0gWwogICAgICAgIGYiUkFNPXtUWydyYW0nXX1NQiDigJQgUEhQIGNoaWxkcmVuPXtUWydwaHBfY2hpbGRyZW4nXX0gaXMgb3B0aW1hbCIsCiAgICAgICAgZiJNeVNRTCBidWZmZXIgcG9vbCB7VFsnbXlzcWxfYnVmJ119IHN1aXRzIHlvdXIgUkFNIiwKICAgICAgICAiRW5hYmxlIFJlZGlzIG9iamVjdCBjYWNoZSBpbiBXb3JkUHJlc3MgZm9yIDQwLTYwJSBzcGVlZCBib29zdCIsCiAgICAgICAgIlVzZSBDbG91ZGZsYXJlIENETiB0byBvZmZsb2FkIHN0YXRpYyBhc3NldHMiLAogICAgICAgICJFbmFibGUgQnJvdGxpIGNvbXByZXNzaW9uOiBhcHQtZ2V0IGluc3RhbGwgbGlibmdpbngtbW9kLWJyb3RsaSIsCiAgICBdCiAgICBjeWFuKCLilZDilZAgQUkgUGVyZm9ybWFuY2UgVGlwcyDilZDilZAiKQogICAgZm9yIHRpcCBpbiB0aXBzOiBwcmludChmIiAg8J+SoSAge3RpcH0iKQoKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQojIFBBR0VTUEVFRAojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlZiBjbWRfcGFnZXNwZWVkKGFyZ3MpOgogICAgaWYgbm90IGFyZ3M6IHByaW50KCJVc2FnZTogZWFzeWluc3RhbGwgcGFnZXNwZWVkIFtvcHRpbWl6ZXxzY29yZXxyZXBvcnR8aW1hZ2VzXSBkb21haW4uY29tIik7IHJldHVybgogICAgc3ViID0gYXJnc1swXTsgZG9tYWluID0gYXJnc1sxXSBpZiBsZW4oYXJncyk+MSBlbHNlICIiCiAgICBpZiBzdWIgPT0gIm9wdGltaXplIjoKICAgICAgICBydW4oZiJwaHAge1BIUF9IRUxQRVJ9IHBhZ2VzcGVlZC1vcHRpbWl6ZSB7ZG9tYWlufSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgb2soZiJQYWdlU3BlZWQgb3B0aW1pemVkOiB7ZG9tYWlufSIpCiAgICBlbGlmIHN1YiA9PSAic2NvcmUiOgogICAgICAgIHVybCA9IGYiaHR0cHM6Ly9wYWdlc3BlZWRvbmxpbmUuZ29vZ2xlYXBpcy5jb20vcGFnZXNwZWVkb25saW5lL3Y1L3J1blBhZ2VzcGVlZD91cmw9aHR0cDovL3tkb21haW59JnN0cmF0ZWd5PWRlc2t0b3AiCiAgICAgICAgc2NvcmUgPSBjbWRfb3V0KGYiY3VybCAtcyAne3VybH0nIDI+L2Rldi9udWxsIHwgcHl0aG9uMyAtYyBcImltcG9ydCBzeXMsanNvbjsgZD1qc29uLmxvYWQoc3lzLnN0ZGluKTsgcHJpbnQoaW50KGRbJ2xpZ2h0aG91c2VSZXN1bHQnXVsnY2F0ZWdvcmllcyddWydwZXJmb3JtYW5jZSddWydzY29yZSddKjEwMCkpXCIgMj4vZGV2L251bGwiKSBvciAiPyIKICAgICAgICBwcmludChmIiAgUGFnZVNwZWVkIHNjb3JlIGZvciB7ZG9tYWlufToge3Njb3JlfS8xMDAiKQogICAgZWxpZiBzdWIgPT0gImltYWdlcyI6CiAgICAgICAgcnVuKGYicGhwIHtQSFBfSEVMUEVSfSBvcHRpbWl6ZS1pbWFnZXMge2RvbWFpbn0gMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgICAgIG9rKCJJbWFnZXMgb3B0aW1pemVkIikKICAgIGVsaWYgc3ViID09ICJyZXBvcnQiOgogICAgICAgIHJ1bihmInBocCB7UEhQX0hFTFBFUn0gcGFnZXNwZWVkLXJlcG9ydCB7ZG9tYWlufSAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCgojID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CiMgRklYLUFQQUNIRSDigJQgQXBhY2hlIGNvbmZsaWN0IOCkleCliyBwZXJtYW5lbnRseSBmaXgg4KSV4KSw4KWH4KSCCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZGVmIGNtZF9maXhfYXBhY2hlKGFyZ3MpOgogICAgIiIiQXBhY2hlMiDgpJXgpYsg4KS54KSf4KS+4KSV4KSwIE5naW54IOCkleCliyBwb3J0IDgwIOCkquCksCByZXN0b3JlIOCkleCksOClh+CkgiIiIgogICAgY3lhbigiXG7ilZDilZDilZDilZDilZDilZAgQXBhY2hlMiBDb25mbGljdCBGaXgg4pWQ4pWQ4pWQ4pWQ4pWQ4pWQIikKICAgIHN0ZXAoIlN0b3BwaW5nIGFuZCByZW1vdmluZyBBcGFjaGUyIikKCiAgICAjIDEuIEFwYWNoZSBzdG9wICsgZGlzYWJsZSArIHB1cmdlCiAgICBydW4oInN5c3RlbWN0bCBzdG9wIGFwYWNoZTIgMj4vZGV2L251bGwgfHwgdHJ1ZSIsIGNoZWNrPUZhbHNlKQogICAgcnVuKCJzeXN0ZW1jdGwgZGlzYWJsZSBhcGFjaGUyIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiREVCSUFOX0ZST05URU5EPW5vbmludGVyYWN0aXZlIGFwdC1nZXQgcmVtb3ZlIC15IC0tcHVyZ2UgYXBhY2hlMiBhcGFjaGUyLWJpbiBhcGFjaGUyLWRhdGEgYXBhY2hlMi11dGlscyBsaWJhcGFjaGUyLW1vZC1waHAqIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigiYXB0LWdldCBhdXRvcmVtb3ZlIC15IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgIHJ1bigicm0gLXJmIC9ldGMvYXBhY2hlMiAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICBvaygiQXBhY2hlMiBwdXJnZWQiKQoKICAgICMgMi4gQXBhY2hlIOCkleCliyBhcHQg4KS44KWHIGJsb2NrIOCkleCksOClh+CkggogICAgUGF0aCgiL2V0Yy9hcHQvcHJlZmVyZW5jZXMuZC9ibG9jay1hcGFjaGUyLnByZWYiKS53cml0ZV90ZXh0KHRleHR3cmFwLmRlZGVudCgiIiJcCiAgICAgICAgUGFja2FnZTogYXBhY2hlMiBhcGFjaGUyLWJpbiBhcGFjaGUyLWRhdGEgYXBhY2hlMi11dGlscyBsaWJhcGFjaGUyLW1vZC1waHAqCiAgICAgICAgUGluOiByZWxlYXNlICoKICAgICAgICBQaW4tUHJpb3JpdHk6IC0xCiAgICAiIiIpKQogICAgb2soIkFwYWNoZTIgYmxvY2tlZCBpbiBhcHQgcHJlZmVyZW5jZXMiKQoKICAgICMgMy4gUG9ydCA4MCBmcmVlIOCkueCliCDigJQgTmdpbnggc3RhcnQg4KSV4KSw4KWH4KSCCiAgICBzdGVwKCJTdGFydGluZyBOZ2lueCBvbiBwb3J0IDgwIikKICAgIGlmIG5vdCBydW5fb2soIm5naW54IC10IDI+L2Rldi9udWxsIik6CiAgICAgICAgd2FybigiTmdpbnggY29uZmlnIGhhcyBlcnJvcnMg4oCUIHJ1bjogbmdpbnggLXQiKQogICAgZWxzZToKICAgICAgICBydW4oInN5c3RlbWN0bCBzdGFydCBuZ2lueCAyPi9kZXYvbnVsbCB8fCB0cnVlIiwgY2hlY2s9RmFsc2UpCiAgICAgICAgcnVuKCJzeXN0ZW1jdGwgZW5hYmxlIG5naW54IDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICBpbXBvcnQgdGltZSBhcyBfdDsgX3Quc2xlZXAoMikKICAgICAgICBpZiBzdmNfYWN0aXZlKCJuZ2lueCIpOgogICAgICAgICAgICBvaygiTmdpbnggaXMgcnVubmluZyBvbiBwb3J0IDgwIikKICAgICAgICBlbHNlOgogICAgICAgICAgICBlcnIoIk5naW54IHN0aWxsIG5vdCBydW5uaW5nIOKAlCBjaGVjazogam91cm5hbGN0bCAtdSBuZ2lueCAtbiAzMCIpCiAgICAgICAgICAgIHJldHVybgoKICAgICMgNC4gUEhQLUZQTSByZXN0YXJ0IOCkleCksOClh+CkggogICAgc3RlcCgiUmVzdGFydGluZyBQSFAtRlBNIikKICAgIGZvciB2IGluIFsiOC40IiwgIjguMyIsICI4LjIiLCAiOC4xIl06CiAgICAgICAgaWYgUGF0aChmIi9ldGMvcGhwL3t2fSIpLmV4aXN0cygpOgogICAgICAgICAgICBydW4oZiJzeXN0ZW1jdGwgcmVzdGFydCBwaHB7dn0tZnBtIDI+L2Rldi9udWxsIHx8IHRydWUiLCBjaGVjaz1GYWxzZSkKICAgICAgICAgICAgZml4X3NvY2sodikKICAgICAgICAgICAgaWYgc3ZjX2FjdGl2ZShmInBocHt2fS1mcG0iKToKICAgICAgICAgICAgICAgIG9rKGYiUEhQIHt2fS1GUE0gcnVubmluZyIpCgogICAgb2soIkFwYWNoZSBmaXggY29tcGxldGUg4oCUIHNpdGUgc2hvdWxkIGJlIGFjY2Vzc2libGUgbm93IikKICAgIGluZm8oIlRlc3Q6IGN1cmwgLUkgaHR0cDovL2xvY2FsaG9zdCIpCiAgICBpbmZvKCJJZiBzdGlsbCA1MDI6IGVhc3lpbnN0YWxsIHNlbGYtaGVhbCA1MDIiKQoKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBNQUlOIERJU1BBVENICiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KQ09NTUFORFMgPSB7CiAgICAiaW5zdGFsbCI6ICAgICAgY21kX2luc3RhbGwsCiAgICAiY3JlYXRlIjogICAgICAgY21kX2NyZWF0ZSwKICAgICJkZWxldGUiOiAgICAgICBjbWRfZGVsZXRlLAogICAgImxpc3QiOiAgICAgICAgIGNtZF9saXN0LAogICAgInNpdGUtaW5mbyI6ICAgIGNtZF9zaXRlX2luZm8sCiAgICAidXBkYXRlLXNpdGUiOiAgY21kX3VwZGF0ZV9zaXRlLAogICAgImNsb25lIjogICAgICAgIGNtZF9jbG9uZSwKICAgICJwaHAtc3dpdGNoIjogICBjbWRfcGhwX3N3aXRjaCwKICAgICJzc2wiOiAgICAgICAgICBjbWRfc3NsLAogICAgInNzbC1yZW5ldyI6ICAgIGNtZF9zc2xfcmVuZXcsCiAgICAicmVkaXMtc3RhdHVzIjogY21kX3JlZGlzX3N0YXR1cywKICAgICJyZWRpcy1yZXN0YXJ0IjpjbWRfcmVkaXNfcmVzdGFydCwKICAgICJyZWRpcy1wb3J0cyI6ICBjbWRfcmVkaXNfcG9ydHMsCiAgICAic3RhdHVzIjogICAgICAgY21kX3N0YXR1cywKICAgICJoZWFsdGgiOiAgICAgICBjbWRfaGVhbHRoLAogICAgIm1vbml0b3IiOiAgICAgIGNtZF9tb25pdG9yLAogICAgImxvZ3MiOiAgICAgICAgIGNtZF9sb2dzLAogICAgInBlcmYiOiAgICAgICAgIGNtZF9wZXJmLAogICAgInNlbGYtaGVhbCI6ICAgIGNtZF9zZWxmX2hlYWwsCiAgICAic2VsZi11cGRhdGUiOiAgY21kX3NlbGZfdXBkYXRlLAogICAgInNlbGYtY2hlY2siOiAgIGNtZF9zZWxmX2NoZWNrLAogICAgImJhY2t1cCI6ICAgICAgIGNtZF9iYWNrdXAsCiAgICAib3B0aW1pemUiOiAgICAgY21kX29wdGltaXplLAogICAgImNsZWFuIjogICAgICAgIGNtZF9jbGVhbiwKICAgICJ3cy1lbmFibGUiOiAgICBjbWRfd3NfZW5hYmxlLAogICAgIndzLWRpc2FibGUiOiAgIGNtZF93c19kaXNhYmxlLAogICAgIndzLXN0YXR1cyI6ICAgIGNtZF93c19zdGF0dXMsCiAgICAid3MtdGVzdCI6ICAgICAgY21kX3dzX3Rlc3QsCiAgICAiaHR0cDMtZW5hYmxlIjogY21kX2h0dHAzX2VuYWJsZSwKICAgICJodHRwMy1zdGF0dXMiOiBjbWRfaHR0cDNfc3RhdHVzLAogICAgImVkZ2Utc2V0dXAiOiAgIGNtZF9lZGdlX3NldHVwLAogICAgImVkZ2Utc3RhdHVzIjogIGNtZF9lZGdlX3N0YXR1cywKICAgICJlZGdlLXB1cmdlIjogICBjbWRfZWRnZV9wdXJnZSwKICAgICJhaS1kaWFnbm9zZSI6ICBjbWRfYWlfZGlhZ25vc2UsCiAgICAiYWktc2V0dXAiOiAgICAgY21kX2FpX3NldHVwLAogICAgImFpLW9wdGltaXplIjogIGNtZF9haV9vcHRpbWl6ZSwKICAgICJwYWdlc3BlZWQiOiAgICBjbWRfcGFnZXNwZWVkLAogICAgImZpeC1hcGFjaGUiOiAgIGNtZF9maXhfYXBhY2hlLAogICAgImZpeC1uZ2lueCI6ICAgIGNtZF9maXhfYXBhY2hlLCAgIyBhbGlhcwp9CgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgaWYgbGVuKHN5cy5hcmd2KSA8IDI6CiAgICAgICAgcHJpbnQoIlVzYWdlOiBlYXN5aW5zdGFsbCA8Y29tbWFuZD4gW2FyZ3NdIik7IHN5cy5leGl0KDEpCiAgICBjbWQgID0gc3lzLmFyZ3ZbMV0KICAgIGFyZ3MgPSBzeXMuYXJndlsyOl0KICAgIGZuICAgPSBDT01NQU5EUy5nZXQoY21kKQogICAgaWYgZm46CiAgICAgICAgdHJ5OgogICAgICAgICAgICBmbihhcmdzKQogICAgICAgIGV4Y2VwdCBLZXlib2FyZEludGVycnVwdDoKICAgICAgICAgICAgcHJpbnQoIlxuSW50ZXJydXB0ZWQiKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgZXJyKHN0cihlKSkKICAgICAgICAgICAgX2xvZygiRVJST1IiLCBzdHIoZSkpCiAgICAgICAgICAgIHN5cy5leGl0KDEpCiAgICBlbHNlOgogICAgICAgIGVycihmIlVua25vd24gY29tbWFuZDoge2NtZH0iKQogICAgICAgIHByaW50KCJSdW46IGVhc3lpbnN0YWxsIGhlbHAiKQogICAgICAgIHN5cy5leGl0KDEpCg=="
+    echo "$CORE_B64" | base64 -d > "$LIB_DIR/core.py"
+    chmod +x "$LIB_DIR/core.py"
+    if [ -s "$LIB_DIR/core.py" ]; then
+        SZ=$(wc -c < "$LIB_DIR/core.py")
+        print_success "core.py extracted (${SZ} bytes)"
+    else
+        print_error "core.py extraction failed"; exit 1
+    fi
+
+    # easyinstall_wp.php — PHP WordPress helper
+    PHP_B64="PD9waHAKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KLy8gRWFzeUluc3RhbGwgdjcuMCDigJQgUEhQIFdvcmRQcmVzcyBIZWxwZXIgKENMSSkKLy8gSGFuZGxlczogd3AtY29uZmlnLCBEQiBvcHMsIHNpdGUgY3JlYXRlL2RlbGV0ZS9jbG9uZSwgcGFnZXNwZWVkLCBpbWFnZXMKLy8gUnVuIHZpYTogcGhwIGVhc3lpbnN0YWxsX3dwLnBocCA8Y29tbWFuZD4gW2FyZ3NdCi8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmRlY2xhcmUoc3RyaWN0X3R5cGVzPTEpOwoKZGVmaW5lKCdFSV9WRVJTSU9OJywgJzcuMCcpOwpkZWZpbmUoJ1dQX1JPT1QnLCAgICAnL3Zhci93d3cvaHRtbCcpOwpkZWZpbmUoJ1NUQVRFX0RJUicsICAnL3Zhci9saWIvZWFzeWluc3RhbGwnKTsKZGVmaW5lKCdMT0dfRklMRScsICAgJy92YXIvbG9nL2Vhc3lpbnN0YWxsL2luc3RhbGwubG9nJyk7CmRlZmluZSgnQ1JFRF9ESVInLCAgICcvcm9vdCcpOwoKLy8g4pSA4pSA4pSAIENvbG9ycyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKY29uc3QgRyAgPSAiXDAzM1swOzMybSI7CmNvbnN0IFkgID0gIlwwMzNbMTszM20iOwpjb25zdCBSICA9ICJcMDMzWzA7MzFtIjsKY29uc3QgQiAgPSAiXDAzM1swOzM0bSI7CmNvbnN0IEMgID0gIlwwMzNbMDszNm0iOwpjb25zdCBOQyA9ICJcMDMzWzBtIjsKCmZ1bmN0aW9uIG9rKHN0cmluZyAkbSk6ICAgdm9pZCB7IGVjaG8gRyAuICLinIUgICRtIiAuIE5DIC4gIlxuIjsgfQpmdW5jdGlvbiB3YXJuKHN0cmluZyAkbSk6IHZvaWQgeyBlY2hvIFkgLiAi4pqg77iPICAgJG0iIC4gTkMgLiAiXG4iOyB9CmZ1bmN0aW9uIGVycihzdHJpbmcgJG0pOiAgdm9pZCB7IGVjaG8gUiAuICLinYwgICRtIiAuIE5DIC4gIlxuIjsgfQpmdW5jdGlvbiBpbmZvKHN0cmluZyAkbSk6IHZvaWQgeyBlY2hvIEIgLiAi4oS577iPICAgJG0iIC4gTkMgLiAiXG4iOyB9CmZ1bmN0aW9uIHN0ZXAoc3RyaW5nICRtKTogdm9pZCB7IGVjaG8gQyAuICLwn5S3ICAkbSIgLiBOQyAuICJcbiI7IH0KCi8vIOKUgOKUgOKUgCBMb2dnaW5nIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApmdW5jdGlvbiBlaV9sb2coc3RyaW5nICRsZXZlbCwgc3RyaW5nICRtc2cpOiB2b2lkIHsKICAgICR0cyAgPSBkYXRlKCdZLW0tZCBIOmk6cycpOwogICAgJGRpciA9IGRpcm5hbWUoTE9HX0ZJTEUpOwogICAgaWYgKCFpc19kaXIoJGRpcikpIG1rZGlyKCRkaXIsIDA3NTUsIHRydWUpOwogICAgZmlsZV9wdXRfY29udGVudHMoTE9HX0ZJTEUsICJbJHRzXSBbJGxldmVsXSAkbXNnXG4iLCBGSUxFX0FQUEVORCk7Cn0KCi8vIOKUgOKUgOKUgCBTaGVsbCBoZWxwZXIg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmZ1bmN0aW9uIHNoKHN0cmluZyAkY21kLCBib29sICRyZXR1cm4gPSBmYWxzZSk6IHN0cmluZ3xib29sIHsKICAgIGVpX2xvZygnQ01EJywgc3Vic3RyKCRjbWQsIDAsIDEwMCkpOwogICAgaWYgKCRyZXR1cm4pIHsKICAgICAgICAkb3V0ID0gc2hlbGxfZXhlYygkY21kIC4gJyAyPi9kZXYvbnVsbCcpOwogICAgICAgIHJldHVybiAkb3V0ICE9PSBudWxsID8gdHJpbSgkb3V0KSA6ICcnOwogICAgfQogICAgc3lzdGVtKCRjbWQgLiAnIDI+L2Rldi9udWxsJywgJHJjKTsKICAgIHJldHVybiAkcmMgPT09IDA7Cn0KCmZ1bmN0aW9uIHNoX291dChzdHJpbmcgJGNtZCk6IHN0cmluZyB7CiAgICByZXR1cm4gdHJpbSgoc3RyaW5nKShzaGVsbF9leGVjKCRjbWQgLiAnIDI+L2Rldi9udWxsJykgPz8gJycpKTsKfQoKLy8g4pSA4pSA4pSAIERhdGFiYXNlIGNvbm5lY3Rpb24g4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmZ1bmN0aW9uIGRiX2Nvbm5lY3QoKTogP1BETyB7CiAgICAkb3B0cyA9IFtQRE86OkFUVFJfRVJSTU9ERSA9PiBQRE86OkVSUk1PREVfRVhDRVBUSU9OLAogICAgICAgICAgICAgUERPOjpBVFRSX0RFRkFVTFRfRkVUQ0hfTU9ERSA9PiBQRE86OkZFVENIX0FTU09DXTsKCiAgICAvLyBUcnkgdW5peF9zb2NrZXQgZmlyc3Qg4oCUIE1hcmlhREIgb24gRGViaWFuL1VidW50dSB1c2VzIHVuaXhfc29ja2V0IHBsdWdpbgogICAgLy8gZm9yIHJvb3QgYnkgZGVmYXVsdCwgc28gbm8gcGFzc3dvcmQgaXMgbmVlZGVkIHdoZW4gY29ubmVjdGluZyB2aWEgc29ja2V0LgogICAgJHNvY2tldHMgPSBbCiAgICAgICAgJy9ydW4vbXlzcWxkL215c3FsZC5zb2NrJywKICAgICAgICAnL3Zhci9ydW4vbXlzcWxkL215c3FsZC5zb2NrJywKICAgICAgICAnL3RtcC9teXNxbC5zb2NrJywKICAgIF07CiAgICBmb3JlYWNoICgkc29ja2V0cyBhcyAkc29jaykgewogICAgICAgIGlmICghZmlsZV9leGlzdHMoJHNvY2spKSBjb250aW51ZTsKICAgICAgICB0cnkgewogICAgICAgICAgICByZXR1cm4gbmV3IFBETygibXlzcWw6dW5peF9zb2NrZXQ9eyRzb2NrfTtjaGFyc2V0PXV0ZjhtYjQiLCAncm9vdCcsICcnLCAkb3B0cyk7CiAgICAgICAgfSBjYXRjaCAoUERPRXhjZXB0aW9uICRlKSB7CiAgICAgICAgICAgIC8vIHNvY2tldCBleGlzdHMgYnV0IGF1dGggc3RpbGwgZmFpbGVkIOKAlCB0cnkgbmV4dAogICAgICAgIH0KICAgIH0KCiAgICAvLyBGYWxsYmFjazogVENQIHdpdGggZW1wdHkgcGFzc3dvcmQgKHdvcmtzIHdoZW4gbmF0aXZlIHBhc3N3b3JkIGF1dGggaXMgc2V0KQogICAgdHJ5IHsKICAgICAgICByZXR1cm4gbmV3IFBETygnbXlzcWw6aG9zdD0xMjcuMC4wLjE7cG9ydD0zMzA2O2NoYXJzZXQ9dXRmOG1iNCcsICdyb290JywgJycsICRvcHRzKTsKICAgIH0gY2F0Y2ggKFBET0V4Y2VwdGlvbiAkZSkgewogICAgICAgIGVycigiREIgY29ubmVjdCBmYWlsZWQ6ICIgLiAkZS0+Z2V0TWVzc2FnZSgpKTsKICAgICAgICBlcnIoIkZpeDogbXlzcWwgLWUgXCJBTFRFUiBVU0VSICdyb290J0AnbG9jYWxob3N0JyBJREVOVElGSUVEIFZJQSBteXNxbF9uYXRpdmVfcGFzc3dvcmQgVVNJTkcgJyc7IEZMVVNIIFBSSVZJTEVHRVM7XCIiKTsKICAgICAgICByZXR1cm4gbnVsbDsKICAgIH0KfQoKLy8g4pSA4pSA4pSAIEdlbmVyYXRlIHJhbmRvbSBzdHJpbmcg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmZ1bmN0aW9uIHJhbmRfc3RyKGludCAkbGVuID0gMTYpOiBzdHJpbmcgewogICAgJGIgPSByYW5kb21fYnl0ZXMoKGludCljZWlsKCRsZW4gKiAzIC8gNCkpOwogICAgcmV0dXJuIHN1YnN0cihwcmVnX3JlcGxhY2UoJy9bXmEtekEtWjAtOV0vJywgJycsIGJhc2U2NF9lbmNvZGUoJGIpKSwgMCwgJGxlbik7Cn0KCi8vIOKUgOKUgOKUgCBHZW5lcmF0ZSBXb3JkUHJlc3Mgc2FsdHMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmZ1bmN0aW9uIHdwX3NhbHQoaW50ICRsZW4gPSA2NCk6IHN0cmluZyB7CiAgICAkY2hhcnMgPSAnYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXpBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWjAxMjM0NTY3ODkhQCMkJV4mKigpLV89K1tde318OzosLjw+Pyc7CiAgICAkc2FsdCAgPSAnJzsKICAgICRtYXggICA9IHN0cmxlbigkY2hhcnMpIC0gMTsKICAgIGZvciAoJGkgPSAwOyAkaSA8ICRsZW47ICRpKyspIHsKICAgICAgICAkc2FsdCAuPSAkY2hhcnNbcmFuZG9tX2ludCgwLCAkbWF4KV07CiAgICB9CiAgICByZXR1cm4gJHNhbHQ7Cn0KCi8vIOKUgOKUgOKUgCBHZXQgUEhQIG1lbW9yeSBsaW1pdCBmb3IgYSBzaXRlIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApmdW5jdGlvbiBnZXRfcGhwX21lbShzdHJpbmcgJHBocF92ZXIpOiBzdHJpbmcgewogICAgJGluaSA9ICIvZXRjL3BocC97JHBocF92ZXJ9L2ZwbS9waHAuaW5pIjsKICAgIGlmIChpc19maWxlKCRpbmkpKSB7CiAgICAgICAgJGxpbmVzID0gZmlsZSgkaW5pLCBGSUxFX0lHTk9SRV9ORVdfTElORVMgfCBGSUxFX1NLSVBfRU1QVFlfTElORVMpOwogICAgICAgIGZvcmVhY2ggKCRsaW5lcyBhcyAkbGluZSkgewogICAgICAgICAgICBpZiAocHJlZ19tYXRjaCgnL15tZW1vcnlfbGltaXRccyo9XHMqKC4rKS9pJywgJGxpbmUsICRtKSkgewogICAgICAgICAgICAgICAgcmV0dXJuIHRyaW0oJG1bMV0pOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQogICAgcmV0dXJuICcyNTZNJzsKfQoKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KLy8gQ09NTUFORDogY3JlYXRlLXNpdGUKLy8gcGhwIHdwX2hlbHBlci5waHAgY3JlYXRlLXNpdGUgZG9tYWluLmNvbSByZWRpc19wb3J0IHBocF92ZXIKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZnVuY3Rpb24gY21kX2NyZWF0ZV9zaXRlKGFycmF5ICRhcmdzKTogdm9pZCB7CiAgICBbJGRvbWFpbiwgJHJlZGlzX3BvcnQsICRwaHBfdmVyXSA9ICRhcmdzICsgWycnLCAnNjM3OScsICc4LjMnXTsKICAgIGlmICghJGRvbWFpbikgeyBlcnIoIkRvbWFpbiByZXF1aXJlZCIpOyBleGl0KDEpOyB9CgogICAgJGRvbWFpbiAgICAgPSBwcmVnX3JlcGxhY2UoJy9odHRwcz86XC9cL3xed3d3XC58XC8vJywnJywgJGRvbWFpbik7CiAgICAkZGJfc2FmZSAgICA9IHByZWdfcmVwbGFjZSgnL1suXC1dLycsICdfJywgJGRvbWFpbik7CiAgICAkZGJfbmFtZSAgICA9ICJ3cF97JGRiX3NhZmV9IjsKICAgICRkYl91c2VyICAgID0gIndwdXNlcl97JGRiX3NhZmV9IjsKICAgICRkYl9wYXNzICAgID0gcmFuZF9zdHIoMjApOwogICAgJHdwX3BhdGggICAgPSBXUF9ST09UIC4gIi97JGRvbWFpbn0iOwogICAgJHBocF9tZW0gICAgPSBnZXRfcGhwX21lbSgkcGhwX3Zlcik7CiAgICAkcmVkaXNfcG9ydCA9IChpbnQpJHJlZGlzX3BvcnQ7CgogICAgc3RlcCgiQ3JlYXRpbmcgV29yZFByZXNzIGNvbmZpZyBmb3IgeyRkb21haW59Iik7CgogICAgLy8g4pSA4pSAIENyZWF0ZSBkYXRhYmFzZSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICRwZG8gPSBkYl9jb25uZWN0KCk7CiAgICBpZiAoISRwZG8pIGV4aXQoMSk7CgogICAgJHBkby0+ZXhlYygiQ1JFQVRFIERBVEFCQVNFIElGIE5PVCBFWElTVFMgYHskZGJfbmFtZX1gIENIQVJBQ1RFUiBTRVQgdXRmOG1iNCBDT0xMQVRFIHV0ZjhtYjRfdW5pY29kZV9jaSIpOwogICAgJHBkby0+ZXhlYygiQ1JFQVRFIFVTRVIgSUYgTk9UIEVYSVNUUyAneyRkYl91c2VyfSdAJ2xvY2FsaG9zdCcgSURFTlRJRklFRCBCWSAneyRkYl9wYXNzfSciKTsKICAgICRwZG8tPmV4ZWMoIkdSQU5UIEFMTCBQUklWSUxFR0VTIE9OIGB7JGRiX25hbWV9YC4qIFRPICd7JGRiX3VzZXJ9J0AnbG9jYWxob3N0JyIpOwogICAgJHBkby0+ZXhlYygiRkxVU0ggUFJJVklMRUdFUyIpOwogICAgb2soIkRhdGFiYXNlIGNyZWF0ZWQ6IHskZGJfbmFtZX0iKTsKCiAgICAvLyDilIDilIAgR2VuZXJhdGUgc2FsdHMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAkc2FsdHMgPSBbXTsKICAgIGZvcmVhY2ggKFsnQVVUSF9LRVknLCdTRUNVUkVfQVVUSF9LRVknLCdMT0dHRURfSU5fS0VZJywnTk9OQ0VfS0VZJywKICAgICAgICAgICAgICAnQVVUSF9TQUxUJywnU0VDVVJFX0FVVEhfU0FMVCcsJ0xPR0dFRF9JTl9TQUxUJywnTk9OQ0VfU0FMVCddIGFzICRrKSB7CiAgICAgICAgJHNhbHRzWyRrXSA9IHdwX3NhbHQoKTsKICAgIH0KCiAgICAvLyDilIDilIAgV3JpdGUgd3AtY29uZmlnLnBocCDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICRjb25maWcgPSA8PDxQSFAKPD9waHAKLyoqIEVhc3lJbnN0YWxsIHY3LjAg4oCUIGF1dG8tZ2VuZXJhdGVkIHdwLWNvbmZpZyAqLwpkZWZpbmUoJ0RCX05BTUUnLCAgICAgJ3skZGJfbmFtZX0nKTsKZGVmaW5lKCdEQl9VU0VSJywgICAgICd7JGRiX3VzZXJ9Jyk7CmRlZmluZSgnREJfUEFTU1dPUkQnLCAneyRkYl9wYXNzfScpOwpkZWZpbmUoJ0RCX0hPU1QnLCAgICAgJ2xvY2FsaG9zdCcpOwpkZWZpbmUoJ0RCX0NIQVJTRVQnLCAgJ3V0ZjhtYjQnKTsKZGVmaW5lKCdEQl9DT0xMQVRFJywgICcnKTsKCmRlZmluZSgnQVVUSF9LRVknLCAgICAgICAgICd7JHNhbHRzW0FVVEhfS0VZXX0nKTsKZGVmaW5lKCdTRUNVUkVfQVVUSF9LRVknLCAgJ3skc2FsdHNbU0VDVVJFX0FVVEhfS0VZXX0nKTsKZGVmaW5lKCdMT0dHRURfSU5fS0VZJywgICAgJ3skc2FsdHNbTE9HR0VEX0lOX0tFWV19Jyk7CmRlZmluZSgnTk9OQ0VfS0VZJywgICAgICAgICd7JHNhbHRzW05PTkNFX0tFWV19Jyk7CmRlZmluZSgnQVVUSF9TQUxUJywgICAgICAgICd7JHNhbHRzW0FVVEhfU0FMVF19Jyk7CmRlZmluZSgnU0VDVVJFX0FVVEhfU0FMVCcsICd7JHNhbHRzW1NFQ1VSRV9BVVRIX1NBTFRdfScpOwpkZWZpbmUoJ0xPR0dFRF9JTl9TQUxUJywgICAneyRzYWx0c1tMT0dHRURfSU5fU0FMVF19Jyk7CmRlZmluZSgnTk9OQ0VfU0FMVCcsICAgICAgICd7JHNhbHRzW05PTkNFX1NBTFRdfScpOwoKZGVmaW5lKCdXUF9ERUJVRycsICAgICAgICAgICAgICBmYWxzZSk7CmRlZmluZSgnV1BfREVCVUdfTE9HJywgICAgICAgICAgZmFsc2UpOwpkZWZpbmUoJ1dQX0RFQlVHX0RJU1BMQVknLCAgICAgIGZhbHNlKTsKZGVmaW5lKCdXUF9NRU1PUllfTElNSVQnLCAgICAgICAneyRwaHBfbWVtfScpOwpkZWZpbmUoJ1dQX01BWF9NRU1PUllfTElNSVQnLCAgICc1MTJNJyk7CmRlZmluZSgnV1BfQ0FDSEUnLCAgICAgICAgICAgICAgdHJ1ZSk7CmRlZmluZSgnRElTQUxMT1dfRklMRV9FRElUJywgICAgZmFsc2UpOwpkZWZpbmUoJ1dQX1BPU1RfUkVWSVNJT05TJywgICAgIDUpOwpkZWZpbmUoJ0VNUFRZX1RSQVNIX0RBWVMnLCAgICAgIDcpOwpkZWZpbmUoJ1dQX0NST05fTE9DS19USU1FT1VUJywgIDYwKTsKZGVmaW5lKCdBVVRPTUFUSUNfVVBEQVRFUl9ESVNBQkxFRCcsIHRydWUpOwpkZWZpbmUoJ1dQX0FVVE9fVVBEQVRFX0NPUkUnLCAgIGZhbHNlKTsKCi8vIFJlZGlzIG9iamVjdCBjYWNoZQpkZWZpbmUoJ1dQX1JFRElTX0hPU1QnLCAgICAgICAgICcxMjcuMC4wLjEnKTsKZGVmaW5lKCdXUF9SRURJU19QT1JUJywgICAgICAgICB7JHJlZGlzX3BvcnR9KTsKZGVmaW5lKCdXUF9SRURJU19EQVRBQkFTRScsICAgICAwKTsKZGVmaW5lKCdXUF9SRURJU19USU1FT1VUJywgICAgICAxKTsKZGVmaW5lKCdXUF9SRURJU19SRUFEX1RJTUVPVVQnLCAxKTsKZGVmaW5lKCdXUF9SRURJU19NQVhUVEwnLCAgICAgICA4NjQwMCk7CmRlZmluZSgnV1BfQ0FDSEVfS0VZX1NBTFQnLCAgICAgJ3skZG9tYWlufV8nKTsKClwkdGFibGVfcHJlZml4ID0gJ3dwXyc7CgppZiAoIWRlZmluZWQoJ0FCU1BBVEgnKSkgewogICAgZGVmaW5lKCdBQlNQQVRIJywgX19ESVJfXyAuICcvJyk7Cn0KcmVxdWlyZV9vbmNlIEFCU1BBVEggLiAnd3Atc2V0dGluZ3MucGhwJzsKUEhQOwoKICAgIGZpbGVfcHV0X2NvbnRlbnRzKCJ7JHdwX3BhdGh9L3dwLWNvbmZpZy5waHAiLCAkY29uZmlnKTsKICAgIGNobW9kKCJ7JHdwX3BhdGh9L3dwLWNvbmZpZy5waHAiLCAwNjAwKTsKICAgIHNoKCJjaG93biB3d3ctZGF0YTp3d3ctZGF0YSB7JHdwX3BhdGh9L3dwLWNvbmZpZy5waHAiKTsKICAgIG9rKCJ3cC1jb25maWcucGhwIGNyZWF0ZWQiKTsKCiAgICAvLyDilIDilIAgU2F2ZSBjcmVkZW50aWFscyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICRjcmVkID0gPDw8Q1JFRArilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZAKV29yZFByZXNzIFNpdGU6IHskZG9tYWlufQrilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZAKVVJMOiAgICAgICBodHRwOi8veyRkb21haW59CkFkbWluOiAgICAgaHR0cDovL3skZG9tYWlufS93cC1hZG1pbi9pbnN0YWxsLnBocAoKRGF0YWJhc2U6CiAgTmFtZTogICAgeyRkYl9uYW1lfQogIFVzZXI6ICAgIHskZGJfdXNlcn0KICBQYXNzOiAgICB7JGRiX3Bhc3N9CgpSZWRpczoKICBQb3J0OiAgICB7JHJlZGlzX3BvcnR9CiAgU2VydmljZTogcmVkaXMteyRkb21haW59CgpQSFA6ICAgICAgIHskcGhwX3Zlcn0KUGF0aDogICAgICB7JHdwX3BhdGh9CuKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkApDUkVEOwogICAgZmlsZV9wdXRfY29udGVudHMoQ1JFRF9ESVIgLiAiL3skZG9tYWlufS1jcmVkZW50aWFscy50eHQiLCAkY3JlZCk7CiAgICBvaygiQ3JlZGVudGlhbHM6ICIgLiBDUkVEX0RJUiAuICIveyRkb21haW59LWNyZWRlbnRpYWxzLnR4dCIpOwp9CgovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQovLyBDT01NQU5EOiBkZWxldGUtc2l0ZQovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpmdW5jdGlvbiBjbWRfZGVsZXRlX3NpdGUoYXJyYXkgJGFyZ3MpOiB2b2lkIHsKICAgICRkb21haW4gID0gJGFyZ3NbMF0gPz8gJyc7CiAgICAkZGJfc2FmZSA9IHByZWdfcmVwbGFjZSgnL1suXC1dLycsICdfJywgJGRvbWFpbik7CiAgICAkZGJfbmFtZSA9ICJ3cF97JGRiX3NhZmV9IjsKICAgICRkYl91c2VyID0gIndwdXNlcl97JGRiX3NhZmV9IjsKCiAgICAkcGRvID0gZGJfY29ubmVjdCgpOwogICAgaWYgKCRwZG8pIHsKICAgICAgICAkcGRvLT5leGVjKCJEUk9QIERBVEFCQVNFIElGIEVYSVNUUyBgeyRkYl9uYW1lfWAiKTsKICAgICAgICAkcGRvLT5leGVjKCJEUk9QIFVTRVIgSUYgRVhJU1RTICd7JGRiX3VzZXJ9J0AnbG9jYWxob3N0JyIpOwogICAgICAgICRwZG8tPmV4ZWMoIkZMVVNIIFBSSVZJTEVHRVMiKTsKICAgICAgICBvaygiREIgcmVtb3ZlZDogeyRkYl9uYW1lfSIpOwogICAgfQp9CgovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQovLyBDT01NQU5EOiBjbG9uZS1kYgovLyBwaHAgd3BfaGVscGVyLnBocCBjbG9uZS1kYiBzcmMuY29tIGRzdC5jb20KLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZnVuY3Rpb24gY21kX2Nsb25lX2RiKGFycmF5ICRhcmdzKTogdm9pZCB7CiAgICBbJHNyYywgJGRzdF0gPSAkYXJncyArIFsnJywgJyddOwogICAgJHNyY19zYWZlID0gcHJlZ19yZXBsYWNlKCcvWy5cLV0vJywgJ18nLCAkc3JjKTsKICAgICRkc3Rfc2FmZSA9IHByZWdfcmVwbGFjZSgnL1suXC1dLycsICdfJywgJGRzdCk7CiAgICAkc3JjX2RiICAgPSAid3BfeyRzcmNfc2FmZX0iOwogICAgJGRzdF9kYiAgID0gIndwX3skZHN0X3NhZmV9IjsKICAgICRkc3RfdXNlciA9ICJ3cHVzZXJfeyRkc3Rfc2FmZX0iOwogICAgJGRzdF9wYXNzID0gcmFuZF9zdHIoMjApOwoKICAgICRwZG8gPSBkYl9jb25uZWN0KCk7CiAgICBpZiAoISRwZG8pIGV4aXQoMSk7CiAgICAkcGRvLT5leGVjKCJDUkVBVEUgREFUQUJBU0UgSUYgTk9UIEVYSVNUUyBgeyRkc3RfZGJ9YCBDSEFSQUNURVIgU0VUIHV0ZjhtYjQgQ09MTEFURSB1dGY4bWI0X3VuaWNvZGVfY2kiKTsKICAgICRwZG8tPmV4ZWMoIkNSRUFURSBVU0VSIElGIE5PVCBFWElTVFMgJ3skZHN0X3VzZXJ9J0AnbG9jYWxob3N0JyBJREVOVElGSUVEIEJZICd7JGRzdF9wYXNzfSciKTsKICAgICRwZG8tPmV4ZWMoIkdSQU5UIEFMTCBQUklWSUxFR0VTIE9OIGB7JGRzdF9kYn1gLiogVE8gJ3skZHN0X3VzZXJ9J0AnbG9jYWxob3N0JyIpOwogICAgJHBkby0+ZXhlYygiRkxVU0ggUFJJVklMRUdFUyIpOwoKICAgIC8vIER1bXAgYW5kIHJlc3RvcmUKICAgIHNoKCJteXNxbGR1bXAgeyRzcmNfZGJ9IDI+L2Rldi9udWxsIHwgbXlzcWwgeyRkc3RfZGJ9IDI+L2Rldi9udWxsIik7CiAgICBvaygiREIgY2xvbmVkOiB7JHNyY19kYn0g4oaSIHskZHN0X2RifSIpOwoKICAgIC8vIFNhdmUgbmV3IERCIGNyZWRzCiAgICBmaWxlX3B1dF9jb250ZW50cyhTVEFURV9ESVIgLiAiL3skZHN0fS5kYmNyZWRzIiwKICAgICAgICBqc29uX2VuY29kZShbJ2RiJyA9PiAkZHN0X2RiLCAndXNlcicgPT4gJGRzdF91c2VyLCAncGFzcycgPT4gJGRzdF9wYXNzXSkpOwp9CgovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQovLyBDT01NQU5EOiB1cGRhdGUtY29uZmlnCi8vIHBocCB3cF9oZWxwZXIucGhwIHVwZGF0ZS1jb25maWcgZHN0LmNvbSByZWRpc19wb3J0Ci8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmZ1bmN0aW9uIGNtZF91cGRhdGVfY29uZmlnKGFycmF5ICRhcmdzKTogdm9pZCB7CiAgICBbJGRvbWFpbiwgJHJlZGlzX3BvcnRdID0gJGFyZ3MgKyBbJycsICc2Mzc5J107CiAgICAkd3BfcGF0aCAgPSBXUF9ST09UIC4gIi97JGRvbWFpbn0iOwogICAgJGNmZ19maWxlID0gInskd3BfcGF0aH0vd3AtY29uZmlnLnBocCI7CiAgICBpZiAoIWlzX2ZpbGUoJGNmZ19maWxlKSkgeyBlcnIoIndwLWNvbmZpZy5waHAgbm90IGZvdW5kIik7IHJldHVybjsgfQoKICAgICRkYl9zYWZlICA9IHByZWdfcmVwbGFjZSgnL1suXC1dLycsICdfJywgJGRvbWFpbik7CiAgICAkZGJfbmFtZSAgPSAid3BfeyRkYl9zYWZlfSI7CiAgICAkZGJfdXNlciAgPSAid3B1c2VyX3skZGJfc2FmZX0iOwoKICAgIC8vIExvYWQgbmV3IGNyZWRzIGlmIGF2YWlsYWJsZQogICAgJGNyZWRzX2ZpbGUgPSBTVEFURV9ESVIgLiAiL3skZG9tYWlufS5kYmNyZWRzIjsKICAgIGlmIChpc19maWxlKCRjcmVkc19maWxlKSkgewogICAgICAgICRjcmVkcyAgICA9IGpzb25fZGVjb2RlKGZpbGVfZ2V0X2NvbnRlbnRzKCRjcmVkc19maWxlKSwgdHJ1ZSk7CiAgICAgICAgJGRiX25hbWUgID0gJGNyZWRzWydkYiddICAgPz8gJGRiX25hbWU7CiAgICAgICAgJGRiX3VzZXIgID0gJGNyZWRzWyd1c2VyJ10gPz8gJGRiX3VzZXI7CiAgICAgICAgJGRiX3Bhc3MgID0gJGNyZWRzWydwYXNzJ10gPz8gJyc7CiAgICAgICAgdW5saW5rKCRjcmVkc19maWxlKTsKICAgIH0gZWxzZSB7CiAgICAgICAgJGRiX3Bhc3MgPSByYW5kX3N0cigyMCk7CiAgICB9CgogICAgJHR4dCA9IGZpbGVfZ2V0X2NvbnRlbnRzKCRjZmdfZmlsZSk7CiAgICAvLyBVcGRhdGUgREIgc2V0dGluZ3MKICAgICR0eHQgPSBwcmVnX3JlcGxhY2UoIi9kZWZpbmVcKCdEQl9OQU1FJywuKj9cKS8iLCAgICAgImRlZmluZSgnREJfTkFNRScsICAgICAneyRkYl9uYW1lfScpIiwgICR0eHQpOwogICAgJHR4dCA9IHByZWdfcmVwbGFjZSgiL2RlZmluZVwoJ0RCX1VTRVInLC4qP1wpLyIsICAgICAiZGVmaW5lKCdEQl9VU0VSJywgICAgICd7JGRiX3VzZXJ9JykiLCAgJHR4dCk7CiAgICAkdHh0ID0gcHJlZ19yZXBsYWNlKCIvZGVmaW5lXCgnREJfUEFTU1dPUkQnLC4qP1wpLyIsICJkZWZpbmUoJ0RCX1BBU1NXT1JEJywgJ3skZGJfcGFzc30nKSIsICAkdHh0KTsKICAgICR0eHQgPSBwcmVnX3JlcGxhY2UoIi9kZWZpbmVcKCdXUF9SRURJU19QT1JUJywuKj9cKS8iLCJkZWZpbmUoJ1dQX1JFRElTX1BPUlQnLCB7JHJlZGlzX3BvcnR9KSIsICR0eHQpOwogICAgJHR4dCA9IHByZWdfcmVwbGFjZSgiL2RlZmluZVwoJ1dQX0NBQ0hFX0tFWV9TQUxUJywuKj9cKS8iLCAiZGVmaW5lKCdXUF9DQUNIRV9LRVlfU0FMVCcsICd7JGRvbWFpbn1fJykiLCAkdHh0KTsKICAgIGZpbGVfcHV0X2NvbnRlbnRzKCRjZmdfZmlsZSwgJHR4dCk7CgogICAgLy8gVXBkYXRlIFVSTHMgaW4gREIKICAgIHNoKCJzdWRvIC11IHd3dy1kYXRhIHdwIHNlYXJjaC1yZXBsYWNlICdodHRwOi8veyRhcmdzWzBdfScgJ2h0dHA6Ly97JGRvbWFpbn0nIC0tcGF0aD17JHdwX3BhdGh9IC0tYWxsb3ctcm9vdCAtLXF1aWV0IDI+L2Rldi9udWxsIHx8IHRydWUiKTsKICAgIG9rKCJ3cC1jb25maWcucGhwIHVwZGF0ZWQgZm9yIHskZG9tYWlufSIpOwp9CgovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQovLyBDT01NQU5EOiBiYWNrdXAtZGIKLy8gcGhwIHdwX2hlbHBlci5waHAgYmFja3VwLWRiIGRvbWFpbi5jb20gL2JhY2t1cC9kaXIKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZnVuY3Rpb24gY21kX2JhY2t1cF9kYihhcnJheSAkYXJncyk6IHZvaWQgewogICAgWyRkb21haW4sICRiYWNrdXBfZGlyXSA9ICRhcmdzICsgWycnLCAnL2JhY2t1cHMnXTsKICAgICRkYl9zYWZlID0gcHJlZ19yZXBsYWNlKCcvWy5cLV0vJywgJ18nLCAkZG9tYWluKTsKICAgICRkYl9uYW1lID0gIndwX3skZGJfc2FmZX0iOwogICAgJHRzICAgICAgPSBkYXRlKCdZbWQtSGlzJyk7CiAgICAkZmlsZSAgICA9ICJ7JGJhY2t1cF9kaXJ9L3skZG9tYWlufS1kYi17JHRzfS5zcWwuZ3oiOwogICAgaWYgKCFpc19kaXIoJGJhY2t1cF9kaXIpKSBta2RpcigkYmFja3VwX2RpciwgMDc1NSwgdHJ1ZSk7CiAgICBzaCgibXlzcWxkdW1wIHskZGJfbmFtZX0gMj4vZGV2L251bGwgfCBnemlwID4geyRmaWxlfSIpOwogICAgb2soIkRCIGJhY2t1cDogeyRmaWxlfSIpOwp9CgovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQovLyBDT01NQU5EOiBvcHRpbWl6ZS10YWJsZXMKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZnVuY3Rpb24gY21kX29wdGltaXplX3RhYmxlcyhhcnJheSAkYXJncyk6IHZvaWQgewogICAgJHBkbyA9IGRiX2Nvbm5lY3QoKTsKICAgIGlmICghJHBkbykgcmV0dXJuOwogICAgc3RlcCgiT3B0aW1pemluZyBhbGwgV29yZFByZXNzIHRhYmxlcyIpOwogICAgJGRicyA9ICRwZG8tPnF1ZXJ5KCJTSE9XIERBVEFCQVNFUyBMSUtFICd3cF8lJyIpLT5mZXRjaEFsbChQRE86OkZFVENIX0NPTFVNTik7CiAgICBmb3JlYWNoICgkZGJzIGFzICRkYikgewogICAgICAgICRwZG8tPmV4ZWMoIlVTRSBgeyRkYn1gIik7CiAgICAgICAgJHRhYmxlcyA9ICRwZG8tPnF1ZXJ5KCJTSE9XIFRBQkxFUyIpLT5mZXRjaEFsbChQRE86OkZFVENIX0NPTFVNTik7CiAgICAgICAgZm9yZWFjaCAoJHRhYmxlcyBhcyAkdGFibGUpIHsKICAgICAgICAgICAgJHBkby0+ZXhlYygiT1BUSU1JWkUgVEFCTEUgYHskdGFibGV9YCIpOwogICAgICAgIH0KICAgICAgICBvaygiT3B0aW1pemVkOiB7JGRifSIpOwogICAgfQp9CgovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQovLyBDT01NQU5EOiB3cC12ZXJzaW9uCi8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmZ1bmN0aW9uIGNtZF93cF92ZXJzaW9uKGFycmF5ICRhcmdzKTogdm9pZCB7CiAgICAkZG9tYWluICA9ICRhcmdzWzBdID8/ICcnOwogICAgJHdwX3BhdGggPSBXUF9ST09UIC4gIi97JGRvbWFpbn0iOwogICAgJHZlcl9maWxlID0gInskd3BfcGF0aH0vd3AtaW5jbHVkZXMvdmVyc2lvbi5waHAiOwogICAgaWYgKCFpc19maWxlKCR2ZXJfZmlsZSkpIHsgZWNobyAidW5rbm93blxuIjsgcmV0dXJuOyB9CiAgICAkdHh0ID0gZmlsZV9nZXRfY29udGVudHMoJHZlcl9maWxlKTsKICAgIHByZWdfbWF0Y2goIi9cXFwkd3BfdmVyc2lvblxzKj1ccyonKFteJ10rKScvIiwgJHR4dCwgJG0pOwogICAgZWNobyAoJG1bMV0gPz8gJ3Vua25vd24nKSAuICJcbiI7Cn0KCi8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09Ci8vIENPTU1BTkQ6IGRiLXNpemUKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZnVuY3Rpb24gY21kX2RiX3NpemUoYXJyYXkgJGFyZ3MpOiB2b2lkIHsKICAgICRkb21haW4gID0gJGFyZ3NbMF0gPz8gJyc7CiAgICAkZGJfc2FmZSA9IHByZWdfcmVwbGFjZSgnL1suXC1dLycsICdfJywgJGRvbWFpbik7CiAgICAkZGJfbmFtZSA9ICJ3cF97JGRiX3NhZmV9IjsKICAgICRwZG8gICAgID0gZGJfY29ubmVjdCgpOwogICAgaWYgKCEkcGRvKSB7IGVjaG8gIj9cbiI7IHJldHVybjsgfQogICAgJHJvdyA9ICRwZG8tPnF1ZXJ5KAogICAgICAgICJTRUxFQ1QgUk9VTkQoU1VNKGRhdGFfbGVuZ3RoK2luZGV4X2xlbmd0aCkvMTAyNC8xMDI0LDIpIEFTIHN6CiAgICAgICAgIEZST00gaW5mb3JtYXRpb25fc2NoZW1hLnRhYmxlcwogICAgICAgICBXSEVSRSB0YWJsZV9zY2hlbWE9J3skZGJfbmFtZX0nIgogICAgKS0+ZmV0Y2goKTsKICAgICRzeiA9ICRyb3dbJ3N6J10gPz8gJzAnOwogICAgZWNobyAieyRkYl9uYW1lfSAgKHskc3p9IE1CKVxuIjsKfQoKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KLy8gQ09NTUFORDogcGFnZXNwZWVkLW9wdGltaXplCi8vIEluamVjdHMgcGVyZm9ybWFuY2UgbXUtcGx1Z2luICsgaW1hZ2UgbGF6eSBsb2FkaW5nICsgcHJlY29ubmVjdCBoZWFkZXJzCi8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CmZ1bmN0aW9uIGNtZF9wYWdlc3BlZWRfb3B0aW1pemUoYXJyYXkgJGFyZ3MpOiB2b2lkIHsKICAgICRkb21haW4gID0gJGFyZ3NbMF0gPz8gJyc7CiAgICAkd3BfcGF0aCA9IFdQX1JPT1QgLiAiL3skZG9tYWlufSI7CiAgICBpZiAoIWlzX2Rpcigkd3BfcGF0aCkpIHsgZXJyKCJXUCBwYXRoIG5vdCBmb3VuZDogeyR3cF9wYXRofSIpOyByZXR1cm47IH0KCiAgICAkbXVfZGlyICA9ICJ7JHdwX3BhdGh9L3dwLWNvbnRlbnQvbXUtcGx1Z2lucyI7CiAgICBpZiAoIWlzX2RpcigkbXVfZGlyKSkgbWtkaXIoJG11X2RpciwgMDc1NSwgdHJ1ZSk7CgogICAgLy8g4pSA4pSAIFBlcmZvcm1hbmNlIG11LXBsdWdpbiDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgIGZpbGVfcHV0X2NvbnRlbnRzKCJ7JG11X2Rpcn0vZWktcGVyZm9ybWFuY2UucGhwIiwgPDw8J1BIUCcKPD9waHAKLyoqCiAqIEVhc3lJbnN0YWxsIFBlcmZvcm1hbmNlIE1VLVBsdWdpbiB2Ny4wCiAqIEF1dG8tbG9hZGVkIGJ5IFdvcmRQcmVzcyBvbiBldmVyeSByZXF1ZXN0CiAqLwoKLy8gUmVtb3ZlIHVubmVjZXNzYXJ5IGhlYWQgYmxvYXQKcmVtb3ZlX2FjdGlvbignd3BfaGVhZCcsICd3cF9nZW5lcmF0b3InKTsKcmVtb3ZlX2FjdGlvbignd3BfaGVhZCcsICd3bHdtYW5pZmVzdF9saW5rJyk7CnJlbW92ZV9hY3Rpb24oJ3dwX2hlYWQnLCAncnNkX2xpbmsnKTsKcmVtb3ZlX2FjdGlvbignd3BfaGVhZCcsICd3cF9zaG9ydGxpbmtfd3BfaGVhZCcpOwpyZW1vdmVfYWN0aW9uKCd3cF9oZWFkJywgJ2FkamFjZW50X3Bvc3RzX3JlbF9saW5rX3dwX2hlYWQnKTsKcmVtb3ZlX2FjdGlvbignd3BfaGVhZCcsICdwcmludF9lbW9qaV9kZXRlY3Rpb25fc2NyaXB0JywgNyk7CnJlbW92ZV9hY3Rpb24oJ3dwX3ByaW50X3N0eWxlcycsICdwcmludF9lbW9qaV9zdHlsZXMnKTsKcmVtb3ZlX2FjdGlvbignYWRtaW5fcHJpbnRfc2NyaXB0cycsICdwcmludF9lbW9qaV9kZXRlY3Rpb25fc2NyaXB0Jyk7CnJlbW92ZV9hY3Rpb24oJ2FkbWluX3ByaW50X3N0eWxlcycsICdwcmludF9lbW9qaV9zdHlsZXMnKTsKCi8vIERpc2FibGUgWE1MLVJQQwphZGRfZmlsdGVyKCd4bWxycGNfZW5hYmxlZCcsICdfX3JldHVybl9mYWxzZScpOwoKLy8gUmVtb3ZlIG9FbWJlZApyZW1vdmVfYWN0aW9uKCd3cF9oZWFkJywgJ3dwX29lbWJlZF9hZGRfZGlzY292ZXJ5X2xpbmtzJyk7CnJlbW92ZV9hY3Rpb24oJ3dwX2hlYWQnLCAncmVzdF9vdXRwdXRfbGlua193cF9oZWFkJyk7CgovLyBEaXNhYmxlIFdQIGhlYXJ0YmVhdCBvbiBmcm9udGVuZAphZGRfYWN0aW9uKCdpbml0JywgZnVuY3Rpb24oKSB7CiAgICBpZiAoIWlzX2FkbWluKCkpIHsKICAgICAgICB3cF9kZXJlZ2lzdGVyX3NjcmlwdCgnaGVhcnRiZWF0Jyk7CiAgICB9Cn0pOwoKLy8gQWRkIHNlY3VyaXR5IGhlYWRlcnMKYWRkX2FjdGlvbignc2VuZF9oZWFkZXJzJywgZnVuY3Rpb24oKSB7CiAgICBoZWFkZXIoJ1gtQ29udGVudC1UeXBlLU9wdGlvbnM6IG5vc25pZmYnKTsKICAgIGhlYWRlcignWC1GcmFtZS1PcHRpb25zOiBTQU1FT1JJR0lOJyk7CiAgICBoZWFkZXIoJ1gtWFNTLVByb3RlY3Rpb246IDE7IG1vZGU9YmxvY2snKTsKICAgIGhlYWRlcignUmVmZXJyZXItUG9saWN5OiBzdHJpY3Qtb3JpZ2luLXdoZW4tY3Jvc3Mtb3JpZ2luJyk7Cn0pOwoKLy8gTGF6eSBsb2FkIGltYWdlcwphZGRfZmlsdGVyKCd3cF9sYXp5X2xvYWRpbmdfZW5hYmxlZCcsICdfX3JldHVybl90cnVlJyk7CgovLyBSZW1vdmUgcXVlcnkgc3RyaW5ncyBmcm9tIHN0YXRpYyByZXNvdXJjZXMKYWRkX2ZpbHRlcignc2NyaXB0X2xvYWRlcl9zcmMnLCAnZWlfcmVtb3ZlX3F1ZXJ5X3N0cmluZ3MnLCAxNSwgMSk7CmFkZF9maWx0ZXIoJ3N0eWxlX2xvYWRlcl9zcmMnLCAgJ2VpX3JlbW92ZV9xdWVyeV9zdHJpbmdzJywgMTUsIDEpOwpmdW5jdGlvbiBlaV9yZW1vdmVfcXVlcnlfc3RyaW5ncyhzdHJpbmcgJHNyYyk6IHN0cmluZyB7CiAgICBpZiAoc3RycG9zKCRzcmMsICc/dmVyPScpKSB7CiAgICAgICAgJHNyYyA9IHByZWdfcmVwbGFjZSgnL1w/dmVyPVswLTkuXSsvJywgJycsICRzcmMpOwogICAgfQogICAgcmV0dXJuICRzcmM7Cn0KCi8vIFByZWNvbm5lY3QgdG8gZXh0ZXJuYWwgb3JpZ2lucwphZGRfYWN0aW9uKCd3cF9oZWFkJywgZnVuY3Rpb24oKSB7CiAgICBlY2hvICc8bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ3N0YXRpYy5jb20iIGNyb3Nzb3JpZ2luPicgLiAiXG4iOwogICAgZWNobyAnPGxpbmsgcmVsPSJkbnMtcHJlZmV0Y2giIGhyZWY9Ii8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPicgLiAiXG4iOwp9LCAxKTsKCi8vIExpbWl0IHBvc3QgcmV2aXNpb25zIGF0IHJ1bnRpbWUKaWYgKCFkZWZpbmVkKCdXUF9QT1NUX1JFVklTSU9OUycpKSBkZWZpbmUoJ1dQX1BPU1RfUkVWSVNJT05TJywgNSk7CgovLyBJbmNyZWFzZSBIVFRQIHRpbWVvdXQgZm9yIFdQIENyb24KYWRkX2ZpbHRlcignaHR0cF9yZXF1ZXN0X3RpbWVvdXQnLCBmbigpID0+IDMwKTsKUEhQKTsKCiAgICBzaCgiY2hvd24gd3d3LWRhdGE6d3d3LWRhdGEgeyRtdV9kaXJ9L2VpLXBlcmZvcm1hbmNlLnBocCIpOwogICAgb2soIlBlcmZvcm1hbmNlIG11LXBsdWdpbiBpbnN0YWxsZWQiKTsKCiAgICAvLyDilIDilIAgLmh0YWNjZXNzIGZvciBuZ2lueCDilIDilIAgKG5naW54IGlnbm9yZXMgaXQgYnV0IGdvb2QgZm9yIHJlZmVyZW5jZSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAvLyDilIDilIAgTmdpbnggY29uZiBzbmlwcGV0IOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogICAgJG5naW54X3NuaXBwZXQgPSA8PDxOR0lOWAojIEVhc3lJbnN0YWxsIFBhZ2VTcGVlZCBzbmlwcGV0IGZvciB7JGRvbWFpbn0KIyBBZGQgdG8gbG9jYXRpb24gfiBcXC5waHAkIGJsb2NrIG9yIHNlcnZlciBibG9jayBhcyBuZWVkZWQKCiMgVmFyeSBoZWFkZXIgZm9yIGNhY2hpbmcKYWRkX2hlYWRlciBWYXJ5ICJBY2NlcHQtRW5jb2RpbmcsIENvb2tpZSIgYWx3YXlzOwoKIyBTZWN1cml0eSBoZWFkZXJzCmFkZF9oZWFkZXIgWC1Db250ZW50LVR5cGUtT3B0aW9ucyAibm9zbmlmZiIgYWx3YXlzOwphZGRfaGVhZGVyIFgtRnJhbWUtT3B0aW9ucyAiU0FNRU9SSUdJTiIgYWx3YXlzOwphZGRfaGVhZGVyIFgtWFNTLVByb3RlY3Rpb24gIjE7IG1vZGU9YmxvY2siIGFsd2F5czsKYWRkX2hlYWRlciBSZWZlcnJlci1Qb2xpY3kgInN0cmljdC1vcmlnaW4td2hlbi1jcm9zcy1vcmlnaW4iIGFsd2F5czsKTkdJTlg7CiAgICAkc25pcHBldF9maWxlID0gIi9ldGMvbmdpbngvc25pcHBldHMvcGFnZXNwZWVkLXskZG9tYWlufS5jb25mIjsKICAgIGZpbGVfcHV0X2NvbnRlbnRzKCRzbmlwcGV0X2ZpbGUsICRuZ2lueF9zbmlwcGV0KTsKICAgIG9rKCJOZ2lueCBQYWdlU3BlZWQgc25pcHBldDogeyRzbmlwcGV0X2ZpbGV9Iik7Cn0KCi8vID09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09Ci8vIENPTU1BTkQ6IG9wdGltaXplLWltYWdlcwovLyBDb252ZXJ0IGltYWdlcyB0byBXZWJQLCBjb21wcmVzcyBKUEVHL1BORwovLyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQpmdW5jdGlvbiBjbWRfb3B0aW1pemVfaW1hZ2VzKGFycmF5ICRhcmdzKTogdm9pZCB7CiAgICAkZG9tYWluICAgPSAkYXJnc1swXSA/PyAnJzsKICAgICR3cF9wYXRoICA9IFdQX1JPT1QgLiAiL3skZG9tYWlufSI7CiAgICAkdXBsb2FkcyAgPSAieyR3cF9wYXRofS93cC1jb250ZW50L3VwbG9hZHMiOwogICAgaWYgKCFpc19kaXIoJHVwbG9hZHMpKSB7IHdhcm4oIlVwbG9hZHMgZGlyIG5vdCBmb3VuZCIpOyByZXR1cm47IH0KCiAgICBzdGVwKCJPcHRpbWl6aW5nIGltYWdlcyBpbiB7JHVwbG9hZHN9Iik7CiAgICAkY29udmVydGVkID0gMDsgJGNvbXByZXNzZWQgPSAwOwoKICAgIC8vIFdlYlAgY29udmVyc2lvbiAocmVxdWlyZXMgY3dlYnApCiAgICBpZiAoc2hfb3V0KCJ3aGljaCBjd2VicCIpICE9PSAnJykgewogICAgICAgICRpdGVyID0gbmV3IFJlY3Vyc2l2ZUl0ZXJhdG9ySXRlcmF0b3IobmV3IFJlY3Vyc2l2ZURpcmVjdG9yeUl0ZXJhdG9yKCR1cGxvYWRzKSk7CiAgICAgICAgZm9yZWFjaCAoJGl0ZXIgYXMgJGZpbGUpIHsKICAgICAgICAgICAgaWYgKCEkZmlsZS0+aXNGaWxlKCkpIGNvbnRpbnVlOwogICAgICAgICAgICAkZXh0ID0gc3RydG9sb3dlcigkZmlsZS0+Z2V0RXh0ZW5zaW9uKCkpOwogICAgICAgICAgICBpZiAoIWluX2FycmF5KCRleHQsIFsnanBnJywnanBlZycsJ3BuZyddKSkgY29udGludWU7CiAgICAgICAgICAgICRzcmMgID0gJGZpbGUtPmdldFBhdGhuYW1lKCk7CiAgICAgICAgICAgICR3ZWJwID0gcHJlZ19yZXBsYWNlKCcvXC4oanBnfGpwZWd8cG5nKSQvaScsICcud2VicCcsICRzcmMpOwogICAgICAgICAgICBpZiAoIWZpbGVfZXhpc3RzKCR3ZWJwKSkgewogICAgICAgICAgICAgICAgc2goImN3ZWJwIC1xdWlldCAtcSA4MiAneyRzcmN9JyAtbyAneyR3ZWJwfScgMj4vZGV2L251bGwgfHwgdHJ1ZSIpOwogICAgICAgICAgICAgICAgaWYgKGZpbGVfZXhpc3RzKCR3ZWJwKSkgJGNvbnZlcnRlZCsrOwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgICAgIG9rKCJXZWJQIGNvbnZlcnRlZDogeyRjb252ZXJ0ZWR9IGltYWdlcyIpOwogICAgfSBlbHNlIHsKICAgICAgICB3YXJuKCJjd2VicCBub3QgZm91bmQg4oCUIGluc3RhbGwgd2l0aDogYXB0LWdldCBpbnN0YWxsIHdlYnAiKTsKICAgIH0KCiAgICAvLyBKUEVHIGNvbXByZXNzaW9uIChyZXF1aXJlcyBqcGVnb3B0aW0pCiAgICBpZiAoc2hfb3V0KCJ3aGljaCBqcGVnb3B0aW0iKSAhPT0gJycpIHsKICAgICAgICBzaCgiZmluZCB7JHVwbG9hZHN9IC10eXBlIGYgXFwoIC1uYW1lICcqLmpwZycgLW8gLW5hbWUgJyouanBlZycgXFwpIC1leGVjIGpwZWdvcHRpbSAtLW1heD04NSAtLXN0cmlwLWFsbCB7fSBcXDsgMj4vZGV2L251bGwgfHwgdHJ1ZSIpOwogICAgICAgIG9rKCJKUEVHIGNvbXByZXNzZWQiKTsKICAgICAgICAkY29tcHJlc3NlZCsrOwogICAgfQoKICAgIC8vIFBORyBvcHRpbWl6YXRpb24gKHJlcXVpcmVzIG9wdGlwbmcpCiAgICBpZiAoc2hfb3V0KCJ3aGljaCBvcHRpcG5nIikgIT09ICcnKSB7CiAgICAgICAgc2goImZpbmQgeyR1cGxvYWRzfSAtdHlwZSBmIC1uYW1lICcqLnBuZycgLWV4ZWMgb3B0aXBuZyAtcXVpZXQgLW8yIHt9IFxcOyAyPi9kZXYvbnVsbCB8fCB0cnVlIik7CiAgICAgICAgb2soIlBORyBjb21wcmVzc2VkIik7CiAgICAgICAgJGNvbXByZXNzZWQrKzsKICAgIH0KCiAgICBpZiAoJGNvbXByZXNzZWQgPT09IDAgJiYgJGNvbnZlcnRlZCA9PT0gMCkgewogICAgICAgIGluZm8oIkluc3RhbGwgdG9vbHM6IGFwdC1nZXQgaW5zdGFsbCB3ZWJwIGpwZWdvcHRpbSBvcHRpcG5nIik7CiAgICB9CgogICAgc2goImNob3duIC1SIHd3dy1kYXRhOnd3dy1kYXRhIHskdXBsb2Fkc30iKTsKfQoKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KLy8gQ09NTUFORDogcGFnZXNwZWVkLXJlcG9ydAovLyBHZW5lcmF0ZSBzaW1wbGUgSFRNTCByZXBvcnQKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KZnVuY3Rpb24gY21kX3BhZ2VzcGVlZF9yZXBvcnQoYXJyYXkgJGFyZ3MpOiB2b2lkIHsKICAgICRkb21haW4gICA9ICRhcmdzWzBdID8/ICcnOwogICAgJHdwX3BhdGggID0gV1BfUk9PVCAuICIveyRkb21haW59IjsKICAgICRyZXBvcnRfZiA9ICIvcm9vdC97JGRvbWFpbn0tcGFnZXNwZWVkLXJlcG9ydC5odG1sIjsKCiAgICAvLyBHYXRoZXIgbWV0cmljcwogICAgJHdwX3ZlciAgICA9IGNtZF93cF92ZXJzaW9uX3N0cigkZG9tYWluKTsKICAgICRwbHVnaW5zICAgPSBzaF9vdXQoInN1ZG8gLXUgd3d3LWRhdGEgd3AgcGx1Z2luIGxpc3QgLS1wYXRoPXskd3BfcGF0aH0gLS1mb3JtYXQ9Y291bnQgLS1hbGxvdy1yb290IDI+L2Rldi9udWxsIikgPzogJz8nOwogICAgJHRoZW1lcyAgICA9IHNoX291dCgic3VkbyAtdSB3d3ctZGF0YSB3cCB0aGVtZSAgbGlzdCAtLXBhdGg9eyR3cF9wYXRofSAtLWZvcm1hdD1jb3VudCAtLWFsbG93LXJvb3QgMj4vZGV2L251bGwiKSA/OiAnPyc7CiAgICAkZGJfc2l6ZSAgID0gY21kX2RiX3NpemVfc3RyKCRkb21haW4pOwogICAgJHVwbG9hZHMgICA9ICJ7JHdwX3BhdGh9L3dwLWNvbnRlbnQvdXBsb2FkcyI7CiAgICAkdXBsX3NpemUgID0gc2hfb3V0KCJkdSAtc2ggeyR1cGxvYWRzfSAyPi9kZXYvbnVsbCB8IGN1dCAtZjEiKSA/OiAnPyc7CiAgICAkc3NsX29rICAgID0gZmlsZV9leGlzdHMoIi9ldGMvbGV0c2VuY3J5cHQvbGl2ZS97JGRvbWFpbn0vY2VydC5wZW0iKSA/ICfinIUgQWN0aXZlJyA6ICfinYwgTm9uZSc7CiAgICAkdHMgICAgICAgID0gZGF0ZSgnWS1tLWQgSDppOnMnKTsKCiAgICAvLyBQSFAgdmVyc2lvbiBmcm9tIG5naW54IGNvbmZpZwogICAgJHBocF92ZXIgICA9IHRyaW0oKHN0cmluZykoc2hlbGxfZXhlYygiZ3JlcCAtb1AgJ3BocFswLTkuXSsoPz0tZnBtKScgL2V0Yy9uZ2lueC9zaXRlcy1hdmFpbGFibGUveyRkb21haW59IDI+L2Rldi9udWxsIHwgaGVhZCAtMSIpID8/ICc/JykpOwogICAgJHJlZGlzX3AgICA9IHRyaW0oKHN0cmluZykoc2hlbGxfZXhlYygiZ3JlcCAnXnBvcnQnIC9ldGMvcmVkaXMvcmVkaXMtIiAuIHN0cl9yZXBsYWNlKCcuJywgJy0nLCAkZG9tYWluKSAuICIuY29uZiAyPi9kZXYvbnVsbCB8IGF3ayAne3ByaW50ICQyfSciKSA/PyAnNjM3OScpKTsKICAgICRyZWRpc19vayAgPSB0cmltKChzdHJpbmcpKHNoZWxsX2V4ZWMoInJlZGlzLWNsaSAtcCB7JHJlZGlzX3B9IHBpbmcgMj4vZGV2L251bGwiKSA/PyAnJykpID09PSAnUE9ORycgPyAn4pyFJyA6ICfinYwnOwoKICAgICRodG1sID0gPDw8SFRNTAo8IURPQ1RZUEUgaHRtbD4KPGh0bWwgbGFuZz0iZW4iPgo8aGVhZD4KPG1ldGEgY2hhcnNldD0iVVRGLTgiPgo8bWV0YSBuYW1lPSJ2aWV3cG9ydCIgY29udGVudD0id2lkdGg9ZGV2aWNlLXdpZHRoLGluaXRpYWwtc2NhbGU9MSI+Cjx0aXRsZT5FYXN5SW5zdGFsbCBQYWdlU3BlZWQgUmVwb3J0IOKAlCB7JGRvbWFpbn08L3RpdGxlPgo8c3R5bGU+CiAgYm9keXtmb250LWZhbWlseTotYXBwbGUtc3lzdGVtLEJsaW5rTWFjU3lzdGVtRm9udCwnU2Vnb2UgVUknLHNhbnMtc2VyaWY7bWFyZ2luOjA7cGFkZGluZzoyNHB4O2JhY2tncm91bmQ6I2Y1ZjdmYjtjb2xvcjojMjIyfQogIGgxe2NvbG9yOiMxYTU2ZGI7bWFyZ2luLWJvdHRvbTo0cHh9CiAgLm1ldGF7Y29sb3I6IzY2Njtmb250LXNpemU6LjllbTttYXJnaW4tYm90dG9tOjI0cHh9CiAgLmNhcmRze2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6cmVwZWF0KGF1dG8tZmlsbCxtaW5tYXgoMjIwcHgsMWZyKSk7Z2FwOjE2cHh9CiAgLmNhcmR7YmFja2dyb3VuZDojZmZmO2JvcmRlci1yYWRpdXM6MTBweDtwYWRkaW5nOjIwcHg7Ym94LXNoYWRvdzowIDFweCA0cHggcmdiYSgwLDAsMCwuMDgpfQogIC5jYXJkIGgze21hcmdpbjowIDAgOHB4O2ZvbnQtc2l6ZTouODVlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7bGV0dGVyLXNwYWNpbmc6LjA1ZW07Y29sb3I6Izg4OH0KICAuY2FyZCAudmFse2ZvbnQtc2l6ZToxLjVlbTtmb250LXdlaWdodDo3MDA7Y29sb3I6IzFhNTZkYn0KICAuY2hlY2tsaXN0e21hcmdpbi10b3A6MjRweDtiYWNrZ3JvdW5kOiNmZmY7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6MjBweDtib3gtc2hhZG93OjAgMXB4IDRweCByZ2JhKDAsMCwwLC4wOCl9CiAgLmNoZWNrbGlzdCBoMnttYXJnaW4tdG9wOjB9CiAgLmNoZWNre3BhZGRpbmc6OHB4IDA7Ym9yZGVyLWJvdHRvbToxcHggc29saWQgI2YwZjBmMDtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDoxMHB4fQogIC5jaGVjazpsYXN0LWNoaWxke2JvcmRlcjpub25lfQogIGZvb3RlcnttYXJnaW4tdG9wOjMycHg7Y29sb3I6I2FhYTtmb250LXNpemU6LjhlbTt0ZXh0LWFsaWduOmNlbnRlcn0KPC9zdHlsZT4KPC9oZWFkPgo8Ym9keT4KPGgxPvCfk4ogRWFzeUluc3RhbGwgUGFnZVNwZWVkIFJlcG9ydDwvaDE+CjxkaXYgY2xhc3M9Im1ldGEiPkRvbWFpbjogPHN0cm9uZz57JGRvbWFpbn08L3N0cm9uZz4gJm5ic3A7fCZuYnNwOyBHZW5lcmF0ZWQ6IHskdHN9PC9kaXY+CjxkaXYgY2xhc3M9ImNhcmRzIj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+V29yZFByZXNzPC9oMz48ZGl2IGNsYXNzPSJ2YWwiPnskd3BfdmVyfTwvZGl2PjwvZGl2PgogIDxkaXYgY2xhc3M9ImNhcmQiPjxoMz5QSFA8L2gzPjxkaXYgY2xhc3M9InZhbCI+eyRwaHBfdmVyfTwvZGl2PjwvZGl2PgogIDxkaXYgY2xhc3M9ImNhcmQiPjxoMz5QbHVnaW5zPC9oMz48ZGl2IGNsYXNzPSJ2YWwiPnskcGx1Z2luc308L2Rpdj48L2Rpdj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+VGhlbWVzPC9oMz48ZGl2IGNsYXNzPSJ2YWwiPnskdGhlbWVzfTwvZGl2PjwvZGl2PgogIDxkaXYgY2xhc3M9ImNhcmQiPjxoMz5EQiBTaXplPC9oMz48ZGl2IGNsYXNzPSJ2YWwiPnskZGJfc2l6ZX08L2Rpdj48L2Rpdj4KICA8ZGl2IGNsYXNzPSJjYXJkIj48aDM+VXBsb2FkczwvaDM+PGRpdiBjbGFzcz0idmFsIj57JHVwbF9zaXplfTwvZGl2PjwvZGl2PgogIDxkaXYgY2xhc3M9ImNhcmQiPjxoMz5TU0w8L2gzPjxkaXYgY2xhc3M9InZhbCI+eyRzc2xfb2t9PC9kaXY+PC9kaXY+CiAgPGRpdiBjbGFzcz0iY2FyZCI+PGgzPlJlZGlzIDp7JHJlZGlzX3B9PC9oMz48ZGl2IGNsYXNzPSJ2YWwiPnskcmVkaXNfb2t9PC9kaXY+PC9kaXY+CjwvZGl2Pgo8ZGl2IGNsYXNzPSJjaGVja2xpc3QiPgogIDxoMj7inIUgUGVyZm9ybWFuY2UgQ2hlY2tsaXN0PC9oMj4KICA8ZGl2IGNsYXNzPSJjaGVjayI+PHNwYW4+8J+Ukjwvc3Bhbj4gU1NMIENlcnRpZmljYXRlOiB7JHNzbF9va308L2Rpdj4KICA8ZGl2IGNsYXNzPSJjaGVjayI+PHNwYW4+4pqhPC9zcGFuPiBSZWRpcyBPYmplY3QgQ2FjaGU6IHskcmVkaXNfb2t9PC9kaXY+CiAgPGRpdiBjbGFzcz0iY2hlY2siPjxzcGFuPvCfkJg8L3NwYW4+IFBIUCBWZXJzaW9uOiB7JHBocF92ZXJ9PC9kaXY+CiAgPGRpdiBjbGFzcz0iY2hlY2siPjxzcGFuPvCfl5zvuI88L3NwYW4+IE5naW54IEZhc3RDR0kgQ2FjaGU6IEVuYWJsZWQ8L2Rpdj4KICA8ZGl2IGNsYXNzPSJjaGVjayI+PHNwYW4+8J+Tpjwvc3Bhbj4gT1BjYWNoZTogRW5hYmxlZDwvZGl2PgogIDxkaXYgY2xhc3M9ImNoZWNrIj48c3Bhbj7wn5a877iPPC9zcGFuPiBSdW4gaW1hZ2Ugb3B0aW1pemF0aW9uOiA8Y29kZT5lYXN5aW5zdGFsbCBwYWdlc3BlZWQgaW1hZ2VzIHskZG9tYWlufTwvY29kZT48L2Rpdj4KICA8ZGl2IGNsYXNzPSJjaGVjayI+PHNwYW4+8J+MkDwvc3Bhbj4gR2V0IFBhZ2VTcGVlZCBzY29yZTogPGNvZGU+ZWFzeWluc3RhbGwgcGFnZXNwZWVkIHNjb3JlIHskZG9tYWlufTwvY29kZT48L2Rpdj4KPC9kaXY+Cjxmb290ZXI+RWFzeUluc3RhbGwgdjcuMCDigJQgUmVwb3J0IGdlbmVyYXRlZCB7JHRzfTwvZm9vdGVyPgo8L2JvZHk+PC9odG1sPgpIVE1MOwoKICAgIGZpbGVfcHV0X2NvbnRlbnRzKCRyZXBvcnRfZiwgJGh0bWwpOwogICAgb2soIlBhZ2VTcGVlZCByZXBvcnQ6IHskcmVwb3J0X2Z9Iik7Cn0KCi8vIEhlbHBlcnMgZm9yIHJlcG9ydApmdW5jdGlvbiBjbWRfd3BfdmVyc2lvbl9zdHIoc3RyaW5nICRkb21haW4pOiBzdHJpbmcgewogICAgJGYgPSBXUF9ST09UIC4gIi97JGRvbWFpbn0vd3AtaW5jbHVkZXMvdmVyc2lvbi5waHAiOwogICAgaWYgKCFpc19maWxlKCRmKSkgcmV0dXJuICc/JzsKICAgIHByZWdfbWF0Y2goIi9cXFwkd3BfdmVyc2lvblxzKj1ccyonKFteJ10rKScvIiwgZmlsZV9nZXRfY29udGVudHMoJGYpLCAkbSk7CiAgICByZXR1cm4gJG1bMV0gPz8gJz8nOwp9CmZ1bmN0aW9uIGNtZF9kYl9zaXplX3N0cihzdHJpbmcgJGRvbWFpbik6IHN0cmluZyB7CiAgICAkc2FmZSA9IHByZWdfcmVwbGFjZSgnL1suXC1dLycsICdfJywgJGRvbWFpbik7CiAgICAkcGRvICA9IGRiX2Nvbm5lY3QoKTsKICAgIGlmICghJHBkbykgcmV0dXJuICc/JzsKICAgICRyb3cgPSAkcGRvLT5xdWVyeSgiU0VMRUNUIFJPVU5EKFNVTShkYXRhX2xlbmd0aCtpbmRleF9sZW5ndGgpLzEwMjQvMTAyNCwyKSBBUyBzeiBGUk9NIGluZm9ybWF0aW9uX3NjaGVtYS50YWJsZXMgV0hFUkUgdGFibGVfc2NoZW1hPSd3cF97JHNhZmV9JyIpLT5mZXRjaCgpOwogICAgcmV0dXJuICgkcm93WydzeiddID8/ICcwJykgLiAnIE1CJzsKfQoKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KLy8gRElTUEFUQ0gKLy8gPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0KJGNvbW1hbmRzID0gWwogICAgJ2NyZWF0ZS1zaXRlJyAgICAgICAgID0+ICdjbWRfY3JlYXRlX3NpdGUnLAogICAgJ2RlbGV0ZS1zaXRlJyAgICAgICAgID0+ICdjbWRfZGVsZXRlX3NpdGUnLAogICAgJ2Nsb25lLWRiJyAgICAgICAgICAgID0+ICdjbWRfY2xvbmVfZGInLAogICAgJ3VwZGF0ZS1jb25maWcnICAgICAgID0+ICdjbWRfdXBkYXRlX2NvbmZpZycsCiAgICAnYmFja3VwLWRiJyAgICAgICAgICAgPT4gJ2NtZF9iYWNrdXBfZGInLAogICAgJ29wdGltaXplLXRhYmxlcycgICAgID0+ICdjbWRfb3B0aW1pemVfdGFibGVzJywKICAgICd3cC12ZXJzaW9uJyAgICAgICAgICA9PiAnY21kX3dwX3ZlcnNpb24nLAogICAgJ2RiLXNpemUnICAgICAgICAgICAgID0+ICdjbWRfZGJfc2l6ZScsCiAgICAncGFnZXNwZWVkLW9wdGltaXplJyAgPT4gJ2NtZF9wYWdlc3BlZWRfb3B0aW1pemUnLAogICAgJ29wdGltaXplLWltYWdlcycgICAgID0+ICdjbWRfb3B0aW1pemVfaW1hZ2VzJywKICAgICdwYWdlc3BlZWQtcmVwb3J0JyAgICA9PiAnY21kX3BhZ2VzcGVlZF9yZXBvcnQnLApdOwoKaWYgKCRhcmdjIDwgMikgewogICAgZWNobyBDIC4gIkVhc3lJbnN0YWxsIFBIUCBIZWxwZXIgdiIgLiBFSV9WRVJTSU9OIC4gTkMgLiAiXG4iOwogICAgZWNobyAiQ29tbWFuZHM6ICIgLiBpbXBsb2RlKCcsICcsIGFycmF5X2tleXMoJGNvbW1hbmRzKSkgLiAiXG4iOwogICAgZXhpdCgwKTsKfQoKJGNtZCAgPSAkYXJndlsxXTsKJGFyZ3MgPSBhcnJheV9zbGljZSgkYXJndiwgMik7CgppZiAoaXNzZXQoJGNvbW1hbmRzWyRjbWRdKSkgewogICAgdHJ5IHsKICAgICAgICBjYWxsX3VzZXJfZnVuYygkY29tbWFuZHNbJGNtZF0sICRhcmdzKTsKICAgIH0gY2F0Y2ggKFRocm93YWJsZSAkZSkgewogICAgICAgIGVycigiUEhQIEVycm9yOiAiIC4gJGUtPmdldE1lc3NhZ2UoKSk7CiAgICAgICAgZWlfbG9nKCdFUlJPUicsICRlLT5nZXRNZXNzYWdlKCkpOwogICAgICAgIGV4aXQoMSk7CiAgICB9Cn0gZWxzZSB7CiAgICBlcnIoIlVua25vd24gY29tbWFuZDogeyRjbWR9Iik7CiAgICBleGl0KDEpOwp9Cg=="
+    echo "$PHP_B64" | base64 -d > "$LIB_DIR/wp_helper.php"
+    if [ -s "$LIB_DIR/wp_helper.php" ]; then
+        SZ=$(wc -c < "$LIB_DIR/wp_helper.php")
+        print_success "wp_helper.php extracted (${SZ} bytes)"
+    else
+        print_error "wp_helper.php extraction failed"; exit 1
+    fi
+
+    cp "$LIB_DIR/core.py"       "$WORK_DIR/easyinstall_core.py"
+    cp "$LIB_DIR/wp_helper.php" "$WORK_DIR/easyinstall_wp.php"
+    cp "$0"                     "$WORK_DIR/install.sh" 2>/dev/null || true
+    print_success "Engine files ready in $LIB_DIR"
+}
+
+install_command() {
+    print_section "Installing easyinstall Command"
+    cat > "$BIN_PATH" << 'CMDEOF'
+#!/bin/bash
+VERSION="7.0"
+LIB_DIR="/usr/local/lib/easyinstall"
+PYTHON_ENGINE="${LIB_DIR}/core.py"
+PHP_HELPER="${LIB_DIR}/wp_helper.php"
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; N='\033[0m'
+_need_root()   { [ "${EUID}" -eq 0 ] || { echo -e "${R}Run as root${N}"; exit 1; }; }
+_need_python() { command -v python3 >/dev/null 2>&1 || apt-get install -y python3 -q; }
+_need_php()    { command -v php >/dev/null 2>&1 || apt-get install -y --no-install-recommends php-cli -q 2>/dev/null || true; }
+_py()  { python3 "${PYTHON_ENGINE}" "$@"; }
 CMD="${1:-help}"; shift || true
-
-case "$CMD" in
-
-    # ── Core install ──────────────────────────────────────────────────────────
-    install)
-        _need_root; _bootstrap; _need_python; _need_php
-        _py install "$@" ;;
-
-    # ── Site management ───────────────────────────────────────────────────────
-    create)
-        _need_root; _bootstrap; _need_python; _need_php
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall create domain.com [--ssl] [--php=8.3]${N}"; exit 1; }
-        _py create "$@" ;;
-
-    delete)
-        _need_root; _bootstrap; _need_python
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall delete domain.com${N}"; exit 1; }
-        _py delete "$@" ;;
-
-    list)         _bootstrap; _need_python; _py list ;;
-    site-info)    _bootstrap; _need_python; _need_php; _py site-info "$@" ;;
-
-    update-site)
-        _need_root; _bootstrap; _need_python; _need_php
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall update-site domain.com|all${N}"; exit 1; }
-        _py update-site "$@" ;;
-
-    clone)
-        _need_root; _bootstrap; _need_python; _need_php
-        _py clone "$@" ;;
-
-    php-switch)
-        _need_root; _bootstrap; _need_python
-        _py php-switch "$@" ;;
-
-    backup-site)
-        _need_root; _bootstrap; _need_python; _need_php
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall backup-site domain.com${N}"; exit 1; }
-        _py backup "$@" ;;
-
-    # ── SSL ───────────────────────────────────────────────────────────────────
-    ssl)
-        _need_root; _bootstrap; _need_python
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall ssl domain.com${N}"; exit 1; }
-        _py ssl "$@" ;;
-
-    ssl-renew)   _need_root; _bootstrap; _need_python; _py ssl-renew ;;
-
-    # ── Redis ─────────────────────────────────────────────────────────────────
-    redis-status)  _bootstrap; _need_python; _py redis-status ;;
-    redis-restart) _need_root; _bootstrap; _need_python; _py redis-restart "$@" ;;
-    redis-ports)   _bootstrap; _need_python; _py redis-ports ;;
-    redis-cli)
-        REDIS_CONF="/etc/redis/redis-${1//./-}.conf"
-        PORT=$(grep "^port" "$REDIS_CONF" 2>/dev/null | awk '{print $2}' || echo "6379")
-        exec redis-cli -p "$PORT" ;;
-
-    # ── Monitoring ────────────────────────────────────────────────────────────
-    status)   _bootstrap; _need_python; _py status ;;
-    health)   _bootstrap; _need_python; _py health ;;
-    monitor)  _bootstrap; _need_python; _py monitor ;;
-    logs)     _bootstrap; _need_python; _py logs "$@" ;;
-    perf)     _bootstrap; _need_python; _py perf ;;
-    version)  echo "EasyInstall v${VERSION}" ;;
-
-    # ── Backup / Optimize ─────────────────────────────────────────────────────
-    backup)   _need_root; _bootstrap; _need_python; _py backup "$@" ;;
-    optimize) _need_root; _bootstrap; _need_python; _py optimize ;;
-    clean)    _need_root; _bootstrap; _need_python; _py clean ;;
-
-    # ── Self-Heal (v6.7 / v7.1) ───────────────────────────────────────────────
-    self-heal|selfheal)
-        _need_root
-        run_self_heal "${1:-full}" ;;
-
-    # ── Self-Update (v6.7 / v7.1) ─────────────────────────────────────────────
-    self-update|selfupdate)
-        _need_root
-        run_self_update "${1:-all}" ;;
-
-    # ── Self-Check — version report ───────────────────────────────────────────
-    self-check|selfcheck|versions)
-        _bootstrap; _need_python
-        # Hybrid: Python reports installed, Bash reports latest upstream
-        _py self-check
-        sh_fetch_versions
-        sh_version_report ;;
-
-    # ── WebSocket (v6.4) ──────────────────────────────────────────────────────
-    ws-enable)
-        _need_root
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall ws-enable domain.com [port]${N}"; exit 1; }
-        WS_DOMAIN="$1"; WS_PORT="${2:-8080}"
-        NGINX_CONF="/etc/nginx/sites-available/$WS_DOMAIN"
-        [ -f "$NGINX_CONF" ] || { echo -e "${R}❌ Nginx config not found for $WS_DOMAIN${N}"; exit 1; }
-        # Inject websocket map
-        if [ ! -f /etc/nginx/conf.d/websocket-map.conf ]; then
-            cat > /etc/nginx/conf.d/websocket-map.conf << 'WSMAP'
-map $http_upgrade $connection_upgrade {
-    default   close;
-    websocket upgrade;
-    ""        close;
-}
-WSMAP
-        fi
-        # Inject WS location block if not already present
-        if ! grep -q "proxy_set_header.*Upgrade" "$NGINX_CONF" 2>/dev/null; then
-            TMPF=$(mktemp)
-            awk -v port="$WS_PORT" '
-            /^}$/ && !done {
-                print ""
-                print "    # WebSocket proxy (EasyInstall v7.1)"
-                print "    location ~ ^/(ws|wss)(/.*)? {"
-                print "        proxy_pass         http://127.0.0.1:" port ";"
-                print "        proxy_http_version 1.1;"
-                print "        proxy_set_header   Upgrade           $http_upgrade;"
-                print "        proxy_set_header   Connection        $connection_upgrade;"
-                print "        proxy_set_header   Host              $host;"
-                print "        proxy_set_header   X-Real-IP         $remote_addr;"
-                print "        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;"
-                print "        proxy_read_timeout  3600s;"
-                print "        proxy_send_timeout  3600s;"
-                print "        proxy_buffering     off;"
-                print "        proxy_cache         off;"
-                print "    }"
-                done=1
-            }
-            { print }
-            ' "$NGINX_CONF" > "$TMPF" && mv "$TMPF" "$NGINX_CONF"
-            echo -e "${G}✅ WebSocket block added to $WS_DOMAIN (backend: 127.0.0.1:$WS_PORT)${N}"
-        else
-            echo -e "${Y}⚠️  WebSocket already configured for $WS_DOMAIN${N}"
-        fi
-        mkdir -p /var/lib/easyinstall
-        echo "${WS_DOMAIN}:${WS_PORT}:enabled" >> /var/lib/easyinstall/websocket.registry
-        sort -u /var/lib/easyinstall/websocket.registry -o /var/lib/easyinstall/websocket.registry
-        nginx -t 2>/dev/null && systemctl reload nginx && \
-            echo -e "${G}✅ WebSocket enabled for $WS_DOMAIN${N}" || \
-            echo -e "${R}❌ Nginx config error — run: nginx -t${N}" ;;
-
-    ws-disable)
-        _need_root
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall ws-disable domain.com${N}"; exit 1; }
-        WS_DOMAIN="$1"
-        NGINX_CONF="/etc/nginx/sites-available/$WS_DOMAIN"
-        [ -f "$NGINX_CONF" ] || { echo -e "${R}❌ Config not found for $WS_DOMAIN${N}"; exit 1; }
-        TMPF=$(mktemp)
-        awk '/# WebSocket proxy \(EasyInstall v7\.1\)/ { skip=1 }
-             skip && /^    \}$/ { skip=0; next }
-             !skip { print }' "$NGINX_CONF" > "$TMPF" && mv "$TMPF" "$NGINX_CONF"
-        sed -i "/^${WS_DOMAIN}:/d" /var/lib/easyinstall/websocket.registry 2>/dev/null || true
-        nginx -t 2>/dev/null && systemctl reload nginx && \
-            echo -e "${G}✅ WebSocket disabled for $WS_DOMAIN${N}" || \
-            echo -e "${R}❌ Nginx config error${N}" ;;
-
-    ws-status)
-        WS_DOMAIN="${1:-}"
-        echo -e "${C}🔌 WebSocket Status${N}"
-        echo -e "${B}══════════════════════════════════════${N}"
-        if [ -n "$WS_DOMAIN" ]; then
-            NGINX_CONF="/etc/nginx/sites-available/$WS_DOMAIN"
-            if grep -q "proxy_set_header.*Upgrade" "$NGINX_CONF" 2>/dev/null; then
-                WS_PORT=$(grep -A3 "proxy_pass.*127.0.0.1" "$NGINX_CONF" 2>/dev/null | grep -oP ':\K[0-9]+' | head -1 || echo "?")
-                echo -e "  ${G}✅ ENABLED${N} — $WS_DOMAIN  backend: 127.0.0.1:$WS_PORT"
-            else
-                echo -e "  ${Y}⚠️  NOT configured${N} for $WS_DOMAIN"
-                echo "  Run: easyinstall ws-enable $WS_DOMAIN [port]"
-            fi
-        else
-            for cf in /etc/nginx/sites-available/*; do
-                [ -f "$cf" ] || continue
-                dom=$(basename "$cf")
-                if grep -q "proxy_set_header.*Upgrade" "$cf" 2>/dev/null; then
-                    echo -e "  ${G}✅${N} $dom — WebSocket enabled"
-                else
-                    echo -e "  ${R}✗${N}  $dom — not configured"
-                fi
-            done
-        fi
-        [ -f /etc/nginx/conf.d/websocket-map.conf ] && \
-            echo -e "\n  ${G}✅ websocket-map.conf present${N}" || \
-            echo -e "\n  ${R}✗ websocket-map.conf missing${N}" ;;
-
-    ws-test)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall ws-test domain.com${N}"; exit 1; }
-        WS_DOMAIN="$1"
-        echo -e "${C}🧪 WebSocket Test: $WS_DOMAIN${N}"
-        echo -e "${B}══════════════════════════════════════${N}"
-        NGINX_CONF="/etc/nginx/sites-available/$WS_DOMAIN"
-        grep -q "proxy_set_header.*Upgrade" "$NGINX_CONF" 2>/dev/null && \
-            echo -e "  ${G}✅ Nginx WS location block present${N}" || \
-            echo -e "  ${R}✗ WS block NOT found — run: easyinstall ws-enable $WS_DOMAIN${N}"
-        [ -f /etc/nginx/conf.d/websocket-map.conf ] && \
-            echo -e "  ${G}✅ Upgrade map loaded${N}" || echo -e "  ${Y}⚠️  Upgrade map missing${N}"
-        echo ""
-        echo -e "${Y}HTTP Upgrade probe:${N}"
-        HTTP_CODE=$(curl -s --max-time 5 \
-            -H "Host: $WS_DOMAIN" -H "Upgrade: websocket" -H "Connection: Upgrade" \
-            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Sec-WebSocket-Version: 13" \
-            -o /dev/null -w "%{http_code}" "http://127.0.0.1/ws/" 2>/dev/null || echo "000")
-        echo -e "  HTTP response: $HTTP_CODE"
-        [ "$HTTP_CODE" = "101" ] && echo -e "  ${G}✅ WebSocket handshake successful!${N}" || \
-            echo -e "  ${Y}ℹ️  101 expected for successful WS upgrade (current: $HTTP_CODE)${N}" ;;
-
-    # ── HTTP/3 + QUIC (v6.4) ──────────────────────────────────────────────────
-    http3-enable) _need_root; _bootstrap; _need_python; _py http3-enable ;;
-    http3-status) _bootstrap; _need_python; _py http3-status ;;
-
-    # ── Edge Computing (v6.4) ─────────────────────────────────────────────────
-    edge-setup)  _need_root; _bootstrap; _need_python; _py edge-setup ;;
-    edge-status) _bootstrap; _need_python; _py edge-status ;;
-    edge-purge)  _need_root; _bootstrap; _need_python; _py edge-purge "$@" ;;
-
-    # ── AI Module (v6.3+) ─────────────────────────────────────────────────────
-    ai-setup)
-        _bootstrap
-        if [ -f /usr/local/lib/easyinstall-ai.sh ]; then
-            . /usr/local/lib/easyinstall-ai.sh; ai_setup
-        else
-            _bootstrap; _need_python; _py ai-setup
-        fi ;;
-
-    ai-diagnose)
-        _bootstrap
-        if [ -f /usr/local/lib/easyinstall-ai.sh ]; then
-            . /usr/local/lib/easyinstall-ai.sh; ai_diagnose "${1:-}"
-        else
-            _need_python; _py ai-diagnose "$@"
-        fi ;;
-
-    ai-optimize)
-        _bootstrap
-        if [ -f /usr/local/lib/easyinstall-ai.sh ]; then
-            . /usr/local/lib/easyinstall-ai.sh; ai_optimize
-        else
-            _need_python; _py ai-optimize
-        fi ;;
-
-    ai-security)
-        _bootstrap
-        if [ -f /usr/local/lib/easyinstall-ai.sh ]; then
-            . /usr/local/lib/easyinstall-ai.sh; ai_security
-        else
-            echo -e "${Y}⚠️  AI security module not installed. Run: easyinstall install${N}"
-        fi ;;
-
-    ai-report)
-        _bootstrap
-        if [ -f /usr/local/lib/easyinstall-ai.sh ]; then
-            . /usr/local/lib/easyinstall-ai.sh; ai_report
-        else
-            echo -e "${Y}⚠️  AI report module not installed. Run: easyinstall install${N}"
-        fi ;;
-
-    ai-install-ollama)
-        _need_root
-        echo -e "${C}🤖 Installing Ollama (Local AI Engine)...${N}"
-        command -v ollama &>/dev/null && echo -e "${G}✅ Ollama already installed${N}" || \
-            curl -fsSL https://ollama.com/install.sh | sh
-        systemctl enable ollama 2>/dev/null && systemctl start ollama 2>/dev/null || \
-            (ollama serve >/dev/null 2>&1 & sleep 3)
-        if [ -f /usr/local/lib/easyinstall-ai.sh ]; then
-            . /usr/local/lib/easyinstall-ai.sh; ai_load_config 2>/dev/null || true
-            AI_MODEL="${AI_MODEL:-llama3.2}"
-            echo -e "${Y}📥 Pulling model: $AI_MODEL...${N}"
-            ollama pull "$AI_MODEL" && echo -e "${G}✅ Model $AI_MODEL ready!${N}" || \
-                echo -e "${Y}⚠️  Pull failed — will retry on first use.${N}"
-        fi
-        echo -e "${G}✅ Local AI ready. Run: easyinstall ai-diagnose${N}" ;;
-
-    # ── Advanced AutoTune (v6.6) ──────────────────────────────────────────────
-    advanced-tune)
-        _need_root
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; advanced_auto_tune
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    perf-dashboard)
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; perf_dashboard
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    warm-cache)
-        _need_root
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; smart_cache_warmer
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    db-optimize)
-        _need_root
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; db_optimization_engine
-        else
-            _bootstrap; _need_python; _py optimize
-        fi ;;
-
-    wp-speed)
-        _need_root
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; wordpress_max_speed
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    install-governor)
-        _need_root
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; install_governor_timer
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    emergency-check)
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; disaster_recovery_mode "manual"
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    autotune-rollback)
-        _need_root
-        if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
-            . /usr/local/lib/easyinstall-autotune.sh; autotune_rollback
-        else
-            echo -e "${R}❌ AutoTune module not found. Run: easyinstall install${N}"
-        fi ;;
-
-    nginx-extras)
-        _need_root
-        if [ -f /usr/local/bin/easyinstall-extras ]; then
-            /usr/local/bin/easyinstall-extras nginx
-        else
-            echo -e "${Y}⚠️  Extras installer not found — run full install first${N}"
-        fi ;;
-
-    # ── Machine Learning (v6.5) ───────────────────────────────────────────────
-    ml-train)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall ml-train domain.com${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-ml.sh ] && \
-            bash /usr/local/lib/easyinstall-ml.sh ml_train "$1" || \
-            echo -e "${R}❌ ML module not found. Run: easyinstall install${N}" ;;
-
-    ml-predict)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall ml-predict domain.com${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-ml.sh ] && \
-            bash /usr/local/lib/easyinstall-ml.sh ml_predict "$1" || \
-            echo -e "${R}❌ ML module not found.${N}" ;;
-
-    ml-status)
-        [ -f /usr/local/lib/easyinstall-ml.sh ] && \
-            bash /usr/local/lib/easyinstall-ml.sh ml_status || \
-            echo -e "${R}❌ ML module not found.${N}" ;;
-
-    ml-model-list)
-        [ -f /usr/local/lib/easyinstall-ml.sh ] && \
-            bash /usr/local/lib/easyinstall-ml.sh ml_model_list || \
-            echo -e "${R}❌ ML module not found.${N}" ;;
-
-    # ── Serverless Functions (v6.5) ───────────────────────────────────────────
-    fn-deploy)
-        { [ -z "$1" ] || [ -z "$2" ]; } && { echo -e "${R}❌ Usage: easyinstall fn-deploy name /path/fn.sh${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-serverless.sh ] && \
-            bash /usr/local/lib/easyinstall-serverless.sh fn_deploy "$1" "$2" || \
-            echo -e "${R}❌ Serverless module not found. Run: easyinstall install${N}" ;;
-
-    fn-invoke)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall fn-invoke name [args]${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-serverless.sh ] && \
-            bash /usr/local/lib/easyinstall-serverless.sh fn_invoke "$@" || \
-            echo -e "${R}❌ Serverless module not found.${N}" ;;
-
-    fn-list)
-        [ -f /usr/local/lib/easyinstall-serverless.sh ] && \
-            bash /usr/local/lib/easyinstall-serverless.sh fn_list || \
-            echo -e "${R}❌ Serverless module not found.${N}" ;;
-
-    fn-delete)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall fn-delete name${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-serverless.sh ] && \
-            bash /usr/local/lib/easyinstall-serverless.sh fn_delete "$1" || \
-            echo -e "${R}❌ Serverless module not found.${N}" ;;
-
-    fn-logs)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall fn-logs name${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-serverless.sh ] && \
-            bash /usr/local/lib/easyinstall-serverless.sh fn_logs "$1" || \
-            echo -e "${R}❌ Serverless module not found.${N}" ;;
-
-    # ── Database Sharding (v6.5) ──────────────────────────────────────────────
-    shard-init)
-        [ -z "$1" ] && { echo -e "${R}❌ Usage: easyinstall shard-init domain.com${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-sharding.sh ] && \
-            bash /usr/local/lib/easyinstall-sharding.sh shard_init "$1" || \
-            echo -e "${R}❌ Sharding module not found. Run: easyinstall install${N}" ;;
-
-    shard-status)
-        [ -f /usr/local/lib/easyinstall-sharding.sh ] && \
-            bash /usr/local/lib/easyinstall-sharding.sh shard_status || \
-            echo -e "${R}❌ Sharding module not found.${N}" ;;
-
-    shard-rebalance)
-        _need_root
-        [ -f /usr/local/lib/easyinstall-sharding.sh ] && \
-            bash /usr/local/lib/easyinstall-sharding.sh shard_rebalance || \
-            echo -e "${R}❌ Sharding module not found.${N}" ;;
-
-    shard-add)
-        { [ -z "$1" ] || [ -z "$2" ]; } && { echo -e "${R}❌ Usage: easyinstall shard-add host port${N}"; exit 1; }
-        [ -f /usr/local/lib/easyinstall-sharding.sh ] && \
-            bash /usr/local/lib/easyinstall-sharding.sh shard_add "$1" "$2" || \
-            echo -e "${R}❌ Sharding module not found.${N}" ;;
-
-    # ── PageSpeed (v6.6) ──────────────────────────────────────────────────────
-    pagespeed)
-        if [ -f /usr/local/lib/easyinstall-pagespeed.sh ]; then
-            . /usr/local/lib/easyinstall-pagespeed.sh; easy_pagespeed "$@"
-        else
-            _need_root; _bootstrap; _need_python; _need_php
-            _py pagespeed "$@"
-        fi ;;
-
-    # ── Troubleshoot ──────────────────────────────────────────────────────────
-    fix-apache|fix-nginx)
-        _need_root; _bootstrap; _need_python
-        _py fix-apache "$@" ;;
-
-    # ── Help / catch-all ──────────────────────────────────────────────────────
-    help|--help|-h) _help ;;
-
-    *)
-        echo -e "${R}❌ Unknown command: $CMD${N}"
-        echo "Run: easyinstall help"
-        exit 1 ;;
+case "${CMD}" in
+    install)          _need_root; _need_python; _need_php; _py install "$@" ;;
+    create)           _need_root; _need_python; _need_php
+                      [ -z "${1}" ] && { echo -e "${R}Usage: easyinstall create domain.com [--ssl]${N}"; exit 1; }
+                      _py create "$@" ;;
+    delete)           _need_root; _need_python; _py delete "$@" ;;
+    list)             _need_python; _py list ;;
+    site-info)        _need_python; _need_php; _py site-info "$@" ;;
+    update-site)      _need_root; _need_python; _need_php; _py update-site "$@" ;;
+    clone)            _need_root; _need_python; _need_php; _py clone "$@" ;;
+    php-switch)       _need_root; _need_python; _py php-switch "$@" ;;
+    ssl)              _need_root; _need_python; _py ssl "$@" ;;
+    ssl-renew)        _need_root; _need_python; _py ssl-renew ;;
+    redis-status)     _need_python; _py redis-status ;;
+    redis-restart)    _need_root; _need_python; _py redis-restart "$@" ;;
+    redis-ports)      _need_python; _py redis-ports ;;
+    redis-cli)        REDIS_CONF="/etc/redis/redis-${1//./-}.conf"
+                      PORT=$(grep '^port' "${REDIS_CONF}" 2>/dev/null | awk '{print $2}' || echo 6379)
+                      exec redis-cli -p "${PORT}" ;;
+    status)           _need_python; _py status ;;
+    health)           _need_python; _py health ;;
+    monitor)          _need_python; _py monitor ;;
+    logs)             _need_python; _py logs "$@" ;;
+    perf)             _need_python; _py perf ;;
+    self-heal|selfheal)     _need_root; _need_python; _py self-heal "${1:-full}" ;;
+    self-update|selfupdate) _need_root; _need_python; _py self-update "${1:-all}" ;;
+    self-check|selfcheck)   _need_python; _py self-check ;;
+    backup)           _need_root; _need_python; _py backup "$@" ;;
+    optimize)         _need_root; _need_python; _py optimize ;;
+    clean)            _need_root; _need_python; _py clean ;;
+    ws-enable)        _need_root; _need_python; _py ws-enable "$@" ;;
+    ws-disable)       _need_root; _need_python; _py ws-disable "$@" ;;
+    ws-status)        _need_python; _py ws-status "$@" ;;
+    ws-test)          _need_python; _py ws-test "$@" ;;
+    http3-enable)     _need_root; _need_python; _py http3-enable ;;
+    http3-status)     _need_python; _py http3-status ;;
+    edge-setup)       _need_root; _need_python; _py edge-setup ;;
+    edge-status)      _need_python; _py edge-status ;;
+    edge-purge)       _need_root; _need_python; _py edge-purge "$@" ;;
+    ai-diagnose)      _need_python; _py ai-diagnose "$@" ;;
+    ai-optimize)      _need_python; _py ai-optimize ;;
+    ai-setup)         _need_python; _py ai-setup ;;
+    pagespeed)        _need_root; _need_python; _need_php; _py pagespeed "$@" ;;
+    fix-apache|fix-nginx) _need_root; _need_python; _py fix-apache "$@" ;;
+    version)          echo "EasyInstall v${VERSION}" ;;
+    help|--help|-h)
+        echo -e "${C}EasyInstall v7.0 — WordPress Performance Stack${N}"
+        echo "  install               Full stack install"
+        echo "  create domain.com     New WordPress site [--ssl] [--php=8.3]"
+        echo "  delete domain.com     Delete site"
+        echo "  list                  List all sites"
+        echo "  site-info domain      Site details"
+        echo "  update-site domain    Update WP core/plugins/themes [--all]"
+        echo "  update-site all       Update all sites"
+        echo "  clone src dst         Clone site"
+        echo "  php-switch domain v   Switch PHP version"
+        echo "  ssl domain            Enable SSL"
+        echo "  ssl-renew             Renew all certs"
+        echo "  redis-status          Redis status"
+        echo "  status                System status"
+        echo "  health                Health check"
+        echo "  monitor               Live monitor"
+        echo "  logs [domain]         View logs"
+        echo "  self-heal [mode]      Auto-fix (full|services|configs|ssl|disk|wp|502)"
+        echo "  self-update [pkg]     Update packages"
+        echo "  self-check            Version status"
+        echo "  backup [domain]       Backup"
+        echo "  optimize              Optimize DB + cache"
+        echo "  clean                 Clean logs/temp"
+        echo "  ws-enable domain port WebSocket"
+        echo "  http3-enable          HTTP/3 + QUIC"
+        echo "  edge-setup            Edge computing"
+        echo "  ai-diagnose           AI log analysis"
+        echo "  pagespeed optimize d  PageSpeed"
+        echo -e "  ${Y}fix-apache            502/Apache conflict fix${N}"
+        ;;
+    *) echo -e "${R}Unknown: ${CMD}${N} — Run: easyinstall help"; exit 1 ;;
 esac
+CMDEOF
+    chmod +x "$BIN_PATH"
+    echo 'export PATH="$PATH:/usr/local/bin"' > /etc/profile.d/easyinstall.sh
+    print_success "easyinstall command installed at $BIN_PATH"
+}
+
+main() {
+    INSTALL_STACK=true
+    for arg in "$@"; do
+        case $arg in
+            --help|-h) show_help; exit 0 ;;
+            --no-stack) INSTALL_STACK=false ;;
+        esac
+    done
+
+    print_banner
+    check_root
+    detect_os
+    check_disk_space
+    check_internet
+    block_apache
+    extract_engine_files
+    install_command
+
+    if [ "$INSTALL_STACK" = true ]; then
+        update_system
+        install_base_deps
+        install_php
+        install_nginx
+        install_mysql
+        install_redis
+        install_certbot
+        install_python_deps
+        configure_firewall
+        configure_fail2ban
+    fi
+
+    create_aliases
+    show_summary
+
+    echo -e "${GREEN}✅ EasyInstall VPS Setup Complete!${NC}"
+    echo -e "${YELLOW}Run: easyinstall help${NC}"
+    echo -e "${YELLOW}Or:  easyinstall install  (full stack fine-tune)${NC}"
+}
+
+main "$@"
