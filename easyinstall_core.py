@@ -610,6 +610,7 @@ def cmd_create(args):
     php_ver = "auto"; use_ssl = False
     for a in args[1:]:
         if a.startswith("--php="): php_ver = a.split("=")[1]
+        elif a.startswith("php="):  php_ver = a.split("=")[1]   # allow bare php=8.4
         if a == "--ssl": use_ssl = True
 
     step(f"Creating WordPress site: {domain}")
