@@ -3,12 +3,40 @@
 # ============================================
 # EasyInstall v6.4 HYBRID EDITION — Installer
 # ============================================
-# Modified to work with one-liner curl pipe installation
-# Now automatically downloads all required files from GitHub
+# Installs both:
+#   • easyinstall.sh         (Bash: dependency layer)
+#   • easyinstall_config.py  (Python: configuration layer)
+#
+# Usage (local — all 3 files in same directory):
+#   sudo bash install.sh
+#
+# Usage (download from URLs):
+#   EASYINSTALL_SH_URL=https://example.com/easyinstall.sh \
+#   EASYINSTALL_PY_URL=https://example.com/easyinstall_config.py \
+#   sudo bash install.sh
+#
+# Flags:
+#   --run        Install + immediately start full server setup
+#   --no-run     Install files only, skip prompt
+#   --reinstall  Remove old files, then reinstall
+#   --uninstall  Remove installed files
+#   --status     Show status of installed files
+#   --help       Show help
+#
+# Compatible: Debian 11/12  |  Ubuntu 20.04 / 22.04 / 24.04
+# Requires  : root
 # ============================================
 
 set -eE
 trap '_installer_error $LINENO' ERR
+
+# ── Re-entry guard ────────────────────────────────────────────────────────────
+# Prevents the installer from running multiple times when piped via
+# wget/curl | bash (some CDN/proxy pages accidentally re-execute the script).
+if [[ -n "${EASYINSTALL_RUNNING:-}" ]]; then
+    exit 0
+fi
+export EASYINSTALL_RUNNING=1
 
 # ── Colour codes ──────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
@@ -16,21 +44,17 @@ BLUE='\033[0;34m';  PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 # ── Paths & constants ─────────────────────────────────────────────────────────
 INSTALLER_VERSION="6.4"
-INSTALL_DIR="/usr/local/lib/easyinstall"
-LIB_DIR="/usr/local/lib"
-BIN_DIR="/usr/local/bin"
+INSTALL_DIR="/usr/local/lib/easyinstall"   # Bash script lives here
+LIB_DIR="/usr/local/lib"                   # Python module lives here
+BIN_DIR="/usr/local/bin"                   # Wrapper symlinks
 LOG_DIR="/var/log/easyinstall"
 INSTALL_LOG="$LOG_DIR/installer.log"
-TMP_DIR="/tmp/easyinstall-$$"  # Unique temp directory
 
-# Default GitHub repository (using your repo)
-GITHUB_RAW="https://raw.githubusercontent.com/sugan0927/easyinstallvps/main"
+# Source-file URLs (override via env if hosting remotely)
+EASYINSTALL_SH_URL="${EASYINSTALL_SH_URL:-}"
+EASYINSTALL_PY_URL="${EASYINSTALL_PY_URL:-}"
 
-# Source-file URLs (can be overridden via env)
-EASYINSTALL_SH_URL="${EASYINSTALL_SH_URL:-$GITHUB_RAW/easyinstall.sh}"
-EASYINSTALL_PY_URL="${EASYINSTALL_PY_URL:-$GITHUB_RAW/easyinstall_config.py}"
-
-# Runtime flags
+# Runtime flags (set by parse_args)
 OPT_REINSTALL=false
 OPT_NO_RUN=false
 OPT_AUTO_RUN=false
@@ -38,7 +62,6 @@ OPT_AUTO_RUN=false
 # ── Error trap ────────────────────────────────────────────────────────────────
 _installer_error() {
     echo -e "${RED}❌  Installer failed at line $1 — check $INSTALL_LOG${NC}"
-    rm -rf "$TMP_DIR" 2>/dev/null || true
     exit 1
 }
 
@@ -65,7 +88,7 @@ log() {
 check_root() {
     log "STEP" "Checking root privileges"
     if [[ "$EUID" -ne 0 ]]; then
-        log "ERROR" "This installer must be run as root. Try: sudo bash install.sh"
+        log "ERROR" "This installer must be run as root.  Try: sudo bash install.sh"
         exit 1
     fi
     log "SUCCESS" "Running as root"
@@ -101,11 +124,15 @@ check_disk() {
 
 check_network() {
     log "STEP" "Checking network connectivity"
-    if ping -c1 -W5 8.8.8.8 &>/dev/null || curl -s --head --max-time 5 https://google.com | grep -q "200"; then
+    local ok=false
+    ping -c1 -W5 8.8.8.8 &>/dev/null && ok=true
+    $ok || curl -s --head --max-time 5 https://google.com | grep -q "200" && ok=true
+    if $ok; then
         log "SUCCESS" "Network OK"
     else
-        log "ERROR" "No internet connectivity - cannot download required files"
-        exit 1
+        log "WARNING" "Network check failed — if this is an offline/local install, this is expected"
+        log "WARNING" "Continuing anyway — files can be installed from local directory without internet"
+        # Only hard-fail if we actually need to download files (checked later in locate_sources)
     fi
 }
 
@@ -133,54 +160,69 @@ ensure_downloader() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — DOWNLOAD REQUIRED FILES
+# SECTION 3 — SOURCE FILE RESOLUTION
+# Priority: same dir → /tmp → env-var URL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_download_file() {
-    local url="$1" dest="$2" name="$3"
-    log "INFO" "Downloading $name..."
-    
+_download() {
+    local url="$1" dest="$2"
     if command -v curl &>/dev/null; then
-        if ! curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$dest"; then
-            log "ERROR" "Failed to download $name from $url"
-            return 1
-        fi
+        curl -fsSL --retry 3 --retry-delay 3 "$url" -o "$dest"
     else
-        if ! wget -q --tries=3 --timeout=10 "$url" -O "$dest"; then
-            log "ERROR" "Failed to download $name from $url"
-            return 1
-        fi
+        wget -q --tries=3 --timeout=20 "$url" -O "$dest"
     fi
-    
-    if [[ ! -s "$dest" ]]; then
-        log "ERROR" "Downloaded $name is empty"
-        return 1
-    fi
-    
-    chmod +x "$dest" 2>/dev/null || true
-    log "SUCCESS" "Downloaded $name"
-    return 0
 }
 
-download_all_files() {
-    log "STEP" "Creating temporary directory: $TMP_DIR"
-    mkdir -p "$TMP_DIR"
-    
-    # Download easyinstall.sh
-    if ! _download_file "$EASYINSTALL_SH_URL" "$TMP_DIR/easyinstall.sh" "easyinstall.sh"; then
+locate_sources() {
+    log "STEP" "Locating source files"
+    local self_dir
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    SH_SOURCE=""
+    PY_SOURCE=""
+
+    # Same directory
+    [[ -f "$self_dir/easyinstall.sh"        ]] && SH_SOURCE="$self_dir/easyinstall.sh"
+    [[ -f "$self_dir/easyinstall_config.py" ]] && PY_SOURCE="$self_dir/easyinstall_config.py"
+
+    # /tmp fallback
+    [[ -z "$SH_SOURCE" && -f "/tmp/easyinstall.sh"        ]] && SH_SOURCE="/tmp/easyinstall.sh"
+    [[ -z "$PY_SOURCE" && -f "/tmp/easyinstall_config.py" ]] && PY_SOURCE="/tmp/easyinstall_config.py"
+
+    # Download from URL if still missing
+    if [[ -z "$SH_SOURCE" && -n "$EASYINSTALL_SH_URL" ]]; then
+        log "INFO" "Downloading easyinstall.sh …"
+        _download "$EASYINSTALL_SH_URL" "/tmp/easyinstall.sh"
+        SH_SOURCE="/tmp/easyinstall.sh"
+        log "SUCCESS" "Downloaded easyinstall.sh"
+    fi
+
+    if [[ -z "$PY_SOURCE" && -n "$EASYINSTALL_PY_URL" ]]; then
+        log "INFO" "Downloading easyinstall_config.py …"
+        _download "$EASYINSTALL_PY_URL" "/tmp/easyinstall_config.py"
+        PY_SOURCE="/tmp/easyinstall_config.py"
+        log "SUCCESS" "Downloaded easyinstall_config.py"
+    fi
+
+    # Hard fail if still missing
+    if [[ -z "$SH_SOURCE" ]]; then
+        log "ERROR" "Cannot find easyinstall.sh — options:"
+        log "INFO"  "  1. Place easyinstall.sh alongside install.sh"
+        log "INFO"  "  2. EASYINSTALL_SH_URL=https://... sudo bash install.sh"
+        log "INFO"  "  3. Copy to /tmp/easyinstall.sh"
         exit 1
     fi
-    
-    # Download easyinstall_config.py
-    if ! _download_file "$EASYINSTALL_PY_URL" "$TMP_DIR/easyinstall_config.py" "easyinstall_config.py"; then
+
+    if [[ -z "$PY_SOURCE" ]]; then
+        log "ERROR" "Cannot find easyinstall_config.py — options:"
+        log "INFO"  "  1. Place easyinstall_config.py alongside install.sh"
+        log "INFO"  "  2. EASYINSTALL_PY_URL=https://... sudo bash install.sh"
+        log "INFO"  "  3. Copy to /tmp/easyinstall_config.py"
         exit 1
     fi
-    
-    # Set source variables
-    SH_SOURCE="$TMP_DIR/easyinstall.sh"
-    PY_SOURCE="$TMP_DIR/easyinstall_config.py"
-    
-    log "SUCCESS" "All files downloaded successfully"
+
+    log "SUCCESS" "easyinstall.sh  → $SH_SOURCE"
+    log "SUCCESS" "easyinstall_config.py → $PY_SOURCE"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -192,23 +234,26 @@ validate_sources() {
 
     # Bash syntax
     if ! bash -n "$SH_SOURCE" 2>/dev/null; then
-        log "ERROR" "easyinstall.sh has syntax errors — aborting"
-        bash -n "$SH_SOURCE" 2>&1 | head -5 | while read line; do log "ERROR" "  $line"; done
-        exit 1
+        log "ERROR" "easyinstall.sh has syntax errors — aborting"; exit 1
     fi
-    log "SUCCESS" "easyinstall.sh — bash syntax clean"
+    log "SUCCESS" "easyinstall.sh   — bash syntax clean"
 
-    # Python syntax
-    if ! python3 -m py_compile "$PY_SOURCE" 2>/dev/null; then
-        log "ERROR" "easyinstall_config.py has syntax errors — aborting"
-        python3 -m py_compile "$PY_SOURCE" 2>&1 | head -5 | while read line; do log "ERROR" "  $line"; done
-        exit 1
+    # Python syntax (strict)
+    if ! python3 -W error::SyntaxWarning -m py_compile "$PY_SOURCE" 2>/dev/null; then
+        # Non-strict fallback (warns but still valid on older Python)
+        if ! python3 -m py_compile "$PY_SOURCE" 2>/dev/null; then
+            log "ERROR" "easyinstall_config.py has syntax errors — aborting"; exit 1
+        fi
+        log "WARNING" "easyinstall_config.py — minor syntax warnings (non-fatal)"
+    else
+        log "SUCCESS" "easyinstall_config.py — python syntax clean"
     fi
-    log "SUCCESS" "easyinstall_config.py — python syntax clean"
 
-    # Sanity checks
-    grep -q "SCRIPT_VERSION" "$SH_SOURCE" || log "WARNING" "easyinstall.sh may be incomplete"
-    grep -q "STAGE_MAP" "$PY_SOURCE" || log "WARNING" "easyinstall_config.py may be incomplete"
+    # Sanity: key identifiers present
+    grep -q "SCRIPT_VERSION" "$SH_SOURCE"          || log "WARNING" "easyinstall.sh may be incomplete"
+    grep -q "STAGE_MAP"      "$PY_SOURCE"           || log "WARNING" "easyinstall_config.py may be incomplete"
+    grep -q "deploy_python_script" "$SH_SOURCE"     || log "WARNING" "deploy_python_script function not found in easyinstall.sh"
+    grep -q "wordpress_install"    "$PY_SOURCE"     || log "WARNING" "wordpress_install stage not found in easyinstall_config.py"
 
     log "SUCCESS" "Source file validation complete"
 }
@@ -226,10 +271,10 @@ create_directories() {
         /var/lib/easyinstall \
         /etc/easyinstall \
         /var/www/html \
-        /backups/daily /backups/weekly /backups/monthly \
+        /backups/{daily,weekly,monthly} \
         /etc/nginx/{sites-available,sites-enabled,conf.d,snippets,ssl} \
         /root/easyinstall-backups
-    chmod 755 /backups 2>/dev/null || true
+    chmod 755 /backups
     log "SUCCESS" "Directories created"
 }
 
@@ -242,7 +287,8 @@ install_files() {
     cp "$PY_SOURCE" "$LIB_DIR/easyinstall_config.py"
     chmod 755 "$LIB_DIR/easyinstall_config.py"
 
-    # Co-locate Python file for deploy_python_script()
+    # Co-locate the Python file next to easyinstall.sh so
+    # deploy_python_script() (which uses BASH_SOURCE dir) can find it.
     cp "$PY_SOURCE" "$INSTALL_DIR/easyinstall_config.py"
     chmod 644 "$INSTALL_DIR/easyinstall_config.py"
 
@@ -259,9 +305,8 @@ exec bash /usr/local/lib/easyinstall/easyinstall.sh "$@"
 EOF
     chmod 755 "$BIN_DIR/easyinstall-install"
 
-    # Create convenience aliases
+    # Convenience alias
     ln -sf "$BIN_DIR/easyinstall-install" "$BIN_DIR/easyinstall-run" 2>/dev/null || true
-    ln -sf "$BIN_DIR/easyinstall-install" "$BIN_DIR/easyinstall" 2>/dev/null || true
 
     log "SUCCESS" "Launcher ready: easyinstall-install"
 }
@@ -304,7 +349,7 @@ smoke_test() {
     log "STEP" "Running smoke tests"
     local all_ok=true
 
-    # Python module responds to unknown stage
+    # 1. Python module responds to unknown stage
     local py_resp
     py_resp=$(python3 "$LIB_DIR/easyinstall_config.py" --stage __nonexistent__ 2>&1 || true)
     if echo "$py_resp" | grep -q "Unknown stage"; then
@@ -313,43 +358,49 @@ smoke_test() {
         log "WARNING" "Python module CLI: unexpected response (non-fatal)"
     fi
 
-    # Stage count check
+    # 2. Stage count ≥ 23
     local stage_count
-    stage_count=$(python3 -c "
+    stage_count=$(python3 - << 'PYCHECK' 2>/dev/null || echo "0"
 import warnings, importlib.util
-warnings.filterwarnings('ignore')
-spec = importlib.util.spec_from_file_location('ec', '/usr/local/lib/easyinstall_config.py')
+warnings.filterwarnings("ignore")
+spec = importlib.util.spec_from_file_location("ec", "/usr/local/lib/easyinstall_config.py")
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 print(len(mod.STAGE_MAP))
-" 2>/dev/null || echo "0")
-    
+PYCHECK
+    )
     if (( stage_count >= 23 )); then
         log "SUCCESS" "Python stages registered: $stage_count"
     else
         log "WARNING" "Python stage count low: $stage_count (expected ≥23)"
+        all_ok=false
     fi
 
-    # Launcher executable
+    # 3. Bash function count ≥ 40
+    local func_count
+    func_count=$(grep -c '^[a-zA-Z_][a-zA-Z0-9_]*() {' \
+        "$INSTALL_DIR/easyinstall.sh" 2>/dev/null || echo "0")
+    if (( func_count >= 40 )); then
+        log "SUCCESS" "Bash functions defined: $func_count"
+    else
+        log "WARNING" "Bash function count low: $func_count (expected ≥40)"
+        all_ok=false
+    fi
+
+    # 4. Launcher executable
     if [[ -x "$BIN_DIR/easyinstall-install" ]]; then
         log "SUCCESS" "Launcher is executable: $BIN_DIR/easyinstall-install"
     else
-        log "WARNING" "Launcher not executable"
+        log "WARNING" "Launcher not executable"; all_ok=false
     fi
+
+    $all_ok \
+        && log "SUCCESS" "All smoke tests passed" \
+        || log "WARNING" "Some smoke tests flagged warnings — installation may still work"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — CLEANUP
-# ═══════════════════════════════════════════════════════════════════════════════
-
-cleanup() {
-    log "STEP" "Cleaning up temporary files"
-    rm -rf "$TMP_DIR" 2>/dev/null || true
-    log "SUCCESS" "Cleanup completed"
-}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — OUTPUT
+# SECTION 7 — OUTPUT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 print_summary() {
@@ -372,6 +423,10 @@ print_summary() {
     echo ""
     echo -e "     ${GREEN}sudo easyinstall-install${NC}"
     echo ""
+    echo -e "   ${BLUE}or${NC}"
+    echo ""
+    echo -e "     ${GREEN}sudo bash $INSTALL_DIR/easyinstall.sh${NC}"
+    echo ""
     echo -e "${YELLOW}📋 The full setup installs and configures:${NC}"
     echo -e "   Nginx  ·  PHP 8.4/8.3/8.2  ·  MariaDB 11  ·  Redis 7"
     echo -e "   Certbot  ·  Fail2ban  ·  Auto-tuning (10 phases)  ·  AI module"
@@ -388,7 +443,7 @@ print_summary() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — SPECIAL MODES
+# SECTION 8 — SPECIAL MODES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 do_uninstall() {
@@ -418,10 +473,10 @@ do_uninstall() {
 do_reinstall() {
     log "INFO" "Reinstall mode — clearing old installed files"
     rm -f "$LIB_DIR/easyinstall_config.py" 2>/dev/null || true
-    rm -f "$INSTALL_DIR/easyinstall.sh" 2>/dev/null || true
+    rm -f "$INSTALL_DIR/easyinstall.sh"     2>/dev/null || true
     rm -f "$INSTALL_DIR/easyinstall_config.py" 2>/dev/null || true
-    rm -f "$BIN_DIR/easyinstall-install" 2>/dev/null || true
-    rm -f "$BIN_DIR/easyinstall-run" 2>/dev/null || true
+    rm -f "$BIN_DIR/easyinstall-install"    2>/dev/null || true
+    rm -f "$BIN_DIR/easyinstall-run"        2>/dev/null || true
     log "SUCCESS" "Old files cleared — continuing with fresh install"
 }
 
@@ -433,6 +488,9 @@ do_status() {
         "$INSTALL_DIR/easyinstall.sh|Bash layer (main installer)"
         "$LIB_DIR/easyinstall_config.py|Python layer (config generator)"
         "$BIN_DIR/easyinstall-install|Server setup launcher"
+        "$LIB_DIR/easyinstall-autotune.sh|AutoTune module (created after full setup)"
+        "$LIB_DIR/easyinstall-ai.sh|AI module (created after full setup)"
+        "$BIN_DIR/easyinstall|CLI dispatcher (created after full setup)"
     )
     for entry in "${entries[@]}"; do
         local path="${entry%%|*}" desc="${entry##*|}"
@@ -454,7 +512,7 @@ do_status() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — ARGUMENT PARSER
+# SECTION 9 — ARGUMENT PARSER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 parse_args() {
@@ -469,7 +527,8 @@ parse_args() {
                 cat << 'HELP'
 Usage: sudo bash install.sh [OPTIONS]
 
-Installs easyinstall.sh and easyinstall_config.py to your server.
+Installs easyinstall.sh and easyinstall_config.py to your server,
+then optionally launches the full WordPress server setup.
 
 Options:
   (no args)      Install files, then prompt to run full setup
@@ -480,12 +539,29 @@ Options:
   --status       Show status of all installed files
   --help         Show this help message
 
+Environment variables:
+  EASYINSTALL_SH_URL=https://...   URL to fetch easyinstall.sh
+  EASYINSTALL_PY_URL=https://...   URL to fetch easyinstall_config.py
+
+File resolution order (for both .sh and .py files):
+  1. Same directory as install.sh
+  2. /tmp/easyinstall.sh  and  /tmp/easyinstall_config.py
+  3. URL specified via environment variable
+
 Examples:
-  # One-liner installation (from your Cloudflare Worker):
-  curl -fsSL https://YOUR_WORKER.workers.dev/install.sh | sudo bash
+  # All 3 files in same directory:
+  sudo bash install.sh
+
+  # Install files only, run later:
+  sudo bash install.sh --no-run
 
   # Install and immediately run full setup:
-  curl -fsSL https://YOUR_WORKER.workers.dev/install.sh | sudo bash -s -- --run
+  sudo bash install.sh --run
+
+  # Download files from remote URLs:
+  EASYINSTALL_SH_URL=https://example.com/easyinstall.sh \
+  EASYINSTALL_PY_URL=https://example.com/easyinstall_config.py \
+  sudo bash install.sh --run
 HELP
                 exit 0
                 ;;
@@ -495,7 +571,7 @@ HELP
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — MAIN
+# SECTION 10 — MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 main() {
@@ -503,7 +579,7 @@ main() {
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║   EasyInstall v${INSTALLER_VERSION} HYBRID — File Installer             ║${NC}"
-    echo -e "${GREEN}║   One-liner installation from GitHub                     ║${NC}"
+    echo -e "${GREEN}║   Bash dependency layer + Python configuration layer     ║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -511,10 +587,10 @@ main() {
     mkdir -p "$LOG_DIR" 2>/dev/null || true
     echo "=== Installer started: $(date) ===" >> "$INSTALL_LOG" 2>/dev/null || true
 
-    # Parse CLI flags
+    # Parse CLI flags FIRST — --help, --status exit early (no root needed)
     parse_args "$@"
 
-    # Preflight checks
+    # ── Preflight ─────────────────────────────────────────────────────────
     check_root
     check_os
     check_disk
@@ -522,34 +598,29 @@ main() {
     ensure_python3
     ensure_downloader
 
-    # Reinstall mode
+    # ── Reinstall: clear old first ────────────────────────────────────────
     [[ "$OPT_REINSTALL" == true ]] && do_reinstall
 
-    # DOWNLOAD FILES FROM GITHUB
-    download_all_files
-
-    # Validate downloaded files
+    # ── Resolve source files ──────────────────────────────────────────────
+    locate_sources
     validate_sources
 
-    # Install files
+    # ── Install ───────────────────────────────────────────────────────────
     create_directories
     install_files
     install_launcher
     write_version_info
     patch_path
 
-    # Clean up temp files
-    cleanup
-
-    # Smoke tests
+    # ── Verify ───────────────────────────────────────────────────────────
     smoke_test
 
-    # Summary
+    # ── Summary ───────────────────────────────────────────────────────────
     print_summary
 
-    # ═══════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     # DECIDE WHETHER TO RUN THE FULL SERVER SETUP
-    # ═══════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════
     if [[ "$OPT_NO_RUN" == true ]]; then
         log "INFO" "--no-run: skipping server setup (run later with: sudo easyinstall-install)"
         exit 0
@@ -559,28 +630,50 @@ main() {
         echo ""
         log "STEP" "--run flag: launching full WordPress server setup now…"
         echo ""
-        # Don't use exec - just call it normally
-        bash "$INSTALL_DIR/easyinstall.sh"
-        exit $?
+        exec bash "$INSTALL_DIR/easyinstall.sh"
+        # exec replaces this process — nothing below runs if exec succeeds
     fi
 
-    # Interactive prompt
+    # ── Detect piped stdin (e.g. wget ... | bash) ───────────────────────
+    # When stdin is a pipe, `read` gets EOF immediately and the script
+    # crashes. Detect this case and skip the interactive prompt entirely.
+    PIPED_STDIN=false
+    if [[ ! -t 0 ]]; then
+        PIPED_STDIN=true
+    fi
+
+    # Interactive prompt — only shown when running from a real terminal
+    if [[ "$PIPED_STDIN" == true ]]; then
+        echo ""
+        echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║  🎉  Installation complete!                               ║${NC}"
+        echo -e "${GREEN}╠══════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${GREEN}║  Detected: running via pipe (wget/curl | bash)           ║${NC}"
+        echo -e "${GREEN}║  Interactive prompt skipped — run setup manually:        ║${NC}"
+        echo -e "${GREEN}║                                                            ║${NC}"
+        echo -e "${GREEN}║    sudo easyinstall-install                               ║${NC}"
+        echo -e "${GREEN}║                                                            ║${NC}"
+        echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        exit 0
+    fi
+
     echo ""
     echo -e "${YELLOW}┌──────────────────────────────────────────────────────────┐${NC}"
     echo -e "${YELLOW}│  Files are installed and ready.                           │${NC}"
     echo -e "${YELLOW}│                                                            │${NC}"
     echo -e "${YELLOW}│  Run the full WordPress server setup now?                 │${NC}"
+    echo -e "${YELLOW}│  (Nginx · PHP · MariaDB · Redis · SSL · Auto-tuning)      │${NC}"
     echo -e "${YELLOW}└──────────────────────────────────────────────────────────┘${NC}"
     echo ""
-    read -r -p "  Start full server setup now? [Y/n]: " answer
+    read -r -p "  Start full server setup now? [Y/n]: " answer </dev/tty
     answer="${answer:-Y}"
 
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         echo ""
         log "STEP" "Launching full WordPress server setup…"
         echo ""
-        # Don't use exec - just call it normally
-        bash "$INSTALL_DIR/easyinstall.sh"
+        exec bash "$INSTALL_DIR/easyinstall.sh" </dev/tty
     else
         echo ""
         log "SUCCESS" "Skipped. Run the server setup any time with:"
@@ -590,5 +683,4 @@ main() {
     fi
 }
 
-# Run main function
 main "$@"
