@@ -3,16 +3,20 @@
 # ============================================
 # EasyInstall v6.4 HYBRID EDITION — Installer
 # ============================================
-# Installs both:
+# Downloads and installs:
 #   • easyinstall.sh         (Bash: dependency layer)
 #   • easyinstall_config.py  (Python: configuration layer)
 #
-# Usage (local — all 3 files in same directory):
+# One-liner usage (downloads files automatically from GitHub):
+#   wget -qO- https://raw.githubusercontent.com/sugandodrai/easyinstall/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sugandodrai/easyinstall/main/install.sh | bash
+#
+# Local usage (all 3 files in same directory):
 #   sudo bash install.sh
 #
-# Usage (download from URLs):
-#   EASYINSTALL_SH_URL=https://example.com/easyinstall.sh \
-#   EASYINSTALL_PY_URL=https://example.com/easyinstall_config.py \
+# Custom mirror (if GitHub is blocked):
+#   EASYINSTALL_SH_URL=https://your.mirror.com/easyinstall.sh \
+#   EASYINSTALL_PY_URL=https://your.mirror.com/easyinstall_config.py \
 #   sudo bash install.sh
 #
 # Flags:
@@ -51,8 +55,14 @@ LOG_DIR="/var/log/easyinstall"
 INSTALL_LOG="$LOG_DIR/installer.log"
 
 # Source-file URLs (override via env if hosting remotely)
-EASYINSTALL_SH_URL="${EASYINSTALL_SH_URL:-}"
-EASYINSTALL_PY_URL="${EASYINSTALL_PY_URL:-}"
+# ── Default download URLs — GitHub primary + jsDelivr mirror ─────────────────
+# Set EASYINSTALL_SH_URL / EASYINSTALL_PY_URL env vars to use a custom host.
+_GITHUB_BASE="https://raw.githubusercontent.com/sugandodrai/easyinstall/main"
+_MIRROR_BASE="https://cdn.jsdelivr.net/gh/sugandodrai/easyinstall@main"
+EASYINSTALL_SH_URL="${EASYINSTALL_SH_URL:-${_GITHUB_BASE}/easyinstall.sh}"
+EASYINSTALL_PY_URL="${EASYINSTALL_PY_URL:-${_GITHUB_BASE}/easyinstall_config.py}"
+_MIRROR_SH_URL="${_MIRROR_BASE}/easyinstall.sh"
+_MIRROR_PY_URL="${_MIRROR_BASE}/easyinstall_config.py"
 
 # Runtime flags (set by parse_args)
 OPT_REINSTALL=false
@@ -164,13 +174,73 @@ ensure_downloader() {
 # Priority: same dir → /tmp → env-var URL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_download() {
+# ── Download a file, verifying it is not an HTML page ────────────────────────
+_fetch() {
     local url="$1" dest="$2"
     if command -v curl &>/dev/null; then
-        curl -fsSL --retry 3 --retry-delay 3 "$url" -o "$dest"
+        curl -fsSL --retry 2 --retry-delay 3 --max-time 30 "$url" -o "$dest" 2>/dev/null
     else
-        wget -q --tries=3 --timeout=20 "$url" -O "$dest"
+        wget -q --tries=2 --timeout=30 "$url" -O "$dest" 2>/dev/null
     fi
+    return $?
+}
+
+_is_html() {
+    # Returns 0 (true) if the file looks like an HTML page, not a shell/python script
+    local file="$1"
+    [[ ! -f "$file" ]] && return 0            # missing = bad
+    [[ ! -s "$file" ]] && return 0            # empty = bad
+    local first
+    first=$(head -c 200 "$file" | tr '[:upper:]' '[:lower:]')
+    # Detect HTML responses: ISP block pages, 404 pages, login walls, etc.
+    if echo "$first" | grep -qE '<!doctype html|<html|<head|<meta|<iframe|<body'; then
+        return 0   # is HTML — bad
+    fi
+    return 1       # not HTML — good
+}
+
+_download() {
+    local name="$1" primary_url="$2" mirror_url="$3" dest="$4"
+
+    # ── Try primary URL ───────────────────────────────────────────────────
+    log "INFO" "Downloading ${name} from primary source..."
+    if _fetch "$primary_url" "$dest" && ! _is_html "$dest"; then
+        log "SUCCESS" "Downloaded ${name}"
+        return 0
+    fi
+
+    # Primary failed or returned HTML — check if it's an ISP block page
+    if [[ -f "$dest" ]] && _is_html "$dest"; then
+        local block_ref
+        block_ref=$(grep -oE 'src="[^"]*"' "$dest" 2>/dev/null | head -1 | tr -d '"' | sed 's/src=//' || echo "unknown")
+        log "WARNING" "Primary URL returned an HTML page (ISP/firewall block detected)"
+        [[ "$block_ref" != "unknown" && -n "$block_ref" ]] &&             log "INFO"    "  Block page URL: $block_ref"
+        rm -f "$dest"
+    else
+        log "WARNING" "Primary URL failed — trying mirror..."
+    fi
+
+    # ── Try mirror URL ────────────────────────────────────────────────────
+    if [[ -n "$mirror_url" ]]; then
+        log "INFO" "Downloading ${name} from mirror..."
+        if _fetch "$mirror_url" "$dest" && ! _is_html "$dest"; then
+            log "SUCCESS" "Downloaded ${name} (mirror)"
+            return 0
+        fi
+        [[ -f "$dest" ]] && _is_html "$dest" && log "WARNING" "Mirror also returned HTML" && rm -f "$dest"
+    fi
+
+    # ── Both failed ───────────────────────────────────────────────────────
+    log "ERROR" "Could not download ${name} from any source."
+    log "INFO"  "Possible causes:"
+    log "INFO"  "  • Your ISP or firewall is blocking GitHub/jsDelivr"
+    log "INFO"  "  • No internet connectivity"
+    log "INFO"  "  • Repository URL has changed"
+    log "INFO"  "Manual fix — download on another machine and copy to server:"
+    log "INFO"  "  Primary : $primary_url"
+    log "INFO"  "  Mirror  : $mirror_url"
+    log "INFO"  "  Then run: sudo bash install.sh  (with files in same dir)"
+    return 1
 }
 
 locate_sources() {
@@ -190,34 +260,38 @@ locate_sources() {
     [[ -z "$PY_SOURCE" && -f "/tmp/easyinstall_config.py" ]] && PY_SOURCE="/tmp/easyinstall_config.py"
 
     # Download from URL if still missing
-    if [[ -z "$SH_SOURCE" && -n "$EASYINSTALL_SH_URL" ]]; then
-        log "INFO" "Downloading easyinstall.sh …"
-        _download "$EASYINSTALL_SH_URL" "/tmp/easyinstall.sh"
-        SH_SOURCE="/tmp/easyinstall.sh"
-        log "SUCCESS" "Downloaded easyinstall.sh"
-    fi
+    # ── 3. Download from GitHub (primary) with jsDelivr mirror fallback ───
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/easyinstall-XXXXXX)
+    trap "rm -rf '$tmpdir'" EXIT
 
-    if [[ -z "$PY_SOURCE" && -n "$EASYINSTALL_PY_URL" ]]; then
-        log "INFO" "Downloading easyinstall_config.py …"
-        _download "$EASYINSTALL_PY_URL" "/tmp/easyinstall_config.py"
-        PY_SOURCE="/tmp/easyinstall_config.py"
-        log "SUCCESS" "Downloaded easyinstall_config.py"
-    fi
-
-    # Hard fail if still missing
     if [[ -z "$SH_SOURCE" ]]; then
-        log "ERROR" "Cannot find easyinstall.sh — options:"
-        log "INFO"  "  1. Place easyinstall.sh alongside install.sh"
-        log "INFO"  "  2. EASYINSTALL_SH_URL=https://... sudo bash install.sh"
-        log "INFO"  "  3. Copy to /tmp/easyinstall.sh"
-        exit 1
+        log "STEP" "Downloading easyinstall.sh..."
+        if _download "easyinstall.sh" \
+                     "$EASYINSTALL_SH_URL" \
+                     "$_MIRROR_SH_URL" \
+                     "$tmpdir/easyinstall.sh"; then
+            SH_SOURCE="$tmpdir/easyinstall.sh"
+        fi
     fi
 
     if [[ -z "$PY_SOURCE" ]]; then
-        log "ERROR" "Cannot find easyinstall_config.py — options:"
-        log "INFO"  "  1. Place easyinstall_config.py alongside install.sh"
-        log "INFO"  "  2. EASYINSTALL_PY_URL=https://... sudo bash install.sh"
-        log "INFO"  "  3. Copy to /tmp/easyinstall_config.py"
+        log "STEP" "Downloading easyinstall_config.py..."
+        if _download "easyinstall_config.py" \
+                     "$EASYINSTALL_PY_URL" \
+                     "$_MIRROR_PY_URL" \
+                     "$tmpdir/easyinstall_config.py"; then
+            PY_SOURCE="$tmpdir/easyinstall_config.py"
+        fi
+    fi
+
+    # ── Hard fail if still missing ─────────────────────────────────────────
+    if [[ -z "$SH_SOURCE" || ! -f "$SH_SOURCE" ]]; then
+        log "ERROR" "easyinstall.sh could not be found or downloaded."
+        exit 1
+    fi
+    if [[ -z "$PY_SOURCE" || ! -f "$PY_SOURCE" ]]; then
+        log "ERROR" "easyinstall_config.py could not be found or downloaded."
         exit 1
     fi
 
@@ -611,6 +685,9 @@ main() {
     install_launcher
     write_version_info
     patch_path
+
+    # ── Clean up the download tmpdir (files already copied) ───────────────
+    # The tmpdir trap in locate_sources handles cleanup on EXIT automatically.
 
     # ── Verify ───────────────────────────────────────────────────────────
     smoke_test
