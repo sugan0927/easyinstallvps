@@ -23,7 +23,7 @@ LOG_DIR="/var/log/easyinstall"
 INSTALL_LOG="$LOG_DIR/installer.log"
 TMP_DIR="/tmp/easyinstall-$$"  # Unique temp directory
 
-# Default GitHub repository (change if you fork)
+# Default GitHub repository (using your repo)
 GITHUB_RAW="https://raw.githubusercontent.com/sugan0927/easyinstallvps/main"
 
 # Source-file URLs (can be overridden via env)
@@ -525,7 +525,7 @@ main() {
     # Reinstall mode
     [[ "$OPT_REINSTALL" == true ]] && do_reinstall
 
-    # DOWNLOAD FILES FROM GITHUB (this is the key fix!)
+    # DOWNLOAD FILES FROM GITHUB
     download_all_files
 
     # Validate downloaded files
@@ -547,7 +547,9 @@ main() {
     # Summary
     print_summary
 
-    # Decide whether to run full server setup
+    # ═══════════════════════════════════════════════════════════
+    # DECIDE WHETHER TO RUN THE FULL SERVER SETUP
+    # ═══════════════════════════════════════════════════════════
     if [[ "$OPT_NO_RUN" == true ]]; then
         log "INFO" "--no-run: skipping server setup (run later with: sudo easyinstall-install)"
         exit 0
@@ -557,7 +559,9 @@ main() {
         echo ""
         log "STEP" "--run flag: launching full WordPress server setup now…"
         echo ""
-        exec bash "$INSTALL_DIR/easyinstall.sh"
+        # Don't use exec - just call it normally
+        bash "$INSTALL_DIR/easyinstall.sh"
+        exit $?
     fi
 
     # Interactive prompt
@@ -575,7 +579,8 @@ main() {
         echo ""
         log "STEP" "Launching full WordPress server setup…"
         echo ""
-        exec bash "$INSTALL_DIR/easyinstall.sh"
+        # Don't use exec - just call it normally
+        bash "$INSTALL_DIR/easyinstall.sh"
     else
         echo ""
         log "SUCCESS" "Skipped. Run the server setup any time with:"
