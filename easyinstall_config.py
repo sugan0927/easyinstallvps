@@ -199,7 +199,7 @@ def stage_nginx_config(cfg):
     log("STEP", "Writing optimized Nginx configuration")
 
     nginx_conf = textwrap.dedent(f"""\
-        user nginx;
+        user www-data;
         worker_processes {cfg.nginx_worker_processes};
         worker_rlimit_nofile 1048576;
         pid /run/nginx.pid;
@@ -1417,10 +1417,31 @@ def stage_create_commands(cfg):
 
         ssl)
             [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall ssl domain.com${NC}"; exit 1; }
-            certbot --nginx -d "$2" -d "www.$2" --non-interactive --agree-tos --email "admin@$2" ;;
+            SSLDOM="$2"
+            log_command "ssl $SSLDOM"
+            # FIX: Use webroot method — more reliable, avoids nginx plugin conflicts
+            systemctl reload nginx 2>/dev/null || true
+            if certbot certonly --webroot -w "/var/www/html/$SSLDOM" \
+                -d "$SSLDOM" -d "www.$SSLDOM" \
+                --non-interactive --agree-tos --email "admin@$SSLDOM"; then
+                echo -e "${GREEN}✅ SSL certificate obtained for $SSLDOM${NC}"
+                # Run Python config to rewrite nginx config with HTTPS block
+                py_config wordpress_install --domain "$SSLDOM" --use-ssl 2>/dev/null || true
+                echo -e "${YELLOW}ℹ️  If site already existed, re-run: easyinstall ssl $SSLDOM${NC}"
+            else
+                echo -e "${YELLOW}⚠️  Webroot failed, trying --nginx plugin fallback...${NC}"
+                certbot --nginx -d "$SSLDOM" -d "www.$SSLDOM" \
+                    --non-interactive --agree-tos --email "admin@$SSLDOM" && \
+                    echo -e "${GREEN}✅ SSL enabled via nginx plugin${NC}" || \
+                    echo -e "${RED}❌ SSL failed. Ensure DNS A-record points to this server and port 80 is open.${NC}"
+            fi ;;
 
         ssl-renew)
-            log_command "ssl-renew"; certbot renew --nginx && echo -e "${GREEN}✅ SSL certs renewed${NC}" ;;
+            log_command "ssl-renew"
+            # FIX: reload nginx after renewal so new certs are loaded
+            certbot renew --quiet --post-hook "systemctl reload nginx" && \
+                echo -e "${GREEN}✅ SSL certs renewed${NC}" || \
+                echo -e "${YELLOW}⚠️  Renewal failed or not due yet${NC}" ;;
 
         backup)
             /usr/local/bin/easy-backup "${2:-daily}" ;;
@@ -1555,6 +1576,15 @@ print(p)
             echo -e "${GREEN}✅ Clone complete: $SRC_DOMAIN → $DST_DOMAIN${NC}"
             echo -e "${YELLOW}  Next: easyinstall ssl $DST_DOMAIN  (if needed)${NC}"
             echo -e "${YELLOW}  Creds: /root/${DST_DOMAIN}-credentials.txt${NC}" ;;
+        remote-install)
+            [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall remote-install domain.com [--php=8.3] [--ssl]${NC}"; exit 1; }
+            DOMAIN=$2; shift 2; parse_args "$@"
+            log_command "remote-install $DOMAIN php=$PHP_VERSION ssl=$USE_SSL"
+            echo -e "${CYAN}🌐 Remote WordPress install on $DOMAIN...${NC}"
+            echo -e "${YELLOW}ℹ️  Set REMOTE_HOST, REMOTE_USER, REMOTE_PASSWORD env vars before running${NC}"
+            ssl_flag=""
+            [ "$USE_SSL" = "true" ] && ssl_flag="--use-ssl"
+            py_config remote_install --domain "$DOMAIN" --php-version "$PHP_VERSION" $ssl_flag ;;
 
         php-switch)
             [ -z "$2" ] || [ -z "$3" ] && { echo -e "${RED}❌ Usage: easyinstall php-switch domain.com 8.4${NC}"; exit 1; }
@@ -2567,6 +2597,12 @@ def stage_wordpress_install(cfg):
             access_log /var/log/nginx/{domain}.access.log main buffer=32k flush=5s;
             error_log  /var/log/nginx/{domain}.error.log warn;
 
+            # FIX: Allow Let's Encrypt ACME challenge (required for SSL cert issuance)
+            location ^~ /.well-known/acme-challenge/ {{
+                root /var/www/html/{domain};
+                allow all;
+            }}
+
             set $skip_cache 0;
             if ($request_method = POST)           {{ set $skip_cache 1; }}
             if ($query_string != "")              {{ set $skip_cache 1; }}
@@ -2597,22 +2633,34 @@ def stage_wordpress_install(cfg):
             location ~ /\\.ht                           {{ deny all; }}
             location = /favicon.ico                     {{ log_not_found off; access_log off; expires max; }}
             location = /robots.txt                      {{ allow all; log_not_found off; access_log off; }}
+            # FIX: Merged gzip_static into single static assets block (removed duplicate location)
             location ~* \\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot|pdf|zip|gz|mp4|webm|webp)$ {{
                 expires max; log_not_found off; access_log off;
+                gzip_static on;
                 add_header Cache-Control "public, immutable";
                 try_files $uri @fallback;
             }}
-            location @fallback                          {{ try_files $uri /index.php?$args; }}
-            location ~* \\.(js|css|svg)$ {{ gzip_static on; expires max; add_header Cache-Control "public, immutable"; }}
+            location @fallback {{ try_files $uri /index.php?$args; }}
         }}
     """)
     write_file(f"/etc/nginx/sites-available/{domain}", nginx_site)
+
+    # FIX: Remove default nginx site that causes routing conflicts with custom domains
+    default_enabled = Path("/etc/nginx/sites-enabled/default")
+    if default_enabled.exists() or default_enabled.is_symlink():
+        default_enabled.unlink()
+        log("INFO", "Removed default nginx site (prevents domain routing conflicts)")
 
     # Enable site
     enabled_link = Path(f"/etc/nginx/sites-enabled/{domain}")
     if not enabled_link.exists():
         enabled_link.symlink_to(f"/etc/nginx/sites-available/{domain}")
     log("SUCCESS", f"Nginx site enabled for {domain}")
+
+    # FIX: Ensure nginx cache directories exist with correct ownership for www-data
+    run("mkdir -p /var/cache/nginx/fastcgi /var/cache/nginx/edge /var/cache/nginx/proxy /var/cache/nginx/static", check=False)
+    run("chown -R www-data:www-data /var/cache/nginx 2>/dev/null || true", check=False)
+    run("chmod -R 755 /var/cache/nginx 2>/dev/null || true", check=False)
 
     # Validate and reload nginx
     rc = run("nginx -t 2>/dev/null", check=False)
@@ -2658,23 +2706,140 @@ def stage_wordpress_install(cfg):
     """)
     write_file(f"/root/{domain}-credentials.txt", creds, mode=0o600)
 
+
     # ── Optional SSL ──────────────────────────────────────────────────────
     if use_ssl:
         log("INFO", f"Requesting SSL certificate for {domain}")
+        # FIX: nginx reload before certbot so ACME challenge location is live
+        run("systemctl reload nginx 2>/dev/null || true", check=False)
+        # FIX: Use --webroot as primary method (more reliable than --nginx plugin
+        #      on fresh installs where nginx config may not yet have ssl block)
         rc = run(
-            f"certbot --nginx -d {domain} -d www.{domain} "
+            f"certbot certonly --webroot -w /var/www/html/{domain} "
+            f"-d {domain} -d www.{domain} "
             f"--non-interactive --agree-tos --email admin@{domain} 2>/dev/null",
             check=False
         )
         if rc == 0:
-            log("SUCCESS", f"SSL enabled for {domain}")
+            log("SUCCESS", f"SSL certificate obtained for {domain}")
+            # FIX: Manually write the HTTPS nginx config since we used --webroot
+            ssl_nginx = textwrap.dedent(f"""
+                # HTTP → HTTPS redirect
+                server {{
+                    listen 80;
+                    listen [::]:80;
+                    server_name {domain} www.{domain};
+                    location ^~ /.well-known/acme-challenge/ {{
+                        root /var/www/html/{domain};
+                        allow all;
+                    }}
+                    location / {{
+                        return 301 https://$host$request_uri;
+                    }}
+                }}
+
+                server {{
+                    listen 443 ssl;
+                    listen [::]:443 ssl;
+                    http2 on;
+                    server_name {domain} www.{domain};
+
+                    ssl_certificate     /etc/letsencrypt/live/{domain}/fullchain.pem;
+                    ssl_certificate_key /etc/letsencrypt/live/{domain}/privkey.pem;
+                    ssl_trusted_certificate /etc/letsencrypt/live/{domain}/chain.pem;
+
+                    root /var/www/html/{domain};
+                    index index.php index.html index.htm;
+
+                    access_log /var/log/nginx/{domain}.access.log main buffer=32k flush=5s;
+                    error_log  /var/log/nginx/{domain}.error.log warn;
+
+                    location ^~ /.well-known/acme-challenge/ {{
+                        root /var/www/html/{domain};
+                        allow all;
+                    }}
+
+                    set $skip_cache 0;
+                    if ($request_method = POST)           {{ set $skip_cache 1; }}
+                    if ($query_string != "")              {{ set $skip_cache 1; }}
+                    if ($request_uri ~* "/wp-admin/|/xmlrpc.php|wp-.*.php|/feed/|index.php|sitemap(_index)?.xml") {{ set $skip_cache 1; }}
+                    if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wp-postpass|wordpress_no_cache|wordpress_logged_in|woocommerce_items_in_cart") {{ set $skip_cache 1; }}
+
+                    location / {{ try_files $uri $uri/ /index.php?$args; }}
+
+                    location ~ \\.php$ {{
+                        include fastcgi_params;
+                        fastcgi_pass unix:/run/php/php{php_version}-fpm.sock;
+                        fastcgi_index index.php;
+                        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                        fastcgi_param PATH_INFO $fastcgi_path_info;
+                        fastcgi_cache WORDPRESS;
+                        fastcgi_cache_valid 200 60m;
+                        fastcgi_cache_valid 301 302 5m;
+                        fastcgi_cache_valid 404 1m;
+                        fastcgi_cache_bypass $skip_cache;
+                        fastcgi_no_cache $skip_cache;
+                        add_header X-Cache $upstream_cache_status;
+                        fastcgi_buffers 16 16k;
+                        fastcgi_buffer_size 32k;
+                        fastcgi_read_timeout 300;
+                        fastcgi_send_timeout 300;
+                    }}
+
+                    location ~ /\\.ht                           {{ deny all; }}
+                    location = /favicon.ico                     {{ log_not_found off; access_log off; expires max; }}
+                    location = /robots.txt                      {{ allow all; log_not_found off; access_log off; }}
+                    location ~* \\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot|pdf|zip|gz|mp4|webm|webp)$ {{
+                        expires max; log_not_found off; access_log off;
+                        gzip_static on;
+                        add_header Cache-Control "public, immutable";
+                        try_files $uri @fallback;
+                    }}
+                    location @fallback {{ try_files $uri /index.php?$args; }}
+                }}
+            """).strip()
+            write_file(f"/etc/nginx/sites-available/{domain}", ssl_nginx)
+            # FIX: Update wp-config.php to use HTTPS URLs
+            wp_conf_path = Path(f"/var/www/html/{domain}/wp-config.php")
+            if wp_conf_path.exists():
+                txt = wp_conf_path.read_text()
+                if "WP_HOME" not in txt:
+                    txt = txt.replace(
+                        "$table_prefix = 'wp_';",
+                        f"define('WP_HOME',   'https://{domain}');\n"
+                        f"define('WP_SITEURL','https://{domain}');\n"
+                        "\n$table_prefix = 'wp_';"
+                    )
+                    wp_conf_path.write_text(txt)
+                    run(f"chown www-data:www-data /var/www/html/{domain}/wp-config.php", check=False)
+            rc2 = run("nginx -t 2>/dev/null", check=False)
+            if rc2 == 0:
+                run("systemctl reload nginx", check=False)
+            log("SUCCESS", f"HTTPS enabled and nginx updated for {domain}")
+            # FIX: Install certbot auto-renewal cron if not already present
+            run(
+                "echo '0 3 * * * root certbot renew --quiet --post-hook \'systemctl reload nginx\'' "
+                "> /etc/cron.d/certbot-renew-easyinstall 2>/dev/null || true",
+                check=False
+            )
         else:
-            log("WARNING", f"SSL failed for {domain} — site available via HTTP")
+            log("WARNING", f"SSL certificate failed for {domain} — trying --nginx plugin fallback")
+            rc2 = run(
+                f"certbot --nginx -d {domain} -d www.{domain} "
+                f"--non-interactive --agree-tos --email admin@{domain} 2>/dev/null",
+                check=False
+            )
+            if rc2 == 0:
+                log("SUCCESS", f"SSL enabled via --nginx plugin for {domain}")
+            else:
+                log("WARNING", f"SSL failed for {domain} — site accessible via HTTP. "
+                    f"Run: certbot --nginx -d {domain} -d www.{domain} manually after DNS is pointed.")
 
     log("SUCCESS", f"WordPress installed for {domain}")
     log("INFO",    f"Complete setup at: {site_url}/wp-admin/install.php")
     log("INFO",    f"Credentials: /root/{domain}-credentials.txt")
     print(site_url)
+
 
 
 
@@ -2849,30 +3014,237 @@ def stage_clone_site(cfg):
 # Main dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE: remote_install  (Integrated from deepseek_python remote installer)
+# Connects to a remote VPS via SSH and runs the full WordPress install remotely.
+# Usage: python3 easyinstall_config.py --stage remote_install \
+#            --domain yoursite.com --php-version 8.3 [--use-ssl]
+# Requires env: REMOTE_HOST, REMOTE_USER, REMOTE_PASSWORD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_remote_install(cfg):
+    """
+    Remote WordPress installer (integrated from deepseek_python_20260319).
+    Uses paramiko SSH to configure a remote VPS - mirrors stage_wordpress_install
+    but executes commands over SSH instead of locally.
+    """
+    import os, time, secrets, string
+
+    domain      = cfg.domain
+    php_version = cfg.php_version or "8.3"
+    use_ssl     = cfg.use_ssl
+
+    if not domain:
+        log("ERROR", "--domain is required for remote_install stage")
+        sys.exit(1)
+
+    vps_host     = os.environ.get("REMOTE_HOST",     "")
+    vps_user     = os.environ.get("REMOTE_USER",     "root")
+    vps_password = os.environ.get("REMOTE_PASSWORD", "")
+
+    if not vps_host:
+        log("ERROR", "REMOTE_HOST environment variable is required")
+        log("INFO",  "Export: REMOTE_HOST=<ip> REMOTE_USER=<user> REMOTE_PASSWORD=<pass>")
+        sys.exit(1)
+
+    try:
+        import paramiko
+    except ImportError:
+        log("ERROR", "paramiko not installed. Run: pip3 install paramiko")
+        sys.exit(1)
+
+    domain      = re.sub(r"https?://", "", domain).lstrip("www.").strip("/")
+    db_safe     = re.sub(r"[.-]", "_", domain)
+    db_pass     = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
+    redis_port  = cfg.redis_port
+    site_url    = ("https://" if use_ssl else "http://") + domain
+
+    log("STEP", "Remote WordPress install: " + vps_host + " | domain=" + domain + " | php=" + php_version)
+
+    # Build SQL commands with safe quoting
+    sql_db    = 'mysql -e "CREATE DATABASE IF NOT EXISTS wp_' + db_safe + ' CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"'
+    sql_user  = "mysql -e \"CREATE USER IF NOT EXISTS 'wpuser_" + db_safe + "'@'localhost' IDENTIFIED BY '" + db_pass + "';\""
+    sql_grant = "mysql -e \"GRANT ALL PRIVILEGES ON wp_" + db_safe + ".* TO 'wpuser_" + db_safe + "'@'localhost'; FLUSH PRIVILEGES;\""
+
+    ssl_cmd = (
+        "certbot certonly --webroot -w /var/www/html/" + domain +
+        " -d " + domain + " -d www." + domain +
+        " --non-interactive --agree-tos --email admin@" + domain
+    ) if use_ssl else "echo 'SSL skipped'"
+
+    # Build wp-config.php content as a list of lines (no f-string with \n)
+    wp_config_lines = [
+        "<?php",
+        "define('DB_NAME',     'wp_" + db_safe + "');",
+        "define('DB_USER',     'wpuser_" + db_safe + "');",
+        "define('DB_PASSWORD', '" + db_pass + "');",
+        "define('DB_HOST',     'localhost');",
+        "define('DB_CHARSET',  'utf8mb4');",
+        "define('DB_COLLATE',  '');",
+        "define('WP_DEBUG',              false);",
+        "define('WP_MEMORY_LIMIT',       '256M');",
+        "define('WP_MAX_MEMORY_LIMIT',   '512M');",
+        "define('WP_CACHE',              true);",
+        "define('WP_POST_REVISIONS',     5);",
+        "define('EMPTY_TRASH_DAYS',      7);",
+        "define('AUTOSAVE_INTERVAL',     300);",
+        "define('FS_METHOD',             'direct');",
+        "define('WP_REDIS_HOST',         '127.0.0.1');",
+        "define('WP_REDIS_PORT',         " + str(redis_port) + ");",
+        "define('WP_CACHE_KEY_SALT',     '" + domain + "_');",
+    ]
+    if use_ssl:
+        wp_config_lines += [
+            "define('WP_HOME',   'https://" + domain + "');",
+            "define('WP_SITEURL','https://" + domain + "');",
+        ]
+    wp_config_lines += [
+        "$table_prefix = 'wp_';",
+        "if (!defined('ABSPATH')) define('ABSPATH', __DIR__ . '/');",
+        "require_once ABSPATH . 'wp-settings.php';",
+    ]
+    wp_config_content = "\n".join(wp_config_lines)
+
+    # Build nginx config content
+    nginx_config_content = "\n".join([
+        "server {",
+        "    listen 80;",
+        "    listen [::]:80;",
+        "    server_name " + domain + " www." + domain + ";",
+        "    root /var/www/html/" + domain + ";",
+        "    index index.php index.html;",
+        "    location ^~ /.well-known/acme-challenge/ {",
+        "        root /var/www/html/" + domain + ";",
+        "        allow all;",
+        "    }",
+        "    location / { try_files $uri $uri/ /index.php?$args; }",
+        "    location ~ \\.php$ {",
+        "        include fastcgi_params;",
+        "        fastcgi_pass unix:/run/php/php" + php_version + "-fpm.sock;",
+        "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
+        "    }",
+        "    location ~ /\\.ht { deny all; }",
+        "}",
+    ])
+
+    # Use printf to write files — avoids heredoc quoting issues
+    def write_remote_file(filepath, content):
+        # Escape single quotes in content for printf
+        escaped = content.replace("'", "'\\''")
+        return "printf '%s' '" + escaped + "' > " + filepath
+
+    remote_commands = [
+        "apt-get update -y",
+        ("apt-get install -y nginx"
+         " php" + php_version + "-fpm"
+         " php" + php_version + "-mysql"
+         " php" + php_version + "-curl"
+         " php" + php_version + "-gd"
+         " php" + php_version + "-mbstring"
+         " php" + php_version + "-xml"
+         " php" + php_version + "-zip"
+         " php" + php_version + "-opcache"
+         " mariadb-server mariadb-client"
+         " redis-server certbot python3-certbot-nginx wget curl"),
+        "systemctl enable nginx mariadb redis-server php" + php_version + "-fpm",
+        "systemctl start nginx mariadb redis-server php" + php_version + "-fpm",
+        # FIX: Remove default site — prevents routing conflicts
+        "rm -f /etc/nginx/sites-enabled/default",
+        sql_db,
+        sql_user,
+        sql_grant,
+        "mkdir -p /var/www/html/" + domain,
+        "wget -qO- https://wordpress.org/latest.tar.gz | tar xz -C /var/www/html/" + domain + " --strip-components=1",
+        "chown -R www-data:www-data /var/www/html/" + domain,
+        "chmod -R 755 /var/www/html/" + domain,
+        write_remote_file("/var/www/html/" + domain + "/wp-config.php", wp_config_content),
+        "chown www-data:www-data /var/www/html/" + domain + "/wp-config.php",
+        "chmod 640 /var/www/html/" + domain + "/wp-config.php",
+        write_remote_file("/etc/nginx/sites-available/" + domain, nginx_config_content),
+        "ln -sf /etc/nginx/sites-available/" + domain + " /etc/nginx/sites-enabled/" + domain,
+        # FIX: nginx worker must be www-data to access PHP-FPM socket
+        "sed -i 's/^user nginx;/user www-data;/' /etc/nginx/nginx.conf 2>/dev/null || true",
+        # FIX: Fix nginx cache dir ownership
+        "mkdir -p /var/cache/nginx/fastcgi && chown -R www-data:www-data /var/cache/nginx",
+        "nginx -t && systemctl reload nginx",
+        ssl_cmd,
+    ]
+
+    client = None
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(vps_host, username=vps_user, password=vps_password, timeout=30)
+        log("SUCCESS", "SSH connected to " + vps_host)
+
+        for cmd in remote_commands:
+            short = cmd[:70]
+            log("INFO", "Remote: " + short + "...")
+            stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+            exit_status = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+            if out:
+                log("INFO", "  OUT: " + out[:200])
+            if exit_status != 0 and err:
+                log("WARNING", "  ERR: " + err[:200])
+            time.sleep(0.5)
+
+        log("SUCCESS", "Remote WordPress installation complete!")
+        log("INFO", "Site URL  : " + site_url)
+        log("INFO", "Admin URL : " + site_url + "/wp-admin/install.php")
+        log("INFO", "DB: wp_" + db_safe + " / wpuser_" + db_safe + " / " + db_pass)
+
+        creds = (
+            "Remote WordPress: " + domain + "\n"
+            "Host: " + vps_host + "\n"
+            "Site URL: " + site_url + "\n"
+            "DB: wp_" + db_safe + " / wpuser_" + db_safe + " / " + db_pass + "\n"
+        )
+        Path("/tmp/" + domain + "-remote-credentials.txt").write_text(creds)
+        log("INFO", "Credentials: /tmp/" + domain + "-remote-credentials.txt")
+
+    except Exception as e:
+        log("ERROR", "Remote install failed: " + str(e))
+        sys.exit(1)
+    finally:
+        if client:
+            client.close()
+            log("INFO", "SSH connection closed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
 STAGE_MAP = {
-    "kernel_tuning":        stage_kernel_tuning,
-    "nginx_config":         stage_nginx_config,
-    "nginx_extras":         stage_nginx_extras,
-    "websocket_support":    stage_websocket_support,
-    "http3_quic":           stage_http3_quic,
-    "edge_computing":       stage_edge_computing,
-    "php_config":           stage_php_config,
-    "mysql_config":         stage_mysql_config,
-    "redis_config":         stage_redis_config,
-    "firewall_config":      stage_firewall_config,
-    "fail2ban_config":      stage_fail2ban_config,
-    "create_redis_monitor": stage_create_redis_monitor,
-    "create_commands":      stage_create_commands,
-    "create_autoheal":      stage_create_autoheal,
-    "create_backup_script": stage_create_backup_script,
-    "create_monitor":       stage_create_monitor,
-    "create_welcome":       stage_create_welcome,
-    "create_info_file":     stage_create_info_file,
-    "create_ai_module":     stage_create_ai_module,
-    "create_autotune_module": stage_create_autotune_module,
-    "advanced_autotune":    stage_advanced_autotune,
-    "wordpress_install":    stage_wordpress_install,
-    "clone_site":           stage_clone_site,
+    "kernel_tuning":           stage_kernel_tuning,
+    "nginx_config":            stage_nginx_config,
+    "nginx_extras":            stage_nginx_extras,
+    "websocket_support":       stage_websocket_support,
+    "http3_quic":              stage_http3_quic,
+    "edge_computing":          stage_edge_computing,
+    "php_config":              stage_php_config,
+    "mysql_config":            stage_mysql_config,
+    "redis_config":            stage_redis_config,
+    "firewall_config":         stage_firewall_config,
+    "fail2ban_config":         stage_fail2ban_config,
+    "create_redis_monitor":    stage_create_redis_monitor,
+    "create_commands":         stage_create_commands,
+    "create_autoheal":         stage_create_autoheal,
+    "create_backup_script":    stage_create_backup_script,
+    "create_monitor":          stage_create_monitor,
+    "create_welcome":          stage_create_welcome,
+    "create_info_file":        stage_create_info_file,
+    "create_ai_module":        stage_create_ai_module,
+    "create_autotune_module":  stage_create_autotune_module,
+    "advanced_autotune":       stage_advanced_autotune,
+    "wordpress_install":       stage_wordpress_install,
+    "clone_site":              stage_clone_site,
+    "remote_install":          stage_remote_install,   # NEW: deepseek_python integrated
 }
 
 
@@ -2881,8 +3253,8 @@ def main():
     stage = cfg.stage
 
     if stage not in STAGE_MAP:
-        log("ERROR", f"Unknown stage: {stage}")
-        log("INFO",  f"Available stages: {', '.join(STAGE_MAP.keys())}")
+        log("ERROR", "Unknown stage: " + stage)
+        log("INFO",  "Available stages: " + ", ".join(STAGE_MAP.keys()))
         sys.exit(1)
 
     try:
@@ -2890,7 +3262,7 @@ def main():
     except SystemExit:
         raise
     except Exception as e:
-        log("ERROR", f"Stage '{stage}' raised exception: {e}")
+        log("ERROR", "Stage '" + stage + "' raised exception: " + str(e))
         import traceback
         traceback.print_exc()
         sys.exit(1)

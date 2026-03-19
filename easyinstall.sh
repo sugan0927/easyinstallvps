@@ -448,8 +448,9 @@ install_nginx_packages() {
     mkdir -p /etc/nginx/{sites-available,sites-enabled,conf.d,ssl,snippets}
     mkdir -p /var/cache/nginx/{fastcgi,proxy,static,edge}
     mkdir -p /var/log/nginx
-    chown -R nginx:nginx /var/cache/nginx 2>/dev/null || \
-        chown -R www-data:www-data /var/cache/nginx 2>/dev/null || true
+    # FIX: Use www-data (matches PHP-FPM socket owner and nginx worker user in config)
+    chown -R www-data:www-data /var/cache/nginx 2>/dev/null || true
+    chmod -R 755 /var/cache/nginx 2>/dev/null || true
     log "SUCCESS" "Nginx packages installed"
 }
 
@@ -590,6 +591,8 @@ mark_redis_port_used() {
 # SECTION 18 — START/ENABLE SERVICES (BASH)
 # ============================================
 enable_start_nginx() {
+    # FIX: Remove default nginx site before starting to avoid port 80 conflict
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     systemctl enable nginx
     systemctl start nginx
     wait_for_service "nginx" 30 || return 1
