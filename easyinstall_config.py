@@ -2565,8 +2565,9 @@ def stage_wordpress_install(cfg):
         define('WP_POST_REVISIONS',        5);
         define('EMPTY_TRASH_DAYS',         7);
         define('WP_CRON_LOCK_TIMEOUT',     60);
-        define('AUTOMATIC_UPDATER_DISABLED', true);
-        define('WP_AUTO_UPDATE_CORE',      true);
+        define('AUTOMATIC_UPDATER_DISABLED', false);
+        define('WP_AUTO_UPDATE_CORE',      'minor');
+        define('FS_METHOD',                'direct');
 
         // Redis (dedicated instance)
         define('WP_REDIS_HOST',     '127.0.0.1');
@@ -3092,6 +3093,8 @@ def stage_remote_install(cfg):
         "define('EMPTY_TRASH_DAYS',      7);",
         "define('AUTOSAVE_INTERVAL',     300);",
         "define('FS_METHOD',             'direct');",
+        "define('AUTOMATIC_UPDATER_DISABLED', false);",
+        "define('WP_AUTO_UPDATE_CORE',      'minor');",
         "define('WP_REDIS_HOST',         '127.0.0.1');",
         "define('WP_REDIS_PORT',         " + str(redis_port) + ");",
         "define('WP_CACHE_KEY_SALT',     '" + domain + "_');",
