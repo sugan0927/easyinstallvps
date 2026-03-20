@@ -2565,7 +2565,7 @@ def stage_wordpress_install(cfg):
         define('WP_POST_REVISIONS',        5);
         define('EMPTY_TRASH_DAYS',         7);
         define('WP_CRON_LOCK_TIMEOUT',     60);
-        define('AUTOMATIC_UPDATER_DISABLED', true);
+        define('AUTOMATIC_UPDATER_DISABLED', false);
         define('WP_AUTO_UPDATE_CORE',      false);
 
         // Redis (dedicated instance)
