@@ -779,7 +779,6 @@ def stage_mysql_config(cfg):
         innodb_page_cleaners = 8
         innodb_buffer_pool_instances = 8
         innodb_autoinc_lock_mode = 2
-        innodb_change_buffering = all
         innodb_old_blocks_time = 1000
         innodb_stats_on_metadata = OFF
         innodb_lock_wait_timeout = 30
@@ -1846,13 +1845,41 @@ print(p)
     """)
     write_file("/usr/local/bin/easyinstall-create", create_script, mode=0o755)
 
-    # bashrc alias
+    # Create /usr/bin symlink so the command is available immediately on the
+    # current PATH without requiring `source ~/.bashrc` in the same session.
+    symlink = Path("/usr/bin/easyinstall")
+    try:
+        if symlink.exists() or symlink.is_symlink():
+            symlink.unlink()
+        symlink.symlink_to("/usr/local/bin/easyinstall")
+        log("SUCCESS", "Symlink created: /usr/bin/easyinstall -> /usr/local/bin/easyinstall")
+    except Exception as e:
+        log("WARNING", f"Could not create /usr/bin symlink: {e}")
+
+    # bashrc alias -- append /usr/local/bin to PATH for future sessions
     bashrc = Path("/root/.bashrc")
     if bashrc.exists():
         content = bashrc.read_text()
-        if "easyinstall" not in content:
+        if "/usr/local/bin" not in content:
             with bashrc.open("a") as f:
                 f.write('\n# EasyInstall v6.4\nexport PATH="$PATH:/usr/local/bin"\n')
+
+    # Also ensure /usr/local/bin is in /etc/environment for system-wide persistence
+    env_file = Path("/etc/environment")
+    try:
+        env_content = env_file.read_text() if env_file.exists() else ""
+        if "PATH" not in env_content:
+            with env_file.open("a") as f:
+                f.write('PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n')
+        elif "/usr/local/bin" not in env_content:
+            new_content = re.sub(
+                r'(PATH="?)([^"\n]+)',
+                lambda m: m.group(1) + "/usr/local/bin:" + m.group(2),
+                env_content,
+            )
+            env_file.write_text(new_content)
+    except Exception as e:
+        log("WARNING", f"Could not update /etc/environment: {e}")
 
     log("SUCCESS", "EasyInstall command dispatcher created")
 
