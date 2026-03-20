@@ -127,11 +127,11 @@ def stage_kernel_tuning(cfg):
 
     sysctl_content = textwrap.dedent("""\
         # EasyInstall v6.4 — Maximum Network Performance
-        net.core.rmem_max = 134217728
-        net.core.wmem_max = 134217728
-        net.ipv4.tcp_rmem = 4096 87380 134217728
-        net.ipv4.tcp_wmem = 4096 65536 134217728
-        net.core.netdev_max_backlog = 5000
+        net.core.rmem_max = 536870912
+        net.core.wmem_max = 536870912
+        net.ipv4.tcp_rmem = 4096 131072 536870912
+        net.ipv4.tcp_wmem = 4096 131072 536870912
+        net.core.netdev_max_backlog = 50000
         net.ipv4.tcp_congestion_control = bbr
         net.core.default_qdisc = fq
         net.ipv4.tcp_notsent_lowat = 16384
@@ -141,8 +141,8 @@ def stage_kernel_tuning(cfg):
         # Connection handling
         net.ipv4.tcp_fin_timeout = 10
         net.ipv4.tcp_tw_reuse = 1
-        net.ipv4.tcp_max_syn_backlog = 4096
-        net.core.somaxconn = 1024
+        net.ipv4.tcp_max_syn_backlog = 65535
+        net.core.somaxconn = 65535
         net.ipv4.tcp_syncookies = 1
         net.ipv4.tcp_syn_retries = 2
         net.ipv4.tcp_synack_retries = 2
@@ -151,26 +151,39 @@ def stage_kernel_tuning(cfg):
         net.ipv4.tcp_keepalive_intvl = 30
         net.ipv4.tcp_keepalive_probes = 3
         net.ipv4.ip_local_port_range = 1024 65535
+        net.ipv4.tcp_fastopen = 3
+        net.ipv4.tcp_window_scaling = 1
+        net.ipv4.tcp_timestamps = 1
+        net.ipv4.tcp_sack = 1
+        net.ipv4.tcp_low_latency = 0
+        net.ipv4.route.flush = 1
 
         # File system
-        fs.file-max = 2097152
+        fs.file-max = 9999999
         fs.inotify.max_user_watches = 524288
         fs.aio-max-nr = 1048576
+        fs.nr_open = 9999999
 
-        # Virtual memory
-        vm.swappiness = 10
+        # Virtual memory — optimized for large binary ops
+        vm.swappiness = 1
         vm.vfs_cache_pressure = 50
-        vm.dirty_ratio = 30
-        vm.dirty_background_ratio = 5
-        vm.dirty_expire_centisecs = 3000
-        vm.dirty_writeback_centisecs = 500
+        vm.dirty_ratio = 10
+        vm.dirty_background_ratio = 3
+        vm.dirty_expire_centisecs = 1500
+        vm.dirty_writeback_centisecs = 300
         vm.overcommit_memory = 1
+        vm.overcommit_ratio = 80
         vm.panic_on_oom = 0
+        vm.min_free_kbytes = 65536
+        vm.zone_reclaim_mode = 0
+        vm.page-cluster = 0
 
         # Kernel
         kernel.pid_max = 65536
         kernel.threads-max = 30938
         kernel.sched_autogroup_enabled = 0
+        kernel.sched_migration_cost_ns = 5000000
+        kernel.numa_balancing = 0
     """)
     write_file("/etc/sysctl.d/99-wordpress.conf", sysctl_content)
 
@@ -627,8 +640,9 @@ def stage_php_config(cfg):
             pm.start_servers = {cfg.php_start_servers}
             pm.min_spare_servers = {cfg.php_min_spare}
             pm.max_spare_servers = {cfg.php_max_spare}
-            pm.max_requests = 10000
+            pm.max_requests = 500
             pm.status_path = /status
+            pm.process_idle_timeout = 10s
 
             slowlog = /var/log/php{version}-fpm-slow.log
             request_slowlog_timeout = 5s
@@ -660,6 +674,14 @@ def stage_php_config(cfg):
                 r";max_input_vars = .*":    "max_input_vars = 5000",
                 r";realpath_cache_size = .*": "realpath_cache_size = 4096k",
                 r";realpath_cache_ttl = .*":  "realpath_cache_ttl = 600",
+                r"expose_php = .*":         "expose_php = Off",
+                r"output_buffering = .*":   "output_buffering = 4096",
+                r"serialize_precision = .*":"serialize_precision = -1",
+                r"pcre.backtrack_limit=.*": "pcre.backtrack_limit=500000",
+                r";pcre.jit=.*":            "pcre.jit=1",
+                r"zlib.output_compression = .*": "zlib.output_compression = Off",
+                r"session.gc_maxlifetime = .*": "session.gc_maxlifetime = 7200",
+                r"session.use_strict_mode = .*": "session.use_strict_mode = 1",
             }
             for pattern, replacement in replacements.items():
                 content = re.sub(pattern, replacement, content)
@@ -669,30 +691,43 @@ def stage_php_config(cfg):
         # opcache
         write_file(f"/etc/php/{version}/fpm/conf.d/10-opcache.ini", textwrap.dedent("""\
             opcache.enable=1
-            opcache.memory_consumption=256
-            opcache.interned_strings_buffer=16
-            opcache.max_accelerated_files=20000
-            opcache.revalidate_freq=60
+            opcache.memory_consumption=512
+            opcache.interned_strings_buffer=64
+            opcache.max_accelerated_files=65407
+            opcache.revalidate_freq=0
             opcache.fast_shutdown=1
             opcache.enable_cli=1
             opcache.validate_timestamps=0
             opcache.save_comments=1
             opcache.load_comments=1
-            opcache.max_file_size=10M
+            opcache.max_file_size=0
             opcache.consistency_checks=0
             opcache.huge_code_pages=1
             opcache.lockfile_path=/tmp
+            opcache.jit=tracing
+            opcache.jit_buffer_size=256M
+            opcache.jit_max_root_traces=4096
+            opcache.jit_max_side_traces=4096
+            opcache.jit_max_exit_counters=8192
+            opcache.jit_hot_loop=8
+            opcache.jit_hot_func=8
+            opcache.jit_hot_return=8
+            opcache.jit_hot_side_exit=16
+            opcache.preload_user=www-data
         """))
 
         # apcu
         write_file(f"/etc/php/{version}/fpm/conf.d/20-apcu.ini", textwrap.dedent("""\
             apcu.enabled=1
-            apcu.shm_size=128M
+            apcu.shm_size=256M
             apcu.ttl=7200
             apcu.gc_ttl=3600
             apcu.mmap_file_mask=/tmp/apcu.XXXXXX
             apcu.slam_defense=1
             apcu.enable_cli=0
+            apcu.entries_hint=16384
+            apcu.smart=0
+            apcu.use_request_time=0
         """))
 
     log("SUCCESS", "PHP configuration complete")
@@ -723,36 +758,53 @@ def stage_mysql_config(cfg):
         max_connect_errors = 1000000
 
         key_buffer_size = 64M
-        sort_buffer_size = 4M
-        read_buffer_size = 2M
-        read_rnd_buffer_size = 4M
-        join_buffer_size = 4M
-        bulk_insert_buffer_size = 64M
-        tmp_table_size = 64M
-        max_heap_table_size = 64M
+        sort_buffer_size = 8M
+        read_buffer_size = 4M
+        read_rnd_buffer_size = 8M
+        join_buffer_size = 8M
+        bulk_insert_buffer_size = 128M
+        tmp_table_size = 128M
+        max_heap_table_size = 128M
 
         innodb_buffer_pool_size = {cfg.mysql_buffer_pool}
         innodb_log_file_size = {cfg.mysql_log_file}
-        innodb_log_buffer_size = 16M
+        innodb_log_buffer_size = 64M
         innodb_flush_method = O_DIRECT
         innodb_file_per_table = 1
-        innodb_flush_log_at_trx_commit = 2
+        innodb_flush_log_at_trx_commit = 0
         innodb_read_io_threads = 64
         innodb_write_io_threads = 64
-        innodb_io_capacity = 2000
-        innodb_io_capacity_max = 3000
-        innodb_purge_threads = 4
-        innodb_page_cleaners = 4
+        innodb_io_capacity = 5000
+        innodb_io_capacity_max = 10000
+        innodb_purge_threads = 8
+        innodb_page_cleaners = 8
         innodb_buffer_pool_instances = 8
         innodb_autoinc_lock_mode = 2
         innodb_change_buffering = all
         innodb_old_blocks_time = 1000
         innodb_stats_on_metadata = OFF
-        innodb_lock_wait_timeout = 50
+        innodb_lock_wait_timeout = 30
+        innodb_sort_buffer_size = 64M
+        innodb_compression_level = 0
+        innodb_adaptive_hash_index = ON
+        innodb_adaptive_flushing = ON
+        innodb_lru_scan_depth = 512
+        innodb_spin_wait_delay = 4
+        innodb_thread_concurrency = 0
 
         table_open_cache = 20000
         table_definition_cache = 20000
         open_files_limit = 100000
+
+        # ── Query Cache (MariaDB only) ──────────────────────────────────────
+        query_cache_type = 1
+        query_cache_size = 128M
+        query_cache_limit = 4M
+        query_cache_min_res_unit = 2k
+
+        # ── Optimizer ──────────────────────────────────────────────────────
+        optimizer_search_depth = 0
+        optimizer_switch = 'index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on,index_condition_pushdown=on,mrr=on,mrr_cost_based=on,block_nested_loop=on,batched_key_access=off,materialization=on,semijoin=on,loosescan=on,firstmatch=on,subquery_cache=on,use_index_extensions=on'
 
         log_error = /var/log/mysql/error.log
         slow_query_log = 1
@@ -765,6 +817,10 @@ def stage_mysql_config(cfg):
 
         thread_cache_size = 256
         thread_stack = 256K
+        thread_handling = pool-of-threads
+        thread_pool_size = 8
+        thread_pool_max_threads = 500
+        thread_pool_idle_timeout = 60
     """)
     write_file("/etc/mysql/mariadb.conf.d/99-wordpress.cnf", mysql_conf)
     log("SUCCESS", "MariaDB configuration written")
@@ -794,12 +850,45 @@ def stage_redis_config(cfg):
 
         maxmemory {cfg.redis_max_memory}
         maxmemory-policy allkeys-lru
-        maxmemory-samples 10
+        maxmemory-samples 5
 
         save ""
         appendonly no
 
         maxclients 10000
+
+        # ── Performance: faster reads & async ops ──────────────────────────
+        hz 100
+        dynamic-hz yes
+        aof-use-rdb-preamble no
+        lazyfree-lazy-eviction yes
+        lazyfree-lazy-expire yes
+        lazyfree-lazy-server-del yes
+        lazyfree-lazy-user-del yes
+        lazyfree-lazy-user-flush yes
+        activerehashing yes
+        activedefrag yes
+        active-defrag-ignore-bytes 50mb
+        active-defrag-threshold-lower 5
+        active-defrag-threshold-upper 20
+        active-defrag-cycle-min 1
+        active-defrag-cycle-max 25
+        active-expire-enabled yes
+        no-appendfsync-on-rewrite yes
+        proto-max-bulk-len 10mb
+        lua-time-limit 3000
+        cluster-enabled no
+        rdbcompression no
+        rdbchecksum no
+
+        # ── Socket / network ───────────────────────────────────────────────
+        tcp-backlog 65535
+        unixsocket /var/run/redis/redis-server.sock
+        unixsocketperm 777
+
+        # ── io-threads (for Redis 6+) ──────────────────────────────────────
+        io-threads 2
+        io-threads-do-reads yes
     """)
     write_file("/etc/redis/redis.conf", redis_conf)
     log("SUCCESS", "Redis configuration written")
