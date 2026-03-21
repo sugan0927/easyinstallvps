@@ -3562,14 +3562,35 @@ def stage_waf_config(cfg):
     """)
     write_file("/etc/nginx/snippets/modsec.conf", modsec_snippet)
 
-    # nginx.conf load_module line (prepend if needed)
+    # nginx.conf load_module line — ONLY add if the .so module actually exists.
+    # Adding a load_module for a non-existent file causes nginx -t to FAIL,
+    # which breaks all site creation. We write the line to a separate disabled
+    # file instead so operators can enable it manually after installing the module.
+    modsec_so_paths = [
+        "/usr/lib/nginx/modules/ngx_http_modsecurity_module.so",
+        "/etc/nginx/modules/ngx_http_modsecurity_module.so",
+        "/usr/lib64/nginx/modules/ngx_http_modsecurity_module.so",
+    ]
+    modsec_so_found = any(Path(p).exists() for p in modsec_so_paths)
+
     nginx_conf = Path("/etc/nginx/nginx.conf")
-    if nginx_conf.exists():
+    if modsec_so_found and nginx_conf.exists():
         content = nginx_conf.read_text()
         modsec_load = "load_module modules/ngx_http_modsecurity_module.so;\n"
         if "modsecurity_module" not in content and "load_module" not in content:
             nginx_conf.write_text(modsec_load + content)
-            log("INFO", "ModSecurity load_module added to nginx.conf")
+            log("INFO", "ModSecurity load_module added to nginx.conf (module .so found)")
+    else:
+        # Write a ready-to-use load_module directive in a DISABLED file.
+        # Operator must: install libnginx-mod-security, then rename/include this file.
+        write_file(
+            "/etc/nginx/modsec/load_module.conf.DISABLED",
+            "# Uncomment after installing libnginx-mod-security or building nginx+ModSecurity\n"
+            "# load_module modules/ngx_http_modsecurity_module.so;\n"
+        )
+        log("INFO", "ModSecurity .so NOT found — load_module NOT added to nginx.conf (safe)")
+        log("INFO", "To activate WAF: apt-get install libnginx-mod-security, then rename "
+                    "/etc/nginx/modsec/load_module.conf.DISABLED → load_module.conf")
 
     # Create modsec cache dir
     run("mkdir -p /var/cache/nginx/modsec/uploads && chown -R www-data:www-data /var/cache/nginx/modsec 2>/dev/null || true", check=False)
@@ -4199,60 +4220,64 @@ def stage_prometheus_setup(cfg):
 def stage_config_validator(cfg):
     log("STEP", "Validating all configuration files — v7.0")
 
+    # ── Pre-flight: remove any load_module lines for .so files that don't exist ──
+    nginx_conf_path = Path("/etc/nginx/nginx.conf")
+    if nginx_conf_path.exists():
+        lines = nginx_conf_path.read_text().splitlines(keepends=True)
+        cleaned, removed = [], []
+        for line in lines:
+            m = re.match(r"\s*load_module\s+([^\s;]+)", line)
+            if m:
+                so_path = m.group(1).strip(";").strip()
+                so_full = Path(so_path) if so_path.startswith("/") else Path("/etc/nginx/modules") / so_path
+                if not so_full.exists():
+                    removed.append(line.rstrip())
+                    log("WARNING", f"Removing broken load_module (file not found): {line.rstrip()}")
+                    continue
+            cleaned.append(line)
+        if removed:
+            nginx_conf_path.write_text("".join(cleaned))
+            log("SUCCESS", f"Removed {len(removed)} broken load_module directive(s) from nginx.conf")
+            Path("/etc/nginx/modsec").mkdir(parents=True, exist_ok=True)
+            with open("/etc/nginx/modsec/removed_load_modules.txt", "w") as f2:
+                f2.write("# Removed by EasyInstall v7.0 config_validator (module .so not found)\n")
+                for rl in removed:
+                    f2.write(rl + "\n")
+
     results = {}
     failed  = []
 
     def validate(name, cmd, expected_rc=0):
-        """Run a validation command, return True if passes."""
         try:
-            r = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30
-            )
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
             ok = (r.returncode == expected_rc)
             results[name] = {"ok": ok, "rc": r.returncode, "stderr": r.stderr[:300]}
             if ok:
-                log("SUCCESS", f"✅ {name}: valid")
+                log("SUCCESS", f"\u2705 {name}: valid")
             else:
-                log("ERROR",   f"❌ {name}: FAILED (rc={r.returncode})")
+                log("ERROR",   f"\u274c {name}: FAILED (rc={r.returncode})")
                 log("ERROR",   f"   {r.stderr[:200]}")
                 failed.append(name)
             return ok
         except subprocess.TimeoutExpired:
-            log("WARNING", f"⏰ {name}: validation timeout")
-            return True  # timeout = non-critical
+            log("WARNING", f"\u23f0 {name}: validation timeout")
+            return True
         except Exception as e:
-            log("WARNING", f"⚠️  {name}: {e}")
+            log("WARNING", f"\u26a0\ufe0f  {name}: {e}")
             return True
 
-    # nginx
-    validate("nginx-config",  "nginx -t 2>&1")
-
-    # PHP-FPM (all installed versions)
+    validate("nginx-config", "nginx -t 2>&1")
     for ver in ["8.4", "8.3", "8.2"]:
-        conf = f"/etc/php/{ver}/fpm/pool.d/www.conf"
         if Path(f"/etc/php/{ver}").exists():
             validate(f"php{ver}-fpm-syntax",
                      f"php-fpm{ver} --fpm-config /etc/php/{ver}/fpm/php-fpm.conf -t 2>&1")
-
-    # MariaDB
-    validate("mariadb-config",
-             "mysqld --help --verbose --user=mysql 2>&1 | head -5",
-             expected_rc=0)
-
-    # Redis syntax check
+    validate("mariadb-config", "mysqld --help --verbose --user=mysql 2>&1 | head -5", expected_rc=0)
     if Path("/etc/redis/redis.conf").exists():
-        validate("redis-config",
-                 "redis-server /etc/redis/redis.conf --test-memory 0 2>&1 | head -3 || true",
-                 expected_rc=0)
-
-    # Fail2ban
+        validate("redis-config", "redis-server /etc/redis/redis.conf --test-memory 0 2>&1 | head -3 || true", expected_rc=0)
     if Path("/etc/fail2ban/jail.local").exists():
         validate("fail2ban-config", "fail2ban-client --test 2>&1 | head -5")
-
-    # UFW
     validate("ufw-status", "ufw status 2>&1 | head -5")
 
-    # Write validation report
     report_lines = [
         "=" * 50,
         "EasyInstall v7.0 — Config Validation Report",
@@ -4260,32 +4285,25 @@ def stage_config_validator(cfg):
         "=" * 50, "",
     ]
     for name, res in results.items():
-        status = "✅ PASS" if res["ok"] else "❌ FAIL"
-        report_lines.append(f"  {status}  {name}")
+        status = "PASS" if res["ok"] else "FAIL"
+        report_lines.append(f"  [{status}]  {name}")
         if not res["ok"] and res["stderr"]:
             report_lines.append(f"         Error: {res['stderr'][:150]}")
     report_lines += ["", f"Total: {len(results)} checks | Failed: {len(failed)}"]
-    report = "\n".join(report_lines)
-    write_file("/root/config-validation-report.txt", report, mode=0o600)
+    write_file("/root/config-validation-report.txt", "\n".join(report_lines), mode=0o600)
 
     if failed:
         log("ERROR", f"Config validation FAILED for: {', '.join(failed)}")
         log("ERROR", "Report: /root/config-validation-report.txt")
-        log("WARNING", "Attempting service reload with current configs...")
-        # Attempt nginx reload only if valid
         if "nginx-config" not in failed:
             run("systemctl reload nginx 2>/dev/null || true", check=False)
-        # Do NOT exit — let bash layer handle rollback decision
     else:
         log("SUCCESS", "All configuration files valid")
-        # Reload all services now that configs are verified
         for svc in ["nginx", "mariadb", "redis-server"]:
-            run(f"systemctl reload {svc} 2>/dev/null || systemctl restart {svc} 2>/dev/null || true",
-                check=False)
+            run(f"systemctl reload {svc} 2>/dev/null || systemctl restart {svc} 2>/dev/null || true", check=False)
         for ver in ["8.4", "8.3", "8.2"]:
             run(f"systemctl reload php{ver}-fpm 2>/dev/null || true", check=False)
-
-    log("INFO", f"Validation report: /root/config-validation-report.txt")
+    log("INFO", "Validation report: /root/config-validation-report.txt")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
