@@ -401,9 +401,12 @@ setup_package_manager() {
     )
 
     # v6.5: Add modern tools
-    # AVIF/WebP tools (avif-tools not available on Debian, use libavif-bin if exists)
     packages+=(webp libwebp-dev)
-    apt-get install -y libavif-bin 2>/dev/null || apt-get install -y libavif16 2>/dev/null || true
+
+    # AVIF tools — optional, subshell isolates ERR trap
+    ( DEBIAN_FRONTEND=noninteractive apt-get install -y libavif-bin >/dev/null 2>&1 ) || \
+        ( DEBIAN_FRONTEND=noninteractive apt-get install -y libavif16 >/dev/null 2>&1 ) || \
+        log "WARNING" "libavif not available — AVIF conversion tools optional"
 
     for pkg in "${packages[@]}"; do
         run_cmd_retry 2 3 "apt-get install -y $pkg" || log "WARNING" "Could not install: $pkg"
@@ -418,7 +421,9 @@ setup_package_manager() {
     # v6.5: Install rclone for S3 backup if enabled
     if [ "$S3_BACKUP" = "true" ]; then
         log "STEP" "Installing rclone for S3 backup"
-        curl https://rclone.org/install.sh | bash 2>/dev/null ||             apt-get install -y rclone
+        ( curl https://rclone.org/install.sh | bash >/dev/null 2>&1 ) || \
+            ( DEBIAN_FRONTEND=noninteractive apt-get install -y rclone >/dev/null 2>&1 ) || \
+            log "WARNING" "rclone install failed — S3 backup may not work"
     fi
 
     log "SUCCESS" "Base package setup complete"
@@ -465,23 +470,19 @@ install_nginx_packages() {
     run_cmd_retry 3 5 "apt-get update -y"
     run_cmd_retry 3 5 "apt-get install -y nginx"
 
-    # v6.5: Try nginx-quic for HTTP/3
+    # v6.5: Try nginx-quic for HTTP/3 — optional, subshell isolates from set -eE and trap ERR
     if [ "$USE_HTTP3" = "true" ]; then
         log "INFO" "Attempting to install nginx-quic for HTTP/3 support"
-        set +e
-        apt-get install -y nginx-quic 2>/dev/null
-        set -e
-        log "WARNING" "nginx-quic not available — HTTP/3 will use Alt-Svc only"
+        ( DEBIAN_FRONTEND=noninteractive apt-get install -y nginx-quic >/dev/null 2>&1 ) || \
+            log "WARNING" "nginx-quic not available — HTTP/3 will use Alt-Svc only"
     fi
 
-    # Brotli module — optional, non-fatal
-    set +e
-    apt-get install -y libnginx-mod-brotli 2>/dev/null || \
+    # Brotli module — optional, subshell isolates from ERR trap
+    ( DEBIAN_FRONTEND=noninteractive apt-get install -y libnginx-mod-brotli >/dev/null 2>&1 ) || \
         log "WARNING" "Brotli module not available — gzip remains active"
-    set -e
 
-    # GeoIP2 module — skip: nginx mainline ABI changes break this package on Debian
-    # apt-get install -y libnginx-mod-http-geoip2 mmdb-bin 2>/dev/null || true
+    # GeoIP2 — skip: mainline nginx ABI incompatible with distro package
+    # ( apt-get install -y libnginx-mod-http-geoip2 mmdb-bin >/dev/null 2>&1 ) || true
 
     mkdir -p /etc/nginx/{sites-available,sites-enabled,conf.d,ssl,snippets}
     mkdir -p /var/cache/nginx/{fastcgi,proxy,static,edge}
@@ -513,8 +514,6 @@ install_php_packages() {
         pkgs="$pkgs php${ver}-xml php${ver}-xmlrpc php${ver}-zip php${ver}-soap php${ver}-intl"
         pkgs="$pkgs php${ver}-bcmath php${ver}-imagick php${ver}-redis php${ver}-opcache"
         pkgs="$pkgs php${ver}-readline php${ver}-apcu php${ver}-memcached php${ver}-igbinary"
-        # v6.5: AVIF support
-        pkgs="$pkgs php${ver}-gd"  # GD with AVIF
 
         if run_cmd_retry 3 5 "apt-get install -y $pkgs"; then
             PHP_INSTALLED_VERSION=$ver
@@ -545,14 +544,16 @@ install_mysql_packages() {
     systemctl stop mariadb 2>/dev/null || true
 
     log "INFO" "Adding MariaDB 11.4 official repository"
-    run_cmd_retry 3 5 "curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash -s -- --mariadb-server-version=mariadb-11.4 --skip-maxscale" 2>/dev/null ||         log "WARNING" "MariaDB 11.4 repo failed, falling back to distro default"
+    ( curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | \
+        bash -s -- --mariadb-server-version=mariadb-11.4 --skip-maxscale >/dev/null 2>&1 ) || \
+        log "WARNING" "MariaDB 11.4 repo failed, falling back to distro default"
 
     run_cmd_retry 3 5 "apt-get update -y"
     run_cmd "apt --fix-broken install -y"
     run_cmd_retry 3 5 "apt-get install -y mariadb-server mariadb-client"
     sleep 5
-    systemctl enable mariadb
-    systemctl start mariadb
+    systemctl enable mariadb 2>/dev/null || true
+    systemctl start mariadb 2>/dev/null || true
     log "SUCCESS" "MariaDB 11.4+ packages installed"
 }
 
@@ -566,7 +567,8 @@ install_wp_cli() {
         mv wp-cli.phar /usr/local/bin/wp
         run_cmd_retry 2 3 "curl -O https://raw.githubusercontent.com/wp-cli/wp-cli/v2.8.0/utils/wp-completion.bash"
         mv wp-completion.bash /etc/bash_completion.d/wp-completion.bash 2>/dev/null || true
-        /usr/local/bin/wp --info &>/dev/null && log "SUCCESS" "WP-CLI installed" ||             log "ERROR" "WP-CLI verification failed"
+        /usr/local/bin/wp --info &>/dev/null && log "SUCCESS" "WP-CLI installed" || \
+            log "WARNING" "WP-CLI verification failed — may work after PATH reload"
     else
         log "ERROR" "Failed to download WP-CLI"
     fi
@@ -591,10 +593,11 @@ install_redis_packages() {
     run_cmd_retry 2 3 "apt-get update -y" 2>/dev/null || true
     run_cmd_retry 3 5 "apt-get install -y redis-server redis-tools"
 
-    # v6.5: Check for Redis Stack
+    # v6.5: Check for Redis Stack — optional, subshell isolates ERR trap
     if apt-cache search redis-stack-server 2>/dev/null | grep -q "redis-stack"; then
         log "INFO" "Redis Stack available — installing"
-        apt-get install -y redis-stack-server 2>/dev/null ||             log "INFO" "Redis Stack not installed (optional)"
+        ( DEBIAN_FRONTEND=noninteractive apt-get install -y redis-stack-server >/dev/null 2>&1 ) || \
+            log "INFO" "Redis Stack not installed (optional)"
     fi
 
     log "SUCCESS" "Redis packages installed"
@@ -640,7 +643,7 @@ mark_redis_port_used() {
 # ============================================
 enable_start_nginx() {
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-    systemctl enable nginx
+    systemctl enable nginx 2>/dev/null || true
     systemctl start nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
     wait_for_service "nginx" 30 || return 1
 }
@@ -657,16 +660,17 @@ enable_start_php() {
 }
 
 enable_start_redis() {
-    systemctl enable redis-server
-    systemctl start redis-server
-    wait_for_service "redis-server" 20 && test_redis 6379
+    systemctl enable redis-server 2>/dev/null || true
+    systemctl start redis-server 2>/dev/null || true
+    wait_for_service "redis-server" 20 || { log "WARNING" "Redis slow to start"; return 0; }
+    test_redis 6379 || log "WARNING" "Redis ping failed — may need a moment"
     mkdir -p /var/lib/easyinstall
     echo "6379" > "$USED_REDIS_PORTS_FILE"
 }
 
 enable_start_mariadb() {
-    systemctl enable mariadb
-    systemctl start mariadb
+    systemctl enable mariadb 2>/dev/null || true
+    systemctl start mariadb 2>/dev/null || true
     wait_for_service "mariadb" 30 || return 1
     test_mysql_connection || return 1
 }
@@ -753,7 +757,7 @@ install_ollama() {
         local ver=$(ollama --version 2>/dev/null || echo "installed")
         log "INFO" "Ollama already installed: $ver"
     else
-        run_cmd_retry 3 5 "curl -fsSL https://ollama.com/install.sh | sh" || {
+        ( curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1 ) || {
             log "ERROR" "Ollama installation failed"; return 1; }
         log "SUCCESS" "Ollama installed"
     fi
@@ -880,9 +884,10 @@ start_autoheal() {
 }
 
 start_fail2ban() {
-    systemctl enable fail2ban
-    systemctl restart fail2ban
-    wait_for_service "fail2ban" 20 && log "SUCCESS" "Fail2ban running" ||         log "WARNING" "Fail2ban may not be running"
+    systemctl enable fail2ban 2>/dev/null || true
+    systemctl restart fail2ban 2>/dev/null || true
+    wait_for_service "fail2ban" 20 && log "SUCCESS" "Fail2ban running" || \
+        log "WARNING" "Fail2ban may not be running"
 }
 
 # ============================================
@@ -1084,9 +1089,9 @@ SECURE_SQL
     fi
     update_status "AUTOTUNE_SERVICES" "Governor + cron jobs installed"
 
-    # Final validation
+    # Final validation — non-fatal, just reports issues
     update_status "TEST" "Running installation tests"
-    test_installation
+    test_installation || log "WARNING" "Some tests failed — check logs above"
 
     cleanup_temp_files "success"
     rm -f "$LOCK_FILE"

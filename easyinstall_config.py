@@ -412,7 +412,7 @@ def stage_nginx_config(cfg):
                 application/x-font-ttf font/opentype image/svg+xml image/x-icon;
 
             fastcgi_cache_path /var/cache/nginx/fastcgi levels=1:2
-                keys_zone=WORDPRESS:256m inactive=60m max_size=2g;
+                keys_zone=WORDPRESS:{min(cfg.total_ram // 16, 128)}m inactive=60m max_size={min(cfg.total_ram // 2, 2048)}m;
             fastcgi_cache_key "$scheme$request_method$host$request_uri";
             fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_503;
             fastcgi_cache_valid 200 301 302 60m;
@@ -524,11 +524,10 @@ def stage_nginx_extras(cfg):
     write_file("/etc/nginx/conf.d/security-headers-2025.conf", textwrap.dedent("""\
         # 2025 Security Headers (EasyInstall v6.5)
 
-        # SSL Hardening: OCSP stapling + HSTS
-        ssl_stapling on;
-        ssl_stapling_verify on;
+        # DNS resolver for upstream and OCSP (http context — valid here)
         resolver 1.1.1.1 8.8.8.8 valid=300s;
         resolver_timeout 5s;
+        # Note: ssl_stapling directives go inside server{} blocks only
 
         # Strict Transport Security
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
@@ -613,11 +612,10 @@ def stage_http3_quic(cfg):
     write_file("/etc/nginx/conf.d/http3-quic.conf", textwrap.dedent("""\
         # HTTP/3 + QUIC global settings (EasyInstall v6.5)
 
-        # Alt-Svc header for HTTP/3 upgrade
-        map $server_protocol $h3_alt_svc {{
+        # Alt-Svc header map for HTTP/3 upgrade
+        map $server_protocol $h3_alt_svc {
             default   'h3=":443"; ma=86400, h3-29=":443"; ma=86400';
-            ""        '';
-        }}
+        }
 
     """) + quic_extra)
 
@@ -778,11 +776,25 @@ def stage_php_config(cfg):
 
         # v6.5: Add igbinary extension config
         write_file(f"/etc/php/{version}/fpm/conf.d/15-igbinary.ini", textwrap.dedent("""\
-            extension=igbinary.so
+            ; igbinary serializer (installed via php-igbinary package)
+            extension=igbinary
             igbinary.compact_strings=On
         """))
 
     log("SUCCESS", "PHP configuration complete (v6.5)")
+
+def _to_bytes(size_str: str) -> int:
+    """Convert size string like '64M', '1G' to bytes integer for MariaDB 11.4+ innodb_redo_log_capacity."""
+    s = size_str.strip().upper()
+    if s.endswith('G'):
+        return int(s[:-1]) * 1024 * 1024 * 1024
+    elif s.endswith('M'):
+        return int(s[:-1]) * 1024 * 1024
+    elif s.endswith('K'):
+        return int(s[:-1]) * 1024
+    else:
+        return int(s)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # STAGE: mysql_config (v6.5: MariaDB 11.4+ optimizations)
@@ -833,21 +845,20 @@ def stage_mysql_config(cfg):
         max_heap_table_size = 64M
 
         innodb_buffer_pool_size = {cfg.mysql_buffer_pool}
-        # innodb_redo_log_capacity replaces innodb_log_file_size in MariaDB 11.4+
-        innodb_redo_log_capacity = {cfg.mysql_log_file}
+        # innodb_redo_log_capacity uses bytes in MariaDB 11.4+ (67108864 = 64MB, 134217728 = 128MB)
+        innodb_redo_log_capacity = {_to_bytes(cfg.mysql_log_file)}
         innodb_log_buffer_size = 16M
         innodb_flush_method = O_DIRECT
         innodb_file_per_table = 1
         innodb_flush_log_at_trx_commit = 2
-        innodb_read_io_threads = 64
-        innodb_write_io_threads = 64
+        innodb_read_io_threads = 4
+        innodb_write_io_threads = 4
         innodb_io_capacity = 2000
         innodb_io_capacity_max = 3000
         innodb_purge_threads = 4
         innodb_page_cleaners = 4
         innodb_buffer_pool_instances = {buffer_pool_instances}
         innodb_autoinc_lock_mode = 2
-        innodb_change_buffering = all
         innodb_old_blocks_time = 1000
         innodb_stats_on_metadata = OFF
         innodb_lock_wait_timeout = 50
@@ -862,7 +873,6 @@ def stage_mysql_config(cfg):
 
         # v6.5: Performance Schema for monitoring
         performance_schema = ON
-        performance_schema_instrument = 'wait/lock/metadata/sql/mdl=ON'
 
         # v6.5: Binary log for replication (if needed)
         log_bin = /var/log/mysql/mariadb-bin
@@ -871,9 +881,9 @@ def stage_mysql_config(cfg):
         binlog_expire_logs_seconds = 604800
         max_binlog_size = 100M
 
-        table_open_cache = 20000
-        table_definition_cache = 20000
-        open_files_limit = 100000
+        table_open_cache = 4096
+        table_definition_cache = 4096
+        open_files_limit = 65535
 
         log_error = /var/log/mysql/error.log
         slow_query_log = 1
@@ -891,10 +901,10 @@ def stage_mysql_config(cfg):
 
         # v6.5: Connection handling
         thread_cache_size = 256
-        thread_stack = 256K
+        thread_stack = 262144
         thread_pool_size = {buffer_pool_instances}
 
-        # v6.5: Query cache deprecated, use ProxySQL or application cache
+        # v6.5: Query cache disabled (deprecated in MariaDB 11.4+)
         query_cache_type = 0
         query_cache_size = 0
     """)
@@ -917,7 +927,8 @@ def stage_redis_config(cfg):
         timeout 0
         tcp-keepalive 300
 
-        daemonize yes
+        # Systemd integration: daemonize no + supervised systemd (correct combination)
+        daemonize no
         supervised systemd
         pidfile /var/run/redis/redis-server.pid
         loglevel notice
