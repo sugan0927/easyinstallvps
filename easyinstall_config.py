@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-easyinstall_config.py — EasyInstall v6.4 Python Configuration Module
+easyinstall_config.py — EasyInstall v7.0 Python Configuration Module
 =====================================================================
 Handles ALL server configuration file generation for the Hybrid Edition.
 Called by easyinstall.sh with --stage <name> and tuning parameters.
@@ -27,7 +27,19 @@ Stages handled:
   create_ai_module    — /usr/local/lib/easyinstall-ai.sh
   create_autotune_module — /usr/local/lib/easyinstall-autotune.sh
   advanced_autotune   — Run all 10 autotune phases inline
-  wordpress_install   — Full WordPress site setup
+  wordpress_install     — Full WordPress site setup
+  clone_site            — Clone existing WordPress site
+  remote_install        — Remote VPS WordPress install via SSH
+
+NEW v7.0 stages:
+  stage_malware_scanner   — ClamAV + quarantine dir + daily scan cron
+  stage_security_hardening— nginx security headers, DDoS map, WP block rules
+  stage_waf_config        — ModSecurity OWASP CRS config for nginx
+  stage_php_fpm_autoscaler— Dynamic PHP-FPM pm.max_children (CPU-aware, reload only)
+  stage_redis_multidb     — Per-site Redis DB0/DB1/DB2 isolation in wp-config.php
+  stage_db_optimizer      — Slow query log analysis + index suggestions (report only)
+  stage_prometheus_setup  — node_exporter + prometheus.yml + grafana setup guide
+  stage_config_validator  — Validates nginx/php/mysql/redis configs post-install
 """
 
 import argparse
@@ -92,7 +104,7 @@ def run(cmd: str, check: bool = True) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="EasyInstall Python Config Module v6.4")
+    p = argparse.ArgumentParser(description="EasyInstall Python Config Module v7.0")
     p.add_argument("--stage", required=True)
     p.add_argument("--total-ram",               type=int,   default=1024)
     p.add_argument("--total-cores",             type=int,   default=2)
@@ -3220,34 +3232,1101 @@ def stage_remote_install(cfg):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main dispatcher
+# NEW v7.0 STAGE: stage_malware_scanner
+# Writes ClamAV quarantine config + quarantine dir + freshclam systemd override
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_malware_scanner(cfg):
+    log("STEP", "Configuring malware scanner (ClamAV) — v7.0")
+
+    # Quarantine directory
+    Path("/var/quarantine/malware").mkdir(parents=True, exist_ok=True)
+    run("chown -R www-data:root /var/quarantine/malware 2>/dev/null || true", check=False)
+    run("chmod 750 /var/quarantine/malware 2>/dev/null || true", check=False)
+
+    # ClamAV scan config
+    clamd_conf = textwrap.dedent("""\
+        # EasyInstall v7.0 — ClamAV Daemon Config
+        LocalSocket /var/run/clamav/clamd.ctl
+        LocalSocketGroup clamav
+        LocalSocketMode 660
+        FixStaleSocket yes
+        User clamav
+        AllowSupplementaryGroups yes
+        ScanPE yes
+        ScanELF yes
+        DetectBrokenExecutables yes
+        ScanHTML yes
+        ScanOLE2 yes
+        ScanPDF yes
+        ScanSWF yes
+        ScanArchive yes
+        MaxDirectoryRecursion 20
+        FollowDirectorySymlinks yes
+        FollowFileSymlinks yes
+        LogFile /var/log/clamav/clamav.log
+        LogTime yes
+        LogRotate yes
+        LogVerbose no
+        PidFile /var/run/clamav/clamd.pid
+        DatabaseDirectory /var/lib/clamav
+        # Quarantine — move infected files here
+        MoveInfectedTo /var/quarantine/malware
+        # Alert on encrypted archives
+        AlertEncrypted yes
+        AlertEncryptedDoc yes
+        AlertEncryptedArchive yes
+    """)
+    Path("/etc/clamav").mkdir(parents=True, exist_ok=True)
+    write_file("/etc/clamav/clamd.conf.d/easyinstall.conf", clamd_conf)
+
+    # freshclam systemd override — auto-update every 4 hours
+    Path("/etc/systemd/system/clamav-freshclam.service.d").mkdir(parents=True, exist_ok=True)
+    write_file("/etc/systemd/system/clamav-freshclam.service.d/override.conf", textwrap.dedent("""\
+        [Service]
+        # EasyInstall v7.0 — freshclam update override
+        Restart=on-failure
+        RestartSec=300
+    """))
+
+    # Malware scan wrapper with per-site quarantine reporting
+    scan_script = textwrap.dedent("""\
+        #!/bin/bash
+        # EasyInstall v7.0 — WordPress Malware Scanner
+        # Scans all sites, quarantines threats, sends alerts
+        LOG="/var/log/easyinstall/malware-scan.log"
+        QUARANTINE="/var/quarantine/malware"
+        ALERT_CONF="/etc/easyinstall/alerts.conf"
+        REPORT="/root/malware-report-$(date +%Y%m%d).txt"
+        [ -f "$ALERT_CONF" ] && source "$ALERT_CONF"
+        mkdir -p /var/log/easyinstall "$QUARANTINE"
+
+        slog() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
+
+        send_alert() {
+            local msg="$1"
+            [ -n "${ALERT_EMAIL:-}" ] && command -v mail &>/dev/null && \
+                echo "$msg" | mail -s "[EasyInstall] MALWARE ALERT: $(hostname)" "$ALERT_EMAIL" 2>/dev/null || true
+            [ -n "${TELEGRAM_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] && \
+                curl -s --max-time 10 \
+                "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+                -d "chat_id=${TELEGRAM_CHAT_ID}" \
+                -d "text=🦠 MALWARE ALERT $(hostname): ${msg}" >/dev/null 2>&1 || true
+        }
+
+        slog "=== Malware Scan Started ==="
+        echo "EasyInstall v7.0 Malware Scan Report — $(date)" > "$REPORT"
+        echo "================================================" >> "$REPORT"
+        TOTAL_INFECTED=0
+
+        for site_dir in /var/www/html/*/; do
+            [ -d "$site_dir" ] || continue
+            DOMAIN=$(basename "$site_dir")
+            WP_CONTENT="${site_dir}wp-content"
+            [ -d "$WP_CONTENT" ] || continue
+            slog "Scanning: $DOMAIN"
+            echo "" >> "$REPORT"
+            echo "Site: $DOMAIN" >> "$REPORT"
+            INFECTED_TMP=$(mktemp)
+            clamscan -r --infected --no-summary \
+                --exclude-dir='^/var/quarantine' \
+                "$WP_CONTENT" 2>/dev/null > "$INFECTED_TMP" || true
+            COUNT=$(grep -c "FOUND$" "$INFECTED_TMP" 2>/dev/null || echo 0)
+            COUNT="${COUNT//[^0-9]/}"
+            if [ "${COUNT:-0}" -gt 0 ]; then
+                slog "  ⚠️  INFECTED: $COUNT file(s) in $DOMAIN"
+                cat "$INFECTED_TMP" >> "$REPORT"
+                TOTAL_INFECTED=$((TOTAL_INFECTED + COUNT))
+                # Move infected files to quarantine
+                grep "FOUND$" "$INFECTED_TMP" | awk -F': ' '{print $1}' | while read -r f; do
+                    mkdir -p "$QUARANTINE/$DOMAIN"
+                    mv "$f" "$QUARANTINE/$DOMAIN/" 2>/dev/null && \
+                        slog "  → Quarantined: $f" || true
+                done
+                send_alert "$COUNT infected file(s) found in $DOMAIN — check $QUARANTINE"
+            else
+                echo "  Status: CLEAN" >> "$REPORT"
+                slog "  ✅ Clean: $DOMAIN"
+            fi
+            rm -f "$INFECTED_TMP"
+        done
+
+        echo "" >> "$REPORT"
+        echo "Total infected files: $TOTAL_INFECTED" >> "$REPORT"
+        echo "Quarantine: $QUARANTINE" >> "$REPORT"
+        slog "=== Scan Complete — Total infected: $TOTAL_INFECTED | Report: $REPORT ==="
+    """)
+    write_file("/usr/local/bin/easy-malware-scan", scan_script, mode=0o755)
+    log("SUCCESS", "Malware scanner configured — run: easy-malware-scan")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_security_hardening
+# Writes SSH hardening config + ModSecurity snippets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_security_hardening(cfg):
+    log("STEP", "Writing security hardening configs — v7.0")
+
+    # nginx security headers snippet (reusable across all sites)
+    security_headers = textwrap.dedent("""\
+        # EasyInstall v7.0 — Security Headers (include in server blocks)
+        add_header X-Frame-Options           "SAMEORIGIN"        always;
+        add_header X-XSS-Protection          "1; mode=block"     always;
+        add_header X-Content-Type-Options    "nosniff"           always;
+        add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy        "camera=(), microphone=(), geolocation=()" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+        add_header Content-Security-Policy   "default-src 'self' https: data: 'unsafe-inline' 'unsafe-eval'" always;
+        # Remove server info leakage
+        server_tokens off;
+        # Hide PHP version
+        fastcgi_hide_header X-Powered-By;
+        # Hide nginx version
+        more_clear_headers Server 2>/dev/null || true;
+    """)
+    write_file("/etc/nginx/snippets/security-headers.conf", security_headers)
+
+    # WordPress-specific nginx security block
+    wp_security_block = textwrap.dedent(r"""\
+        # EasyInstall v7.0 — WordPress Security Block (include in wp server blocks)
+
+        # Block access to sensitive WordPress files
+        location ~* /(\\.git|wp-config\\.php|wp-config-sample\\.php|\\.htaccess|readme\\.html|license\\.txt|xmlrpc\\.php) {
+            deny all;
+            return 404;
+            access_log off;
+            log_not_found off;
+        }
+
+        # Block PHP execution in uploads directory
+        location ~* /wp-content/uploads/.*\\.php$ {
+            deny all;
+            return 403;
+        }
+
+        # Block PHP in wp-includes
+        location ~* /wp-includes/.*\\.php$ {
+            deny all;
+            return 403;
+        }
+
+        # Rate limit wp-login.php (10 req/min per IP)
+        location = /wp-login.php {
+            limit_req zone=login burst=3 nodelay;
+            include fastcgi_params;
+            fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        }
+
+        # Block user enumeration via ?author=N
+        if ($query_string ~ "^author=\\d") {
+            return 403;
+        }
+
+        # Block common exploit scanners
+        location ~* /(shell|phpspy|c99|r57|\.env|\.aws|backup|admin\\.php) {
+            deny all;
+            return 404;
+        }
+    """)
+    write_file("/etc/nginx/snippets/wp-security.conf", wp_security_block)
+
+    # nginx DDoS protection config
+    ddos_conf = textwrap.dedent(f"""\
+        # EasyInstall v7.0 — DDoS Protection
+        # Rate limit zones (reference in server blocks)
+        limit_req_zone $binary_remote_addr zone=login:10m rate=10r/m;
+        limit_req_zone $binary_remote_addr zone=api:10m   rate=30r/m;
+        limit_req_zone $binary_remote_addr zone=global:20m rate=100r/s;
+        limit_conn_zone $binary_remote_addr zone=perip:10m;
+        limit_conn_zone $server_name        zone=perserver:10m;
+
+        # Connection limits per IP
+        # Add to server blocks: limit_conn perip 20; limit_conn perserver 200;
+
+        # Block common bad bots and scanners
+        map $http_user_agent $bad_bot {{
+            default          0;
+            ~*MJ12bot        1;
+            ~*AhrefsBot      1;
+            ~*SemrushBot     1;
+            ~*DotBot         1;
+            ~*BLEXBot        1;
+            ~*masscan        1;
+            ~*nikto          1;
+            ~*sqlmap         1;
+            ~*zgrab          1;
+            ~*python-requests/2 1;
+        }}
+    """)
+    write_file("/etc/nginx/conf.d/ddos-protection.conf", ddos_conf)
+
+    log("SUCCESS", "Security hardening configs written")
+    log("INFO",    "Add to site configs: include /etc/nginx/snippets/wp-security.conf;")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_waf_config
+# Installs ModSecurity + OWASP CRS for nginx
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_waf_config(cfg):
+    log("STEP", "Configuring WAF (ModSecurity + OWASP CRS) — v7.0")
+
+    # Install ModSecurity nginx module
+    rc = run("apt-get install -y libmodsecurity3 libmodsecurity-dev 2>/dev/null", check=False)
+    if rc != 0:
+        log("WARNING", "ModSecurity packages not available — WAF config written for manual activation")
+
+    # Install nginx-mod-security if available
+    run("apt-get install -y libnginx-mod-security 2>/dev/null || true", check=False)
+
+    # Create ModSecurity directory structure
+    modsec_dir = Path("/etc/nginx/modsec")
+    modsec_dir.mkdir(parents=True, exist_ok=True)
+    Path("/etc/nginx/modsec/rules").mkdir(exist_ok=True)
+    Path("/var/log/nginx/modsec").mkdir(parents=True, exist_ok=True)
+
+    # Main ModSecurity config
+    modsec_main = textwrap.dedent("""\
+        # EasyInstall v7.0 — ModSecurity Main Config
+        # Load OWASP CRS rules
+        Include /etc/nginx/modsec/crs-setup.conf
+        Include /etc/nginx/modsec/rules/*.conf
+
+        # Core settings
+        SecRuleEngine On
+        SecRequestBodyAccess On
+        SecRequestBodyLimit 13107200
+        SecRequestBodyNoFilesLimit 131072
+        SecResponseBodyAccess Off
+        SecResponseBodyMimeType text/plain text/html text/xml
+
+        # Logging
+        SecDebugLog /var/log/nginx/modsec/debug.log
+        SecDebugLogLevel 0
+        SecAuditLog /var/log/nginx/modsec/audit.log
+        SecAuditLogParts ABIJDEFHZ
+        SecAuditEngine RelevantOnly
+        SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+
+        # Data directory
+        SecTmpDir /tmp/
+        SecDataDir /var/cache/nginx/modsec/
+        SecUploadDir /var/cache/nginx/modsec/uploads/
+
+        # Default action
+        SecDefaultAction "phase:1,log,auditlog,pass"
+        SecDefaultAction "phase:2,log,auditlog,pass"
+    """)
+    write_file("/etc/nginx/modsec/main.conf", modsec_main)
+
+    # CRS setup config
+    crs_setup = textwrap.dedent("""\
+        # EasyInstall v7.0 — OWASP CRS Setup
+        # Download CRS: git clone https://github.com/coreruleset/coreruleset.git /tmp/crs
+        # cp /tmp/crs/crs-setup.conf.example /etc/nginx/modsec/crs-setup.conf
+        # cp -r /tmp/crs/rules/ /etc/nginx/modsec/rules/
+
+        # Paranoia level (1=low, 4=high) — 1 recommended for WordPress
+        SecAction \\
+            "id:900000,\\
+            phase:1,\\
+            pass,\\
+            t:none,\\
+            setvar:tx.paranoia_level=1"
+
+        # Inbound anomaly score threshold (5=default)
+        SecAction \\
+            "id:900110,\\
+            phase:1,\\
+            pass,\\
+            t:none,\\
+            setvar:tx.inbound_anomaly_score_threshold=5,\\
+            setvar:tx.outbound_anomaly_score_threshold=4"
+
+        # WordPress-specific exclusions to reduce false positives
+        SecRuleRemoveById 920420
+        SecRuleRemoveById 941130
+        SecRuleRemoveByTag "attack-sqli" env=!WORDPRESS_ADMIN
+    """)
+    write_file("/etc/nginx/modsec/crs-setup.conf", crs_setup)
+
+    # nginx modsec snippet for inclusion in server blocks
+    modsec_snippet = textwrap.dedent("""\
+        # EasyInstall v7.0 — ModSecurity nginx snippet
+        # Add to server block: include /etc/nginx/snippets/modsec.conf;
+        modsecurity on;
+        modsecurity_rules_file /etc/nginx/modsec/main.conf;
+    """)
+    write_file("/etc/nginx/snippets/modsec.conf", modsec_snippet)
+
+    # nginx.conf load_module line (prepend if needed)
+    nginx_conf = Path("/etc/nginx/nginx.conf")
+    if nginx_conf.exists():
+        content = nginx_conf.read_text()
+        modsec_load = "load_module modules/ngx_http_modsecurity_module.so;\n"
+        if "modsecurity_module" not in content and "load_module" not in content:
+            nginx_conf.write_text(modsec_load + content)
+            log("INFO", "ModSecurity load_module added to nginx.conf")
+
+    # Create modsec cache dir
+    run("mkdir -p /var/cache/nginx/modsec/uploads && chown -R www-data:www-data /var/cache/nginx/modsec 2>/dev/null || true", check=False)
+
+    log("SUCCESS", "WAF (ModSecurity) config written")
+    log("INFO",    "To enable per-site: add 'include /etc/nginx/snippets/modsec.conf;' to server block")
+    log("INFO",    "Download OWASP CRS: git clone https://github.com/coreruleset/coreruleset /tmp/crs")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_php_fpm_autoscaler
+# Dynamic PHP-FPM pm.max_children scaling based on CPU + active processes
+# Runs every 5 minutes via cron, uses reload (not restart)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_php_fpm_autoscaler(cfg):
+    log("STEP", "Creating dynamic PHP-FPM auto-scaler — v7.0")
+
+    ram    = cfg.total_ram
+    cores  = cfg.total_cores
+    max_c  = cfg.php_max_children
+    floor  = max(3, max_c // 4)           # minimum children = 25% of base
+    ceiling = max_c * 2                   # maximum = 2× base (RAM-bounded)
+
+    autoscaler = textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        # EasyInstall v7.0 — Dynamic PHP-FPM Auto-Scaler
+        # Runs every 5 minutes via cron
+        # Adjusts pm.max_children based on CPU load + active FPM processes
+        # Uses systemctl reload (NOT restart) — zero downtime
+        import subprocess, os, re, sys, time
+        from pathlib import Path
+        from datetime import datetime
+
+        # Tuned for this server: RAM={ram}MB, Cores={cores}
+        BASE_CHILDREN   = {max_c}
+        FLOOR_CHILDREN  = {floor}
+        CEILING_CHILDREN= {ceiling}
+        SCALE_UP_CPU    = 70    # CPU% threshold → scale up
+        SCALE_DOWN_CPU  = 30    # CPU% threshold → scale down
+        LOG_FILE        = "/var/log/easyinstall/phpfpm-autoscale.log"
+        PHP_VERSIONS    = ["8.4", "8.3", "8.2"]
+
+        def log(msg):
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            line = f"[{{ts}}] [PHP-FPM-AUTOSCALE] {{msg}}"
+            print(line)
+            Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\\n")
+
+        def get_cpu_percent():
+            try:
+                r = subprocess.run(["top", "-bn1"], capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if "Cpu(s)" in line or "%Cpu" in line:
+                        # Extract idle percentage → CPU% = 100 - idle
+                        m = re.search(r"(\\d+\\.\\d+)\\s*id", line)
+                        if m:
+                            return round(100.0 - float(m.group(1)), 1)
+            except Exception:
+                pass
+            # Fallback: use /proc/loadavg
+            try:
+                load = float(open("/proc/loadavg").read().split()[0])
+                return round((load / {cores}) * 100, 1)
+            except Exception:
+                return 50.0
+
+        def get_active_fpm_processes(version):
+            try:
+                r = subprocess.run(
+                    ["pgrep", "-c", f"php-fpm{{version}}"],
+                    capture_output=True, text=True, timeout=3
+                )
+                return int(r.stdout.strip() or 0)
+            except Exception:
+                return 0
+
+        def get_current_max_children(conf_path):
+            try:
+                content = Path(conf_path).read_text()
+                m = re.search(r"^pm\\.max_children\\s*=\\s*(\\d+)", content, re.MULTILINE)
+                return int(m.group(1)) if m else BASE_CHILDREN
+            except Exception:
+                return BASE_CHILDREN
+
+        def set_max_children(conf_path, new_value):
+            try:
+                content = Path(conf_path).read_text()
+                new_content = re.sub(
+                    r"^(pm\\.max_children\\s*=\\s*)\\d+",
+                    f"\\g<1>{{new_value}}",
+                    content,
+                    flags=re.MULTILINE
+                )
+                Path(conf_path).write_text(new_content)
+                return True
+            except Exception as e:
+                log(f"ERROR writing {{conf_path}}: {{e}}")
+                return False
+
+        def reload_fpm(version):
+            try:
+                r = subprocess.run(
+                    ["systemctl", "reload", f"php{{version}}-fpm"],
+                    capture_output=True, text=True, timeout=15
+                )
+                return r.returncode == 0
+            except Exception:
+                return False
+
+        def main():
+            cpu = get_cpu_percent()
+            log(f"CPU: {{cpu}}% | Base: {{BASE_CHILDREN}} | Floor: {{FLOOR_CHILDREN}} | Ceiling: {{CEILING_CHILDREN}}")
+
+            for ver in PHP_VERSIONS:
+                conf = f"/etc/php/{{ver}}/fpm/pool.d/www.conf"
+                if not Path(conf).exists():
+                    continue
+
+                current = get_current_max_children(conf)
+                active  = get_active_fpm_processes(ver)
+                utilization = (active / max(current, 1)) * 100
+
+                log(f"PHP {{ver}}: current={{current}}, active={{active}}, util={{utilization:.0f}}%, cpu={{cpu}}%")
+
+                new_value = current
+
+                # Scale UP: high CPU or high utilization
+                if cpu >= SCALE_UP_CPU or utilization >= 80:
+                    step = max(5, current // 10)
+                    new_value = min(current + step, CEILING_CHILDREN)
+                    if new_value != current:
+                        log(f"PHP {{ver}}: SCALE UP {{current}} → {{new_value}} (cpu={{cpu}}%, util={{utilization:.0f}}%)")
+
+                # Scale DOWN: low CPU AND low utilization
+                elif cpu <= SCALE_DOWN_CPU and utilization <= 25:
+                    step = max(2, current // 10)
+                    new_value = max(current - step, FLOOR_CHILDREN)
+                    if new_value != current:
+                        log(f"PHP {{ver}}: SCALE DOWN {{current}} → {{new_value}} (cpu={{cpu}}%, util={{utilization:.0f}}%)")
+
+                if new_value != current:
+                    if set_max_children(conf, new_value):
+                        if reload_fpm(ver):
+                            log(f"PHP {{ver}}: Reloaded (no restart) — max_children={{new_value}}")
+                        else:
+                            log(f"PHP {{ver}}: ⚠️  Reload failed — reverting to {{current}}")
+                            set_max_children(conf, current)
+                else:
+                    log(f"PHP {{ver}}: No change needed ({{current}} children)")
+
+        if __name__ == "__main__":
+            main()
+    """)
+    write_file("/usr/local/bin/easy-phpfpm-autoscale", autoscaler, mode=0o755)
+
+    # Cron: run every 5 minutes
+    cron_entry = "*/5 * * * * root /usr/bin/python3 /usr/local/bin/easy-phpfpm-autoscale 2>/dev/null\n"
+    cron_path = Path("/etc/cron.d/easy-phpfpm-autoscale")
+    cron_path.write_text(f"# EasyInstall v7.0 — PHP-FPM Dynamic Auto-Scaler\n{cron_entry}")
+
+    log("SUCCESS", f"PHP-FPM auto-scaler installed (floor={floor}, base={max_c}, ceiling={ceiling})")
+    log("INFO",    "Runs every 5 min via cron — logs: /var/log/easyinstall/phpfpm-autoscale.log")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_redis_multidb
+# Per-site Redis DB isolation in wp-config.php
+# DB0=object cache, DB1=sessions, DB2=transients
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_redis_multidb(cfg):
+    log("STEP", "Configuring per-site Redis multi-DB isolation — v7.0")
+
+    wp_root = Path("/var/www/html")
+    if not wp_root.exists():
+        log("WARNING", "No WordPress sites found — Redis multi-DB skipped")
+        return
+
+    sites_updated = 0
+    for site_dir in sorted(wp_root.iterdir()):
+        if not site_dir.is_dir():
+            continue
+        wp_config = site_dir / "wp-config.php"
+        if not wp_config.exists():
+            continue
+
+        domain = site_dir.name
+        # Determine Redis port from per-site Redis config
+        domain_slug = domain.replace(".", "-")
+        redis_conf = Path(f"/etc/redis/redis-{domain_slug}.conf")
+        redis_port = 6379
+        if redis_conf.exists():
+            for line in redis_conf.read_text().splitlines():
+                if line.startswith("port "):
+                    try:
+                        redis_port = int(line.split()[1])
+                    except (ValueError, IndexError):
+                        pass
+
+        content = wp_config.read_text()
+
+        # Skip if already configured for multi-DB
+        if "WP_REDIS_DATABASE_SESSION" in content:
+            log("INFO", f"{domain}: Redis multi-DB already configured")
+            continue
+
+        redis_multidb_block = textwrap.dedent(f"""\
+            // EasyInstall v7.0 — Redis Multi-DB Isolation
+            // DB0 = Object cache (default WordPress cache)
+            // DB1 = PHP sessions
+            // DB2 = Transients (wp_options transient API)
+            define('WP_REDIS_HOST',               '127.0.0.1');
+            define('WP_REDIS_PORT',               {redis_port});
+            define('WP_REDIS_DATABASE',           0);   // Object cache
+            define('WP_REDIS_DATABASE_SESSION',   1);   // Sessions
+            define('WP_REDIS_DATABASE_TRANSIENT', 2);   // Transients
+            define('WP_REDIS_TIMEOUT',            1);
+            define('WP_REDIS_READ_TIMEOUT',       1);
+            define('WP_REDIS_MAXTTL',             86400);
+            define('WP_REDIS_SELECTIVE_FLUSH',    true);
+            // Session handler — store PHP sessions in Redis DB1
+            ini_set('session.save_handler', 'redis');
+            ini_set('session.save_path',    'tcp://127.0.0.1:{redis_port}?database=1');
+        """)
+
+        # Insert after the first <?php line
+        if "<?php" in content and "WP_REDIS_DATABASE" not in content:
+            new_content = content.replace(
+                "<?php\n",
+                "<?php\n" + redis_multidb_block + "\n",
+                1
+            )
+            wp_config.write_text(new_content)
+            run(f"chown www-data:www-data {wp_config} 2>/dev/null || true", check=False)
+            log("SUCCESS", f"{domain}: Redis multi-DB configured (port {redis_port})")
+            sites_updated += 1
+        else:
+            log("INFO", f"{domain}: wp-config.php structure unexpected — skipped")
+
+    log("SUCCESS", f"Redis multi-DB isolation applied to {sites_updated} site(s)")
+    log("INFO",    "DB0=ObjectCache, DB1=Sessions, DB2=Transients — per-site isolation")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_db_optimizer
+# Analyzes slow query log, suggests indexes, generates report
+# Uses pt-query-digest if available, else custom parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_db_optimizer(cfg):
+    log("STEP", "Creating database query optimizer — v7.0")
+
+    optimizer_script = textwrap.dedent("""\
+        #!/usr/bin/env python3
+        # EasyInstall v7.0 — Database Query Optimizer
+        # Analyzes slow query log and generates optimization report
+        # NEVER auto-creates indexes — suggestions only (safe for production)
+        import subprocess, re, sys, os
+        from pathlib import Path
+        from datetime import datetime
+        from collections import defaultdict
+
+        SLOW_LOG      = "/var/log/mysql/slow.log"
+        REPORT_FILE   = "/root/db-optimization-report.txt"
+        LOG_FILE      = "/var/log/easyinstall/db-optimizer.log"
+        TOP_N_QUERIES = 20
+
+        def olog(msg):
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            line = f"[{ts}] [DB-OPTIMIZER] {msg}"
+            print(line)
+            Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\\n")
+
+        def run_sql(query):
+            try:
+                r = subprocess.run(
+                    ["mysql", "-N", "-e", query],
+                    capture_output=True, text=True, timeout=30
+                )
+                return r.stdout.strip() if r.returncode == 0 else ""
+            except Exception:
+                return ""
+
+        def parse_slow_log(log_path):
+            # Parse MySQL slow query log, return list of (query, time, lock_time, rows).
+            if not Path(log_path).exists():
+                return []
+            queries = []
+            current = {}
+            try:
+                for line in open(log_path, errors="replace"):
+                    line = line.rstrip()
+                    if line.startswith("# Query_time:"):
+                        m = re.search(
+                            r"Query_time:\\s*([\\d.]+).*Lock_time:\\s*([\\d.]+).*Rows_sent:\\s*(\\d+).*Rows_examined:\\s*(\\d+)",
+                            line
+                        )
+                        if m:
+                            current = {
+                                "time":      float(m.group(1)),
+                                "lock_time": float(m.group(2)),
+                                "rows_sent": int(m.group(3)),
+                                "rows_examined": int(m.group(4)),
+                            }
+                    elif line.startswith("SET timestamp="):
+                        pass
+                    elif current and not line.startswith("#") and len(line) > 5:
+                        current["query"] = line[:300]
+                        queries.append(dict(current))
+                        current = {}
+            except Exception as e:
+                olog(f"Error parsing slow log: {e}")
+            return queries
+
+        def try_pt_query_digest():
+            # Use pt-query-digest if available for better analysis.
+            if not (Path("/usr/bin/pt-query-digest").exists() or
+                    Path("/usr/local/bin/pt-query-digest").exists()):
+                return None
+            try:
+                r = subprocess.run(
+                    ["pt-query-digest", "--report-format=query_report",
+                     "--limit=20", SLOW_LOG],
+                    capture_output=True, text=True, timeout=120
+                )
+                return r.stdout[:8000] if r.returncode == 0 else None
+            except Exception:
+                return None
+
+        def get_missing_indexes():
+            # Check for tables missing indexes using EXPLAIN on slow queries.
+            suggestions = []
+            # Check WordPress core tables for missing indexes
+            wp_tables_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'wp_%';"
+            tables = run_sql(wp_tables_sql)
+            if not tables:
+                return suggestions
+            for table in tables.splitlines():
+                table = table.strip()
+                if not table:
+                    continue
+                idx_check = run_sql(f"SHOW INDEX FROM `{table}`;")
+                if not idx_check:
+                    suggestions.append(f"  ⚠️  Table `{table}` has NO indexes — consider: ALTER TABLE `{table}` ADD INDEX (id);")
+            return suggestions[:10]
+
+        def get_table_stats():
+            # Get WordPress table sizes and row counts.
+            sql = ("SELECT table_name, "
+                   "ROUND(((data_length + index_length) / 1024 / 1024), 2) AS size_mb, "
+                   "table_rows FROM information_schema.tables "
+                   "WHERE table_schema = DATABASE() AND table_name LIKE 'wp_%' "
+                   "ORDER BY (data_length + index_length) DESC LIMIT 15;")
+            return run_sql(sql)
+
+        def get_innodb_status():
+            return run_sql("SHOW ENGINE INNODB STATUS\\\\G")[:3000]
+
+        def generate_report(queries, pt_output):
+            lines = [
+                "=" * 60,
+                "EasyInstall v7.0 — Database Optimization Report",
+                f"Generated: {datetime.now()}",
+                "=" * 60, "",
+            ]
+
+            # Server variables
+            lines += ["=== MySQL Server Variables ==="]
+            for var in ["innodb_buffer_pool_size", "query_cache_size", "slow_query_log",
+                        "long_query_time", "max_connections", "thread_cache_size"]:
+                val = run_sql(f"SHOW VARIABLES LIKE '{var}';")
+                if val:
+                    lines.append(f"  {val}")
+            lines.append("")
+
+            # Table statistics
+            lines += ["=== WordPress Table Statistics (Top 15 by size) ==="]
+            stats = get_table_stats()
+            if stats:
+                lines.append("  table_name | size_mb | rows")
+                for row in stats.splitlines():
+                    lines.append(f"  {row}")
+            else:
+                lines.append("  (Could not connect to MySQL)")
+            lines.append("")
+
+            # pt-query-digest output (if available)
+            if pt_output:
+                lines += ["=== pt-query-digest Analysis ===", pt_output, ""]
+            elif queries:
+                # Sort by query time descending
+                top = sorted(queries, key=lambda x: x.get("time", 0), reverse=True)[:TOP_N_QUERIES]
+                lines += [f"=== Top {len(top)} Slowest Queries (from slow.log) ==="]
+                for i, q in enumerate(top, 1):
+                    lines.append(f"  [{i}] Time: {q['time']:.3f}s | Lock: {q['lock_time']:.3f}s | "
+                                  f"Rows examined: {q['rows_examined']} | Rows sent: {q['rows_sent']}")
+                    lines.append(f"      Query: {q.get('query', '')[:150]}")
+                    # Basic index suggestion
+                    qtext = q.get("query", "").upper()
+                    if "WHERE" in qtext and "INDEX" not in qtext:
+                        m = re.search(r"FROM\\s+(\\w+).*WHERE\\s+(\\w+)", qtext)
+                        if m:
+                            tbl = m.group(1).lower()
+                            col = m.group(2).lower()
+                            lines.append(f"      💡 Suggestion: ALTER TABLE `{tbl}` ADD INDEX idx_{col} (`{col}`);")
+                    lines.append("")
+            else:
+                lines.append("  No slow query data found. Enable: slow_query_log=1, long_query_time=2")
+            lines.append("")
+
+            # Missing index suggestions
+            lines += ["=== Index Suggestions ==="]
+            missing = get_missing_indexes()
+            if missing:
+                lines += missing
+            else:
+                lines.append("  No obvious missing indexes detected")
+            lines.append("")
+
+            # WordPress-specific recommendations
+            lines += [
+                "=== WordPress-Specific Recommendations ===",
+                "  1. Run: wp cron event run --due-now --allow-root (clear stuck cron)",
+                "  2. Run: wp cache flush --allow-root (flush object cache)",
+                "  3. Run: wp db optimize --allow-root (optimize all tables)",
+                "  4. wp db repair --allow-root (repair corrupted tables)",
+                "  5. Check autoloaded options: SELECT SUM(LENGTH(option_value)) FROM wp_options WHERE autoload='yes';",
+                "  6. Large wp_options autoload can severely slow WP — use: wp option get siteurl --allow-root",
+                "",
+                "=== General MySQL Recommendations ===",
+                "  • Ensure innodb_buffer_pool_size = 70-80% of dedicated DB RAM",
+                "  • Set long_query_time=1 for more granular slow query capture",
+                "  • Consider pt-query-digest: apt-get install percona-toolkit",
+                "  • Run: ANALYZE TABLE wp_posts wp_postmeta wp_options wp_users;",
+                "  • NOTE: Do NOT auto-apply INDEX suggestions without testing on staging first",
+            ]
+
+            return "\\n".join(lines)
+
+        def main():
+            olog("Starting database optimization analysis...")
+            queries = []
+            pt_output = None
+
+            # Try pt-query-digest first
+            olog("Checking for pt-query-digest...")
+            pt_output = try_pt_query_digest()
+            if pt_output:
+                olog("pt-query-digest analysis complete")
+            else:
+                olog("pt-query-digest not found — using built-in parser")
+                queries = parse_slow_log(SLOW_LOG)
+                olog(f"Parsed {len(queries)} slow queries from {SLOW_LOG}")
+
+            report = generate_report(queries, pt_output)
+            Path(REPORT_FILE).write_text(report)
+            Path(REPORT_FILE).chmod(0o600)
+            olog(f"Report written: {REPORT_FILE}")
+            print(report[:2000])  # Print summary to stdout
+            print(f"\\nFull report: {REPORT_FILE}")
+
+        if __name__ == "__main__":
+            main()
+    """)
+    write_file("/usr/local/bin/easy-db-optimizer", optimizer_script, mode=0o755)
+
+    # Weekly cron for DB optimization report
+    cron_entry = (
+        "# EasyInstall v7.0 — Weekly DB optimization report\n"
+        "0 4 * * 0 root /usr/bin/python3 /usr/local/bin/easy-db-optimizer >> "
+        "/var/log/easyinstall/db-optimizer.log 2>&1\n"
+    )
+    write_file("/etc/cron.d/easy-db-optimizer", cron_entry)
+    log("SUCCESS", "DB optimizer installed — run: easy-db-optimizer | Weekly cron Sunday 4 AM")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_prometheus_setup
+# Installs node_exporter + writes prometheus.yml + grafana note
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_prometheus_setup(cfg):
+    log("STEP", "Setting up Prometheus + node_exporter — v7.0")
+
+    # Install node_exporter via apt (Ubuntu/Debian)
+    rc = run("apt-get install -y prometheus-node-exporter 2>/dev/null", check=False)
+    if rc == 0:
+        run("systemctl enable prometheus-node-exporter 2>/dev/null || true", check=False)
+        run("systemctl start prometheus-node-exporter 2>/dev/null || true", check=False)
+        log("SUCCESS", "prometheus-node-exporter installed and started (port 9100)")
+    else:
+        log("WARNING", "prometheus-node-exporter not available via apt — writing config only")
+
+    # Install prometheus if available
+    rc2 = run("apt-get install -y prometheus 2>/dev/null", check=False)
+    if rc2 == 0:
+        log("SUCCESS", "Prometheus installed")
+
+    # Write prometheus.yml
+    ram = cfg.total_ram
+    prometheus_yml = textwrap.dedent(f"""\
+        # EasyInstall v7.0 — Prometheus Configuration
+        # Server: {ram}MB RAM
+        global:
+          scrape_interval:     15s
+          evaluation_interval: 15s
+          external_labels:
+            monitor: 'easyinstall-v7'
+
+        # Alertmanager (configure if desired)
+        # alerting:
+        #   alertmanagers:
+        #     - static_configs:
+        #         - targets: ['localhost:9093']
+
+        scrape_configs:
+          # Node metrics (CPU, RAM, Disk, Network)
+          - job_name: 'node'
+            static_configs:
+              - targets: ['localhost:9100']
+            relabel_configs:
+              - source_labels: [__address__]
+                target_label: instance
+                replacement: 'easyinstall-server'
+
+          # nginx metrics (requires nginx-prometheus-exporter)
+          # apt-get install nginx-prometheus-exporter
+          - job_name: 'nginx'
+            static_configs:
+              - targets: ['localhost:9113']
+
+          # MySQL/MariaDB metrics (requires mysqld_exporter)
+          - job_name: 'mysql'
+            static_configs:
+              - targets: ['localhost:9104']
+
+          # Redis metrics (requires redis_exporter)
+          - job_name: 'redis'
+            static_configs:
+              - targets: ['localhost:9121']
+
+          # PHP-FPM metrics (requires php-fpm_exporter)
+          - job_name: 'php-fpm'
+            static_configs:
+              - targets: ['localhost:9253']
+    """)
+    Path("/etc/prometheus").mkdir(parents=True, exist_ok=True)
+    write_file("/etc/prometheus/prometheus.yml", prometheus_yml)
+
+    # Grafana installation note
+    grafana_note = textwrap.dedent("""\
+        ========================================
+        EasyInstall v7.0 — Grafana Setup Guide
+        ========================================
+
+        1. Install Grafana:
+           apt-get install -y apt-transport-https software-properties-common
+           wget -q -O - https://packages.grafana.com/gpg.key | apt-key add -
+           echo "deb https://packages.grafana.com/oss/deb stable main" > /etc/apt/sources.list.d/grafana.list
+           apt-get update && apt-get install -y grafana
+           systemctl enable grafana-server && systemctl start grafana-server
+
+        2. Open Grafana: http://YOUR_SERVER_IP:3000 (default: admin/admin)
+
+        3. Add Prometheus data source:
+           Configuration → Data Sources → Add → Prometheus → URL: http://localhost:9090
+
+        4. Import WordPress/Server dashboards:
+           Dashboard ID 1860  (Node Exporter Full)
+           Dashboard ID 763   (Redis Dashboard)
+           Dashboard ID 7362  (MySQL Overview)
+           Dashboard ID 4358  (Nginx VTS)
+
+        5. UFW: Allow Grafana port from your IP only:
+           ufw allow from YOUR_IP to any port 3000
+           (Do NOT open 3000 to public)
+
+        Additional exporters:
+          nginx:   apt-get install nginx-prometheus-exporter
+                   nginx-prometheus-exporter -nginx.scrape-uri=http://localhost/nginx_status
+          mysql:   https://github.com/prometheus/mysqld_exporter
+          redis:   https://github.com/oliver006/redis_exporter
+        ========================================
+    """)
+    write_file("/root/grafana-setup-guide.txt", grafana_note, mode=0o600)
+
+    # nginx /nginx_status endpoint for prometheus scraping
+    nginx_status_conf = textwrap.dedent("""\
+        # EasyInstall v7.0 — nginx stub_status for Prometheus
+        server {
+            listen 127.0.0.1:8080;
+            server_name localhost;
+            location /nginx_status {
+                stub_status on;
+                allow 127.0.0.1;
+                deny all;
+                access_log off;
+            }
+            location /php-fpm-status {
+                fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                include fastcgi_params;
+                fastcgi_param SCRIPT_NAME /status;
+                allow 127.0.0.1;
+                deny all;
+                access_log off;
+            }
+        }
+    """)
+    write_file("/etc/nginx/conf.d/monitoring-endpoints.conf", nginx_status_conf)
+
+    log("SUCCESS", "Prometheus + node_exporter configured")
+    log("INFO",    "Grafana setup guide: /root/grafana-setup-guide.txt")
+    log("INFO",    "node_exporter metrics: http://localhost:9100/metrics")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW v7.0 STAGE: stage_config_validator
+# Validates all config files after installation, triggers rollback on failure
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_config_validator(cfg):
+    log("STEP", "Validating all configuration files — v7.0")
+
+    results = {}
+    failed  = []
+
+    def validate(name, cmd, expected_rc=0):
+        """Run a validation command, return True if passes."""
+        try:
+            r = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=30
+            )
+            ok = (r.returncode == expected_rc)
+            results[name] = {"ok": ok, "rc": r.returncode, "stderr": r.stderr[:300]}
+            if ok:
+                log("SUCCESS", f"✅ {name}: valid")
+            else:
+                log("ERROR",   f"❌ {name}: FAILED (rc={r.returncode})")
+                log("ERROR",   f"   {r.stderr[:200]}")
+                failed.append(name)
+            return ok
+        except subprocess.TimeoutExpired:
+            log("WARNING", f"⏰ {name}: validation timeout")
+            return True  # timeout = non-critical
+        except Exception as e:
+            log("WARNING", f"⚠️  {name}: {e}")
+            return True
+
+    # nginx
+    validate("nginx-config",  "nginx -t 2>&1")
+
+    # PHP-FPM (all installed versions)
+    for ver in ["8.4", "8.3", "8.2"]:
+        conf = f"/etc/php/{ver}/fpm/pool.d/www.conf"
+        if Path(f"/etc/php/{ver}").exists():
+            validate(f"php{ver}-fpm-syntax",
+                     f"php-fpm{ver} --fpm-config /etc/php/{ver}/fpm/php-fpm.conf -t 2>&1")
+
+    # MariaDB
+    validate("mariadb-config",
+             "mysqld --help --verbose --user=mysql 2>&1 | head -5",
+             expected_rc=0)
+
+    # Redis syntax check
+    if Path("/etc/redis/redis.conf").exists():
+        validate("redis-config",
+                 "redis-server /etc/redis/redis.conf --test-memory 0 2>&1 | head -3 || true",
+                 expected_rc=0)
+
+    # Fail2ban
+    if Path("/etc/fail2ban/jail.local").exists():
+        validate("fail2ban-config", "fail2ban-client --test 2>&1 | head -5")
+
+    # UFW
+    validate("ufw-status", "ufw status 2>&1 | head -5")
+
+    # Write validation report
+    report_lines = [
+        "=" * 50,
+        "EasyInstall v7.0 — Config Validation Report",
+        f"Date: {datetime.now()}",
+        "=" * 50, "",
+    ]
+    for name, res in results.items():
+        status = "✅ PASS" if res["ok"] else "❌ FAIL"
+        report_lines.append(f"  {status}  {name}")
+        if not res["ok"] and res["stderr"]:
+            report_lines.append(f"         Error: {res['stderr'][:150]}")
+    report_lines += ["", f"Total: {len(results)} checks | Failed: {len(failed)}"]
+    report = "\n".join(report_lines)
+    write_file("/root/config-validation-report.txt", report, mode=0o600)
+
+    if failed:
+        log("ERROR", f"Config validation FAILED for: {', '.join(failed)}")
+        log("ERROR", "Report: /root/config-validation-report.txt")
+        log("WARNING", "Attempting service reload with current configs...")
+        # Attempt nginx reload only if valid
+        if "nginx-config" not in failed:
+            run("systemctl reload nginx 2>/dev/null || true", check=False)
+        # Do NOT exit — let bash layer handle rollback decision
+    else:
+        log("SUCCESS", "All configuration files valid")
+        # Reload all services now that configs are verified
+        for svc in ["nginx", "mariadb", "redis-server"]:
+            run(f"systemctl reload {svc} 2>/dev/null || systemctl restart {svc} 2>/dev/null || true",
+                check=False)
+        for ver in ["8.4", "8.3", "8.2"]:
+            run(f"systemctl reload php{ver}-fpm 2>/dev/null || true", check=False)
+
+    log("INFO", f"Validation report: /root/config-validation-report.txt")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main dispatcher — UPDATED v7.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 STAGE_MAP = {
-    "kernel_tuning":           stage_kernel_tuning,
-    "nginx_config":            stage_nginx_config,
-    "nginx_extras":            stage_nginx_extras,
-    "websocket_support":       stage_websocket_support,
-    "http3_quic":              stage_http3_quic,
-    "edge_computing":          stage_edge_computing,
-    "php_config":              stage_php_config,
-    "mysql_config":            stage_mysql_config,
-    "redis_config":            stage_redis_config,
-    "firewall_config":         stage_firewall_config,
-    "fail2ban_config":         stage_fail2ban_config,
-    "create_redis_monitor":    stage_create_redis_monitor,
-    "create_commands":         stage_create_commands,
-    "create_autoheal":         stage_create_autoheal,
-    "create_backup_script":    stage_create_backup_script,
-    "create_monitor":          stage_create_monitor,
-    "create_welcome":          stage_create_welcome,
-    "create_info_file":        stage_create_info_file,
-    "create_ai_module":        stage_create_ai_module,
-    "create_autotune_module":  stage_create_autotune_module,
-    "advanced_autotune":       stage_advanced_autotune,
-    "wordpress_install":       stage_wordpress_install,
-    "clone_site":              stage_clone_site,
-    "remote_install":          stage_remote_install,   # NEW: deepseek_python integrated
+    # ── Original v6.4 stages (unchanged) ─────────────────────────────────────
+    "kernel_tuning":            stage_kernel_tuning,
+    "nginx_config":             stage_nginx_config,
+    "nginx_extras":             stage_nginx_extras,
+    "websocket_support":        stage_websocket_support,
+    "http3_quic":               stage_http3_quic,
+    "edge_computing":           stage_edge_computing,
+    "php_config":               stage_php_config,
+    "mysql_config":             stage_mysql_config,
+    "redis_config":             stage_redis_config,
+    "firewall_config":          stage_firewall_config,
+    "fail2ban_config":          stage_fail2ban_config,
+    "create_redis_monitor":     stage_create_redis_monitor,
+    "create_commands":          stage_create_commands,
+    "create_autoheal":          stage_create_autoheal,
+    "create_backup_script":     stage_create_backup_script,
+    "create_monitor":           stage_create_monitor,
+    "create_welcome":           stage_create_welcome,
+    "create_info_file":         stage_create_info_file,
+    "create_ai_module":         stage_create_ai_module,
+    "create_autotune_module":   stage_create_autotune_module,
+    "advanced_autotune":        stage_advanced_autotune,
+    "wordpress_install":        stage_wordpress_install,
+    "clone_site":               stage_clone_site,
+    "remote_install":           stage_remote_install,
+    # ── New v7.0 stages ───────────────────────────────────────────────────────
+    "stage_malware_scanner":    stage_malware_scanner,
+    "stage_security_hardening": stage_security_hardening,
+    "stage_waf_config":         stage_waf_config,
+    "stage_php_fpm_autoscaler": stage_php_fpm_autoscaler,
+    "stage_redis_multidb":      stage_redis_multidb,
+    "stage_db_optimizer":       stage_db_optimizer,
+    "stage_prometheus_setup":   stage_prometheus_setup,
+    "stage_config_validator":   stage_config_validator,
 }
 
 

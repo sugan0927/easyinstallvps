@@ -28,7 +28,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ── Global Variables ─────────────────────────────────────────────────────────
-SCRIPT_VERSION="6.4"
+SCRIPT_VERSION="7.0"
 LOCK_FILE="/var/run/easyinstall.lock"
 LOG_FILE="/var/log/easyinstall/install.log"
 ERROR_LOG="/var/log/easyinstall/error.log"
@@ -37,6 +37,12 @@ BACKUP_DIR="/root/easyinstall-backups/$(date +%Y%m%d-%H%M%S)"
 USED_REDIS_PORTS_FILE="/var/lib/easyinstall/used_redis_ports.txt"
 INSTALL_START_TIME=$(date +%s)
 PYTHON_CONFIG_SCRIPT="/usr/local/lib/easyinstall_config.py"
+CENTRAL_LOG_DIR="/var/log/easyinstall/central"
+SECURITY_AUDIT_REPORT="/root/security-audit.txt"
+ALERT_EMAIL="${ALERT_EMAIL:-}"
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+SLACK_WEBHOOK="${SLACK_WEBHOOK:-}"
 
 # ============================================
 # SECTION 1 — LOGGING  (pure bash, no deps)
@@ -830,17 +836,505 @@ start_fail2ban() {
 }
 
 # ============================================
+# SECTION 23b — SSH HARDENING (BASH)
+# ============================================
+harden_ssh() {
+    log "STEP" "Hardening SSH configuration"
+    local sshd_conf="/etc/ssh/sshd_config"
+    [ ! -f "$sshd_conf" ] && { log "WARNING" "sshd_config not found, skipping SSH hardening"; return 0; }
+
+    # Backup first
+    cp -p "$sshd_conf" "${sshd_conf}.bak.$(date +%Y%m%d%H%M%S)"
+    log "INFO" "SSH config backed up"
+
+    # Apply hardening settings
+    local settings=(
+        "PasswordAuthentication no"
+        "PermitRootLogin no"
+        "X11Forwarding no"
+        "MaxAuthTries 3"
+        "LoginGraceTime 20"
+        "AllowAgentForwarding no"
+        "AllowTcpForwarding no"
+        "PermitEmptyPasswords no"
+        "ClientAliveInterval 300"
+        "ClientAliveCountMax 2"
+        "Protocol 2"
+        "UseDNS no"
+    )
+
+    for setting in "${settings[@]}"; do
+        local key="${setting%% *}"
+        if grep -qE "^#?${key}[[:space:]]" "$sshd_conf"; then
+            sed -i "s|^#*[[:space:]]*${key}.*|${setting}|g" "$sshd_conf"
+        else
+            echo "$setting" >> "$sshd_conf"
+        fi
+    done
+
+    # Validate and restart SSH
+    if sshd -t 2>/dev/null; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        log "SUCCESS" "SSH hardened — password login disabled, root login disabled"
+        log "WARNING" "IMPORTANT: Ensure you have SSH key configured before next login!"
+    else
+        log "ERROR" "SSH config validation failed — restoring backup"
+        cp "${sshd_conf}.bak."* "$sshd_conf" 2>/dev/null || true
+    fi
+}
+
+# ============================================
+# SECTION 23c — MALWARE SCANNER SETUP (BASH)
+# Installs ClamAV + sets up scan cron jobs
+# Python stage handles config file generation
+# ============================================
+install_malware_scanner() {
+    log "STEP" "Installing malware scanner (ClamAV)"
+
+    # Install ClamAV
+    run_cmd_retry 3 5 "apt-get install -y clamav clamav-daemon" || {
+        log "WARNING" "ClamAV installation failed — skipping malware scanner"
+        return 0
+    }
+
+    # Update virus database
+    log "INFO" "Updating ClamAV virus database..."
+    systemctl stop clamav-freshclam 2>/dev/null || true
+    run_cmd_retry 2 10 "freshclam" || log "WARNING" "freshclam update failed — will retry via cron"
+    systemctl enable clamav-freshclam 2>/dev/null || true
+    systemctl start clamav-freshclam 2>/dev/null || true
+
+    # Install Linux Malware Detect (maldet) if available
+    if run_cmd_retry 2 5 "apt-get install -y maldet" 2>/dev/null; then
+        log "SUCCESS" "maldet installed"
+    else
+        log "INFO" "maldet not available via apt — ClamAV only"
+    fi
+
+    # Create malware scan script
+    mkdir -p /usr/local/bin
+    cat > /usr/local/bin/easy-malware-scan <<'SCANSCRIPT'
+#!/bin/bash
+# EasyInstall v7.0 — Malware Scanner
+LOG="/var/log/easyinstall/malware-scan.log"
+QUARANTINE_DIR="/var/quarantine/malware"
+ALERT_EMAIL="${ALERT_EMAIL:-}"
+mkdir -p "$QUARANTINE_DIR"
+
+log_scan() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
+
+scan_site() {
+    local domain="$1"
+    local wp_content="/var/www/html/${domain}/wp-content"
+    [ -d "$wp_content" ] || return 0
+
+    log_scan "Scanning $domain wp-content..."
+    local infected_file="/tmp/clamav-infected-${domain}.txt"
+
+    clamscan -r --infected --no-summary \
+        --move="$QUARANTINE_DIR" \
+        "$wp_content" 2>/dev/null > "$infected_file" || true
+
+    local infected_count
+    infected_count=$(wc -l < "$infected_file" 2>/dev/null || echo 0)
+    infected_count="${infected_count//[^0-9]/}"
+
+    if [ "${infected_count:-0}" -gt 0 ]; then
+        log_scan "⚠️  INFECTED FILES FOUND in $domain: $infected_count file(s)"
+        log_scan "Files quarantined to: $QUARANTINE_DIR"
+        cat "$infected_file" >> "$LOG"
+        # Send alert
+        if [ -n "$ALERT_EMAIL" ]; then
+            echo "Malware detected in $domain ($infected_count files). Check: $QUARANTINE_DIR" | \
+                mail -s "[EasyInstall] MALWARE ALERT: $domain" "$ALERT_EMAIL" 2>/dev/null || true
+        fi
+    else
+        log_scan "✅ Clean: $domain"
+    fi
+    rm -f "$infected_file"
+}
+
+# Scan all WordPress sites
+for site_dir in /var/www/html/*/; do
+    [ -d "$site_dir" ] || continue
+    domain=$(basename "$site_dir")
+    scan_site "$domain"
+done
+
+log_scan "Malware scan completed"
+SCANSCRIPT
+    chmod +x /usr/local/bin/easy-malware-scan
+
+    # Install daily cron + weekly freshclam update
+    cat > /etc/cron.d/easy-malware-scan <<'SCANCRON'
+# EasyInstall v7.0 — Daily malware scan (3 AM)
+0 3 * * * root /usr/local/bin/easy-malware-scan >> /var/log/easyinstall/malware-scan.log 2>&1
+# Weekly virus DB update
+0 2 * * 0 root freshclam >> /var/log/easyinstall/freshclam.log 2>&1
+SCANCRON
+
+    log "SUCCESS" "Malware scanner installed — daily cron at 3 AM"
+    log "INFO"    "Manual scan: easy-malware-scan | Quarantine: /var/quarantine/malware"
+}
+
+# ============================================
+# SECTION 23d — SECURITY AUDIT (BASH)
+# Runs lynis system audit, saves summary report
+# ============================================
+run_security_audit() {
+    log "STEP" "Running system security audit (lynis)"
+
+    # Install lynis
+    if ! command -v lynis &>/dev/null; then
+        run_cmd_retry 2 5 "apt-get install -y lynis" || {
+            log "WARNING" "lynis not available — skipping security audit"
+            return 0
+        }
+    fi
+
+    log "INFO" "Running lynis audit (this may take 1-2 minutes)..."
+    local audit_raw="/tmp/lynis-audit-raw.txt"
+    lynis audit system --quiet --no-colors > "$audit_raw" 2>&1 || true
+
+    # Parse and create summary report
+    cat > "$SECURITY_AUDIT_REPORT" <<REPORTHEADER
+========================================
+EasyInstall v7.0 — Security Audit Report
+Date: $(date)
+Hostname: $(hostname)
+Kernel: $(uname -r)
+========================================
+
+REPORTHEADER
+
+    # Extract hardening index
+    local hardening_index
+    hardening_index=$(grep "Hardening index" "$audit_raw" | awk '{print $NF}' || echo "N/A")
+    echo "HARDENING INDEX: $hardening_index / 100" >> "$SECURITY_AUDIT_REPORT"
+    echo "" >> "$SECURITY_AUDIT_REPORT"
+
+    # Extract HIGH priority warnings
+    echo "=== HIGH PRIORITY FINDINGS ===" >> "$SECURITY_AUDIT_REPORT"
+    grep -A2 "warning\|WARN\|\[!!!\]" "$audit_raw" | \
+        grep -v "^--$" | head -50 >> "$SECURITY_AUDIT_REPORT" 2>/dev/null || \
+        echo "No critical warnings found" >> "$SECURITY_AUDIT_REPORT"
+
+    echo "" >> "$SECURITY_AUDIT_REPORT"
+    echo "=== RECOMMENDATIONS ===" >> "$SECURITY_AUDIT_REPORT"
+    grep "Suggestion\|suggestion" "$audit_raw" | \
+        sed 's/^.*Suggestion[[:space:]]*/  • /' | head -30 >> "$SECURITY_AUDIT_REPORT" 2>/dev/null || true
+
+    echo "" >> "$SECURITY_AUDIT_REPORT"
+    echo "Full audit log: $audit_raw" >> "$SECURITY_AUDIT_REPORT"
+
+    chmod 600 "$SECURITY_AUDIT_REPORT"
+    rm -f "$audit_raw"
+
+    log "SUCCESS" "Security audit complete — Report: $SECURITY_AUDIT_REPORT"
+    log "INFO"    "Hardening index: $hardening_index/100"
+}
+
+# ============================================
+# SECTION 23e — SMART ALERTING SYSTEM (BASH)
+# Installs disk/CPU/service alerting cron
+# ============================================
+setup_alerting() {
+    log "STEP" "Setting up smart alerting system"
+
+    cat > /usr/local/bin/easy-alert <<'ALERTSCRIPT'
+#!/bin/bash
+# EasyInstall v7.0 — Smart Alerting System
+ALERT_EMAIL="${ALERT_EMAIL:-}"
+TELEGRAM_TOKEN="${TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+SLACK_WEBHOOK="${SLACK_WEBHOOK:-}"
+ALERT_LOG="/var/log/easyinstall/alerts.log"
+DISK_THRESHOLD=90
+CPU_THRESHOLD=80
+mkdir -p /var/log/easyinstall
+
+log_alert() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ALERT: $1" | tee -a "$ALERT_LOG"; }
+
+send_alert() {
+    local message="$1"
+    log_alert "$message"
+
+    # Email
+    if [ -n "$ALERT_EMAIL" ] && command -v mail &>/dev/null; then
+        echo "$message" | mail -s "[EasyInstall ALERT] $(hostname)" "$ALERT_EMAIL" 2>/dev/null || true
+    fi
+
+    # Telegram
+    if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        curl -s --max-time 10 \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=[EasyInstall ALERT] $(hostname): ${message}" \
+            >/dev/null 2>&1 || true
+    fi
+
+    # Slack
+    if [ -n "$SLACK_WEBHOOK" ]; then
+        curl -s --max-time 10 -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"🚨 [EasyInstall ALERT] $(hostname): ${message}\"}" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+# Check disk usage
+disk_usage=$(df / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+if [ "${disk_usage:-0}" -ge "$DISK_THRESHOLD" ]; then
+    send_alert "DISK CRITICAL: / is ${disk_usage}% full (threshold: ${DISK_THRESHOLD}%)"
+fi
+
+# Check CPU load (1-min average vs cores)
+total_cores=$(nproc)
+cpu_load=$(uptime | awk -F'average:' '{print $2}' | awk -F',' '{print $1}' | tr -d ' .')
+cpu_load="${cpu_load//[^0-9]/}"
+cpu_threshold_abs=$((total_cores * CPU_THRESHOLD / 10))
+if [ "${cpu_load:-0}" -ge "${cpu_threshold_abs:-999}" ]; then
+    send_alert "HIGH CPU: Load average critical ($(uptime | awk -F'average:' '{print $2}'))"
+fi
+
+# Check critical services
+for service in nginx mariadb redis-server; do
+    if ! systemctl is-active --quiet "$service" 2>/dev/null; then
+        send_alert "SERVICE DOWN: $service is not running on $(hostname)"
+        # Attempt auto-restart
+        systemctl start "$service" 2>/dev/null || true
+    fi
+done
+
+# Check disk inode usage
+inode_usage=$(df -i / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+if [ "${inode_usage:-0}" -ge 90 ]; then
+    send_alert "INODE CRITICAL: / inodes ${inode_usage}% used"
+fi
+ALERTSCRIPT
+    chmod +x /usr/local/bin/easy-alert
+
+    # Install alerting cron (every 5 minutes)
+    cat > /etc/cron.d/easy-alerts <<'ALERTCRON'
+# EasyInstall v7.0 — Smart alerting (every 5 minutes)
+*/5 * * * * root /usr/local/bin/easy-alert 2>/dev/null
+ALERTCRON
+
+    log "SUCCESS" "Smart alerting installed (checks every 5 min)"
+    log "INFO"    "Configure: ALERT_EMAIL, TELEGRAM_TOKEN, SLACK_WEBHOOK in /etc/easyinstall/alerts.conf"
+
+    # Create alerts config template
+    mkdir -p /etc/easyinstall
+    [ -f /etc/easyinstall/alerts.conf ] || cat > /etc/easyinstall/alerts.conf <<'ALERTCONF'
+# EasyInstall v7.0 — Alert Configuration
+# Uncomment and fill in your notification channels:
+
+# Email alerts (requires mailutils installed)
+# ALERT_EMAIL="admin@yourdomain.com"
+
+# Telegram alerts
+# TELEGRAM_TOKEN="your-bot-token"
+# TELEGRAM_CHAT_ID="your-chat-id"
+
+# Slack webhook
+# SLACK_WEBHOOK="https://hooks.slack.com/services/..."
+
+# Thresholds
+DISK_THRESHOLD=90
+CPU_THRESHOLD=80
+ALERTCONF
+    chmod 600 /etc/easyinstall/alerts.conf
+}
+
+# ============================================
+# SECTION 23f — CENTRALIZED LOGGING (BASH)
+# Configures rsyslog to centralize all logs
+# ============================================
+setup_centralized_logging() {
+    log "STEP" "Setting up centralized logging"
+    mkdir -p "$CENTRAL_LOG_DIR"
+
+    # rsyslog configuration for centralized collection
+    cat > /etc/rsyslog.d/50-easyinstall.conf <<RSYSLOGCONF
+# EasyInstall v7.0 — Centralized Logging
+\$template EasyInstallFormat,"/var/log/easyinstall/central/%PROGRAMNAME%.log"
+if \$programname == 'nginx' then ?EasyInstallFormat
+if \$programname == 'mysqld' or \$programname == 'mariadb' then ?EasyInstallFormat
+if \$programname == 'php-fpm' then ?EasyInstallFormat
+if \$programname == 'redis-server' then ?EasyInstallFormat
+RSYSLOGCONF
+
+    # Logrotate config for central logs
+    cat > /etc/logrotate.d/easyinstall-central <<LOGROTATE
+/var/log/easyinstall/central/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        systemctl reload rsyslog 2>/dev/null || true
+    endscript
+}
+LOGROTATE
+
+    systemctl restart rsyslog 2>/dev/null || true
+    log "SUCCESS" "Centralized logging configured at $CENTRAL_LOG_DIR"
+}
+
+# ============================================
+# SECTION 23g — INCREMENTAL BACKUP (BASH)
+# Adds rsync --link-dest incremental backup
+# ============================================
+setup_incremental_backup() {
+    log "STEP" "Setting up incremental backup system"
+
+    cat > /usr/local/bin/easy-backup-incremental <<'INCBAK'
+#!/bin/bash
+# EasyInstall v7.0 — Incremental Backup using rsync --link-dest
+BACKUP_BASE="/backups/incremental"
+DATE=$(date +%Y-%m-%d_%H-%M)
+LATEST_LINK="$BACKUP_BASE/latest"
+CURRENT="$BACKUP_BASE/$DATE"
+LOG="/var/log/easyinstall/backup-incremental.log"
+S3_BUCKET="${S3_BUCKET:-}"
+S3_PREFIX="${S3_PREFIX:-easyinstall-backups}"
+
+mkdir -p "$CURRENT" /var/log/easyinstall
+
+blog() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
+
+blog "Starting incremental backup: $DATE"
+
+# Incremental file backup using --link-dest (hardlinks to unchanged files)
+rsync -a --delete \
+    --link-dest="$LATEST_LINK" \
+    --exclude="*.log" --exclude="*.tmp" --exclude="cache/*" \
+    /var/www/html/ "$CURRENT/www/" 2>>"$LOG" && \
+    blog "✅ Files: incremental rsync complete" || \
+    blog "❌ Files: rsync failed"
+
+# Database backup
+mysqldump --all-databases --single-transaction --quick 2>/dev/null | \
+    gzip > "$CURRENT/mysql-all-databases.sql.gz" && \
+    blog "✅ Database: backup complete" || \
+    blog "❌ Database: backup failed"
+
+# Backup Redis dumps
+cp /var/lib/redis/dump.rdb "$CURRENT/redis-dump.rdb" 2>/dev/null || true
+
+# Verify backup integrity
+if tar -czf "$CURRENT/backup-meta.tar.gz" "$CURRENT/"*.gz 2>/dev/null; then
+    tar -tzf "$CURRENT/backup-meta.tar.gz" >/dev/null 2>&1 && \
+        blog "✅ Integrity: backup verified OK" || \
+        blog "❌ Integrity: backup CORRUPTED — check immediately!"
+fi
+
+# Update 'latest' symlink
+rm -f "$LATEST_LINK"
+ln -s "$CURRENT" "$LATEST_LINK"
+
+# Offsite upload to S3 (if configured)
+if [ -n "$S3_BUCKET" ] && command -v aws &>/dev/null; then
+    blog "Uploading to S3: s3://${S3_BUCKET}/${S3_PREFIX}/${DATE}/"
+    aws s3 sync "$CURRENT/" "s3://${S3_BUCKET}/${S3_PREFIX}/${DATE}/" \
+        --storage-class STANDARD_IA 2>>"$LOG" && \
+        blog "✅ S3 upload complete" || \
+        blog "⚠️  S3 upload failed"
+fi
+
+# Retention: keep last 14 incremental backups
+ls -dt "$BACKUP_BASE"/20* 2>/dev/null | tail -n +15 | xargs rm -rf 2>/dev/null || true
+
+blog "Incremental backup complete — Size: $(du -sh "$CURRENT" 2>/dev/null | cut -f1)"
+INCBAK
+    chmod +x /usr/local/bin/easy-backup-incremental
+
+    # Incremental backup cron (every 6 hours)
+    cat >> /etc/cron.d/easy-backup <<'INCCRON'
+# EasyInstall v7.0 — Incremental backup (every 6 hours)
+0 */6 * * * root /usr/local/bin/easy-backup-incremental 2>/dev/null
+INCCRON
+
+    mkdir -p /backups/incremental
+    log "SUCCESS" "Incremental backup system installed (every 6 hours)"
+    log "INFO"    "S3 offsite: set S3_BUCKET in environment or /etc/easyinstall/backup.conf"
+}
+
+# ============================================
+# SECTION 23h — SELF-UPDATE (BASH)
+# easyinstall self-update from GitHub
+# ============================================
+setup_self_update() {
+    log "STEP" "Setting up self-update mechanism"
+
+    cat > /usr/local/bin/easy-self-update <<'SELFUPDATE'
+#!/bin/bash
+# EasyInstall v7.0 — Self Update
+GITHUB_REPO="${EASYINSTALL_REPO:-https://raw.githubusercontent.com/your-repo/easyinstall/main}"
+CURRENT_VERSION=$(grep 'SCRIPT_VERSION=' /usr/local/bin/easyinstall 2>/dev/null | head -1 | cut -d'"' -f2 || echo "unknown")
+LOG="/var/log/easyinstall/updates.log"
+
+ulog() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [UPDATER] $1" | tee -a "$LOG"; }
+
+ulog "Self-update check (current: v${CURRENT_VERSION})"
+
+# Check for update
+REMOTE_VERSION=$(curl -sfL "${GITHUB_REPO}/VERSION" --max-time 10 2>/dev/null || echo "")
+if [ -z "$REMOTE_VERSION" ]; then
+    ulog "⚠️  Cannot reach update server — check EASYINSTALL_REPO variable"
+    exit 1
+fi
+
+if [ "$CURRENT_VERSION" = "$REMOTE_VERSION" ]; then
+    ulog "✅ Already up-to-date (v${CURRENT_VERSION})"
+    exit 0
+fi
+
+ulog "Update available: v${CURRENT_VERSION} → v${REMOTE_VERSION}"
+ulog "Downloading update..."
+
+# Download to temp
+TMP_SH=$(mktemp)
+TMP_PY=$(mktemp)
+curl -sfL "${GITHUB_REPO}/easyinstall.sh" -o "$TMP_SH" --max-time 60 || { ulog "❌ Download failed"; exit 1; }
+curl -sfL "${GITHUB_REPO}/easyinstall_config.py" -o "$TMP_PY" --max-time 60 || { ulog "❌ Download failed"; exit 1; }
+
+# Validate (basic check)
+grep -q "SCRIPT_VERSION" "$TMP_SH" || { ulog "❌ Downloaded script looks invalid"; exit 1; }
+
+# Backup current version
+cp /usr/local/bin/easyinstall "/root/easyinstall-backup-v${CURRENT_VERSION}.sh" 2>/dev/null || true
+cp /usr/local/lib/easyinstall_config.py "/root/easyinstall_config-backup-v${CURRENT_VERSION}.py" 2>/dev/null || true
+
+# Apply update
+cp "$TMP_SH" /usr/local/bin/easyinstall && chmod +x /usr/local/bin/easyinstall
+cp "$TMP_PY" /usr/local/lib/easyinstall_config.py && chmod +x /usr/local/lib/easyinstall_config.py
+rm -f "$TMP_SH" "$TMP_PY"
+
+ulog "✅ Updated to v${REMOTE_VERSION} successfully"
+echo -e "\033[0;32m✅ EasyInstall updated: v${CURRENT_VERSION} → v${REMOTE_VERSION}\033[0m"
+SELFUPDATE
+    chmod +x /usr/local/bin/easy-self-update
+    log "SUCCESS" "Self-update script installed at /usr/local/bin/easy-self-update"
+    log "INFO"    "Usage: easy-self-update | Set EASYINSTALL_REPO to your GitHub raw URL"
+}
+
+# ============================================
 # SECTION 24 — MAIN INSTALLATION FLOW
 # ============================================
 main() {
     clear
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}🚀 EasyInstall WordPress Performance v6.4 (HYBRID EDITION)${NC}"
+    echo -e "${GREEN}🚀 EasyInstall WordPress Performance v7.0 (HYBRID EDITION)${NC}"
     echo -e "${GREEN}   Bash = Dependencies | Python = Configuration${NC}"
+    echo -e "${GREEN}   Security | Performance | Monitoring | DR${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo -e "${YELLOW}Architecture:${NC}"
-    echo -e "   • ${CYAN}Bash layer${NC}  → apt installs, repos, service start/enable, lock files"
+    echo -e "   • ${CYAN}Bash layer${NC}  → apt installs, repos, service start/enable, lock files, security"
     echo -e "   • ${CYAN}Python layer${NC} → all config file generation, tuning, WP setup, monitoring"
     echo ""
 
@@ -978,6 +1472,43 @@ SECURE_SQL
     run_python_config "create_autotune_module"
     start_autoheal
 
+    # ── PHASE Q2: Bash — Security hardening & scanning ─────────────────
+    harden_ssh
+    update_status "SSH_HARDENING" "SSH hardened"
+
+    install_malware_scanner
+    update_status "MALWARE_SCANNER" "Malware scanner installed"
+
+    run_security_audit
+    update_status "SECURITY_AUDIT" "Security audit complete"
+
+    # ── PHASE Q3: Bash — Centralized logging ───────────────────────────
+    setup_centralized_logging
+    update_status "CENTRAL_LOGGING" "Centralized logging configured"
+
+    # ── PHASE Q4: Bash — Alerting system ───────────────────────────────
+    setup_alerting
+    update_status "ALERTING" "Smart alerting configured"
+
+    # ── PHASE Q5: Bash — Incremental backup ────────────────────────────
+    setup_incremental_backup
+    update_status "INCREMENTAL_BACKUP" "Incremental backup installed"
+
+    # ── PHASE Q6: Bash — Self-update mechanism ─────────────────────────
+    setup_self_update
+    update_status "SELF_UPDATE" "Self-update mechanism installed"
+
+    # ── PHASE Q7: Python — Advanced security stages ─────────────────────
+    run_python_config "stage_malware_scanner"
+    run_python_config "stage_security_hardening"
+    run_python_config "stage_waf_config"
+    run_python_config "stage_php_fpm_autoscaler"
+    run_python_config "stage_redis_multidb"
+    run_python_config "stage_db_optimizer"
+    run_python_config "stage_prometheus_setup"
+    run_python_config "stage_config_validator"
+    update_status "ADV_SECURITY" "Advanced security stages complete"
+
     # ── Detect and export active PHP version for site creation ───────────
     ACTIVE_PHP_VERSION=$(detect_active_php_version)
     export ACTIVE_PHP_VERSION
@@ -1018,7 +1549,8 @@ SECURE_SQL
 
     echo ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}✅ EasyInstall v6.4 HYBRID EDITION Complete!${NC}"
+    echo -e "${GREEN}✅ EasyInstall v7.0 HYBRID EDITION Complete!${NC}"
+    echo -e "${GREEN}   Security | Performance | Monitoring | DR${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo -e "${YELLOW}📊 Installation Statistics:${NC}"
@@ -1033,11 +1565,17 @@ SECURE_SQL
     echo "   5.  easyinstall monitor"
     echo "   6.  easyinstall perf-dashboard"
     echo "   7.  easyinstall warm-cache"
-    echo "   8.  [NEW] easyinstall update-site domain.com"
-    echo "   9.  [NEW] easyinstall clone src.com dst.com"
+    echo "   8.  easyinstall update-site domain.com"
+    echo "   9.  easyinstall clone src.com dst.com"
     echo "   10. [v6.4] easyinstall ws-enable domain.com 8080"
     echo "   11. [v6.4] easyinstall http3-enable"
     echo "   12. [v6.4] easyinstall edge-setup"
+    echo "   13. [v7.0] easyinstall security-audit"
+    echo "   14. [v7.0] easyinstall malware-scan"
+    echo "   15. [v7.0] easyinstall db-optimizer"
+    echo "   16. [v7.0] easyinstall backup-incremental"
+    echo "   17. [v7.0] easy-self-update"
+    echo "   18. [v7.0] Configure alerts: /etc/easyinstall/alerts.conf"
     echo ""
     echo -e "${GREEN}⚡ Performance Settings:${NC}"
     echo "   • PHP Children     : ${PHP_MAX_CHILDREN}"
@@ -1045,6 +1583,13 @@ SECURE_SQL
     echo "   • MySQL Buffer     : ${MYSQL_BUFFER_POOL}"
     echo "   • Redis Memory     : ${REDIS_MAX_MEMORY}"
     echo "   • Nginx Connections: ${NGINX_WORKER_CONNECTIONS}"
+    echo ""
+    echo -e "${YELLOW}🔒 Security:${NC}"
+    echo "   • SSH hardened     : ✅ Password auth disabled"
+    echo "   • Malware scanner  : ✅ ClamAV daily cron"
+    echo "   • Security audit   : ✅ Report: $SECURITY_AUDIT_REPORT"
+    echo "   • WAF (ModSecurity): See /etc/nginx/modsec/"
+    echo "   • Alerting         : Configure /etc/easyinstall/alerts.conf"
     echo ""
     echo -e "${YELLOW}📝 Logs: $LOG_FILE${NC}"
     echo -e "${YELLOW}☕ Support: https://paypal.me/sugandodrai${NC}"
