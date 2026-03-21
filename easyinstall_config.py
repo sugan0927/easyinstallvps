@@ -188,8 +188,8 @@ def run(cmd: str, check: bool = True) -> int:
 # v6.5: Async Operations (New Addition, Core Unchanged)
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def download_async(url: str, dest: Path, session: aiohttp.ClientSession) -> bool:
-    """v6.5: Async download for parallel operations"""
+async def download_async(url: str, dest: Path, session: "Any") -> bool:
+    """v6.5: Async download for parallel operations (requires aiohttp)"""
     try:
         async with session.get(url) as response:
             if response.status == 200:
@@ -199,9 +199,12 @@ async def download_async(url: str, dest: Path, session: aiohttp.ClientSession) -
         log("WARNING", f"Async download failed: {e}")
     return False
 
-async def parallel_downloads(urls: List[tuple]) -> List[bool]:
-    """v6.5: Download multiple files in parallel"""
-    async with aiohttp.ClientSession() as session:
+async def parallel_downloads(urls: "List[tuple]") -> "List[bool]":
+    """v6.5: Download multiple files in parallel (requires aiohttp)"""
+    if not AIOHTTP_AVAILABLE:
+        return [False] * len(urls)
+    import aiohttp as _aiohttp
+    async with _aiohttp.ClientSession() as session:
         tasks = [download_async(url, Path(dest), session) for url, dest in urls]
         return await asyncio.gather(*tasks)
 
@@ -234,8 +237,8 @@ def parse_args():
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--clone-from",  default="",    help="Source domain for clone_site stage")
     # v6.5: Modern features
-    p.add_argument("--use-avif", action="store_true", default=True, help="Enable AVIF image support")
-    p.add_argument("--use-http3", action="store_true", default=True, help="Enable HTTP/3 QUIC")
+    p.add_argument("--use-avif", type=lambda x: x.lower() not in ("false","0","no"), default=True, help="Enable AVIF image support")
+    p.add_argument("--use-http3", type=lambda x: x.lower() not in ("false","0","no"), default=True, help="Enable HTTP/3 QUIC")
     p.add_argument("--s3-backup", action="store_true", help="Enable S3-compatible backup")
     p.add_argument("--s3-endpoint", default="", help="S3 endpoint (e.g., s3.amazonaws.com)")
     p.add_argument("--s3-bucket", default="", help="S3 bucket name")
@@ -355,10 +358,6 @@ def stage_nginx_config(cfg):
         worker_rlimit_nofile 1048576;
         pid /run/nginx.pid;
 
-        # v6.5: Load dynamic modules
-        load_module modules/ngx_http_brotli_filter_module.so;
-        load_module modules/ngx_http_brotli_static_module.so;
-
         events {{
             worker_connections {cfg.nginx_worker_connections};
             use epoll;
@@ -397,27 +396,12 @@ def stage_nginx_config(cfg):
                             '"$http_user_agent" "$http_x_forwarded_for" '
                             'rt=$request_time uct="$upstream_connect_time" '
                             'uht="$upstream_header_time" urt="$upstream_response_time"'
-                            # v6.5: Add protocol logging for HTTP/3 detection
-                            ' proto="$server_protocol" quic="$http3"';
+                            ' proto="$server_protocol"';
 
             access_log /var/log/nginx/access.log main buffer=32k flush=5s;
             error_log  /var/log/nginx/error.log warn;
 
-            # v6.5: Brotli compression (primary)
-            brotli on;
-            brotli_comp_level 6;
-            brotli_static on;
-            brotli_min_length 1000;
-            brotli_types
-                text/plain text/css text/xml text/javascript
-                application/json application/javascript application/xml+rss
-                application/xml application/rss+xml application/atom+xml
-                application/x-javascript application/x-httpd-php
-                application/x-font-ttf font/opentype image/svg+xml image/x-icon
-                # v6.5: AVIF brotli support
-                image/avif image/webp;
-
-            # Gzip fallback
+            # Gzip (primary — brotli via conf.d/brotli.conf if module available)
             gzip on;
             gzip_vary on;
             gzip_proxied any;
@@ -451,9 +435,6 @@ def stage_nginx_config(cfg):
             ssl_session_cache shared:SSL:50m;
             ssl_session_timeout 1d;
             ssl_session_tickets off;
-
-            # v6.5: TLS 1.3 0-RTT
-            ssl_early_data on;
 
             limit_req_zone $binary_remote_addr zone=login:10m rate=10r/m;
 
@@ -1814,7 +1795,7 @@ async def _async_download_wordpress(wp_root: Path):
         ("https://wordpress.org/latest.tar.gz", "/tmp/wordpress-latest.tar.gz")
     ]
     results = await parallel_downloads(urls)
-    if results[0]:
+    if results and results[0]:
         # Extract
         import tarfile
         with tarfile.open("/tmp/wordpress-latest.tar.gz", "r:gz") as tar:

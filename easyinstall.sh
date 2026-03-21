@@ -397,7 +397,9 @@ setup_package_manager() {
     )
 
     # v6.5: Add modern tools
-    packages+=(avif-tools webp libwebp-dev)  # AVIF/WebP tools
+    # AVIF/WebP tools (avif-tools not available on Debian, use libavif-bin if exists)
+    packages+=(webp libwebp-dev)
+    apt-get install -y libavif-bin 2>/dev/null || apt-get install -y libavif16 2>/dev/null || true
 
     for pkg in "${packages[@]}"; do
         run_cmd_retry 2 3 "apt-get install -y $pkg" || log "WARNING" "Could not install: $pkg"
