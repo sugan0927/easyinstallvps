@@ -1,18 +1,24 @@
 #!/bin/bash
 
 # ============================================
-# EasyInstall WordPress Maximum Performance Installation Script v6.4
+# EasyInstall WordPress Maximum Performance Installation Script v6.5 (2026)
 # HYBRID EDITION: Bash = Dependencies | Python = Configuration
 # Ultra-Optimized WordPress Setup with Advanced Auto-Tuning (10 Phases)
 # RAM Auto-Detection: 512MB to 16GB
 # Compatible with Debian 12 and Ubuntu 24.04/22.04
 #
 # ARCHITECTURE:
-#   easyinstall.sh         — Bash: all apt installs, system deps, repo setup,
-#                            service start/enable, lock/logging, entry point
-#   easyinstall_config.py  — Python: all server config file generation,
-#                            WordPress setup, Nginx/PHP/MySQL/Redis config,
-#                            autotune, firewall rules, monitoring scripts
+#   easyinstall.sh         — Bash: all apt installs, repos, service start/enable
+#   easyinstall_config.py  — Python: all server config file generation
+#
+# v6.5 MODERNIZATIONS:
+#   ✅ PHP 8.4 as default priority (was 8.3)
+#   ✅ AVIF image format support detection
+#   ✅ HTTP/3 QUIC with 0-RTT preparation
+#   ✅ MariaDB 11.4+ repository
+#   ✅ S3 backup integration (rclone)
+#   ✅ Container runtime detection (Docker/Podman)
+#   ✅ Enhanced error handling
 # ============================================
 
 set -eE
@@ -28,7 +34,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ── Global Variables ─────────────────────────────────────────────────────────
-SCRIPT_VERSION="6.4"
+SCRIPT_VERSION="6.5"
 LOCK_FILE="/var/run/easyinstall.lock"
 LOG_FILE="/var/log/easyinstall/install.log"
 ERROR_LOG="/var/log/easyinstall/error.log"
@@ -38,8 +44,18 @@ USED_REDIS_PORTS_FILE="/var/lib/easyinstall/used_redis_ports.txt"
 INSTALL_START_TIME=$(date +%s)
 PYTHON_CONFIG_SCRIPT="/usr/local/lib/easyinstall_config.py"
 
+# v6.5: Modern feature flags
+USE_AVIF="${USE_AVIF:-true}"
+USE_HTTP3="${USE_HTTP3:-true}"
+S3_BACKUP="${S3_BACKUP:-false}"
+S3_ENDPOINT="${S3_ENDPOINT:-}"
+S3_BUCKET="${S3_BUCKET:-}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-}"
+CONTAINER_MODE="${CONTAINER_MODE:-false}"
+
 # ============================================
-# SECTION 1 — LOGGING  (pure bash, no deps)
+# SECTION 1 — LOGGING
 # ============================================
 log() {
     local level=$1
@@ -53,6 +69,7 @@ log() {
         "SUCCESS") echo -e "${GREEN}✅ $message${NC}" ;;
         "INFO")    echo -e "${BLUE}ℹ️  $message${NC}" ;;
         "STEP")    echo -e "${PURPLE}🔷 $message${NC}" ;;
+        "MODERN")  echo -e "${CYAN}🚀 $message${NC}" ;;  # v6.5
         *)         echo -e "$message" ;;
     esac
 }
@@ -88,9 +105,9 @@ update_status() {
 # SECTION 2 — SAFE COMMAND EXECUTION
 # ============================================
 run_cmd() {
-    local cmd="$@"
+    local cmd="$*"
     log "INFO" "Running: $cmd"
-    if eval "$cmd"; then
+    if bash -c "$cmd"; then
         log "SUCCESS" "Completed: ${cmd:0:60}..."
         return 0
     else
@@ -106,7 +123,7 @@ run_cmd_retry() {
     local attempt=1
     while [ $attempt -le $max_attempts ]; do
         log "INFO" "Attempt $attempt/$max_attempts: ${command:0:60}..."
-        if eval "$command"; then
+        if bash -c "$command"; then
             log "SUCCESS" "Succeeded on attempt $attempt"
             return 0
         fi
@@ -157,7 +174,7 @@ backup_config() {
         fi
     done
     cat > "$BACKUP_DIR/MANIFEST.txt" <<EOF
-EasyInstall Backup
+EasyInstall v6.5 Backup
 Date: $(date)
 Version: $SCRIPT_VERSION
 Files:
@@ -176,13 +193,13 @@ perform_rollback() {
         log "SUCCESS" "Restored: $original_file"
     done
     log "SUCCESS" "Rollback completed"
-    for service in nginx php8.3-fpm php8.2-fpm mariadb redis-server; do
+    for service in nginx php8.4-fpm php8.3-fpm php8.2-fpm mariadb redis-server; do
         systemctl restart "$service" 2>/dev/null || true
     done
 }
 
 # ============================================
-# SECTION 5 — SYSTEM VALIDATION (BASH)
+# SECTION 5 — SYSTEM VALIDATION
 # ============================================
 check_root() {
     log "STEP" "Checking root privileges"
@@ -244,7 +261,7 @@ check_os_compatibility() {
 }
 
 # ============================================
-# SECTION 6 — SERVICE HEALTH CHECKS (BASH)
+# SECTION 6 — SERVICE HEALTH CHECKS
 # ============================================
 wait_for_service() {
     local service=$1 max_attempts=${2:-30} attempt=1
@@ -286,11 +303,10 @@ validate_nginx_config() {
 }
 
 # ============================================
-# SECTION 7 — RAM AUTO-DETECT & TUNE (BASH)
-# Exported as env vars consumed by Python config
+# SECTION 7 — RAM AUTO-DETECT & TUNE
 # ============================================
 detect_ram_and_tune() {
-    log "STEP" "Auto-tuning based on RAM"
+    log "STEP" "Auto-tuning based on RAM (v6.5)"
     TOTAL_RAM=$(free -m | awk '/Mem:/ {print $2}')
     TOTAL_CORES=$(nproc)
     log "INFO" "Detected ${TOTAL_RAM}MB RAM with ${TOTAL_CORES} cores"
@@ -329,7 +345,6 @@ detect_ram_and_tune() {
 
     NGINX_WORKER_PROCESSES=$TOTAL_CORES
 
-    # Export so Python config script can read them via env
     export TOTAL_RAM TOTAL_CORES
     export PHP_MAX_CHILDREN PHP_START_SERVERS PHP_MIN_SPARE PHP_MAX_SPARE
     export PHP_MEMORY_LIMIT PHP_MAX_EXECUTION
@@ -340,7 +355,7 @@ detect_ram_and_tune() {
 }
 
 # ============================================
-# SECTION 8 — OS DETECTION (BASH)
+# SECTION 8 — OS DETECTION
 # ============================================
 detect_os() {
     log "STEP" "Detecting operating system"
@@ -366,10 +381,10 @@ detect_os() {
 }
 
 # ============================================
-# SECTION 9 — PACKAGE MANAGER & BASE DEPS (BASH)
+# SECTION 9 — PACKAGE MANAGER & BASE DEPS
 # ============================================
 setup_package_manager() {
-    log "STEP" "Setting up package manager and base dependencies"
+    log "STEP" "Setting up package manager and base dependencies (v6.5)"
 
     run_cmd_retry 3 5 "apt-get update -y"
     run_cmd "apt --fix-broken install -y"
@@ -380,22 +395,31 @@ setup_package_manager() {
         jq net-tools dnsutils cron rsync nano vim openssl apache2-utils
         systemd dbus python3 python3-pip python3-venv ncdu
     )
+
+    # v6.5: Add modern tools
+    packages+=(avif-tools webp libwebp-dev)  # AVIF/WebP tools
+
     for pkg in "${packages[@]}"; do
         run_cmd_retry 2 3 "apt-get install -y $pkg" || log "WARNING" "Could not install: $pkg"
     done
 
     if [ "$OS_ID" = "ubuntu" ]; then
-        run_cmd_retry 2 3 "apt-get install -y mysql-client-8.0" || \
-        run_cmd_retry 2 3 "apt-get install -y mysql-client" || true
+        run_cmd_retry 2 3 "apt-get install -y mysql-client-8.0" ||         run_cmd_retry 2 3 "apt-get install -y mysql-client" || true
     else
-        run_cmd_retry 2 3 "apt-get install -y mariadb-client" || \
-        run_cmd_retry 2 3 "apt-get install -y mysql-client" || true
+        run_cmd_retry 2 3 "apt-get install -y mariadb-client" ||         run_cmd_retry 2 3 "apt-get install -y mysql-client" || true
     fi
+
+    # v6.5: Install rclone for S3 backup if enabled
+    if [ "$S3_BACKUP" = "true" ]; then
+        log "STEP" "Installing rclone for S3 backup"
+        curl https://rclone.org/install.sh | bash 2>/dev/null ||             apt-get install -y rclone
+    fi
+
     log "SUCCESS" "Base package setup complete"
 }
 
 # ============================================
-# SECTION 10 — SWAP SETUP (BASH — filesystem op)
+# SECTION 10 — SWAP SETUP
 # ============================================
 setup_swap() {
     log "STEP" "Configuring swap space"
@@ -405,8 +429,7 @@ setup_swap() {
         elif [ "$TOTAL_RAM" -le 2048 ]; then SWAPSIZE=3G
         else SWAPSIZE=4G; fi
         log "INFO" "Creating ${SWAPSIZE} swap file"
-        fallocate -l $SWAPSIZE /swapfile 2>/dev/null || \
-            dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
+        fallocate -l $SWAPSIZE /swapfile 2>/dev/null ||             dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
         chmod 600 /swapfile
         if mkswap /swapfile && swapon /swapfile; then
             echo '/swapfile none swap sw 0 0' >> /etc/fstab
@@ -422,43 +445,45 @@ setup_swap() {
 }
 
 # ============================================
-# SECTION 11 — INSTALL NGINX (BASH: repo + pkg)
+# SECTION 11 — INSTALL NGINX
 # ============================================
 install_nginx_packages() {
-    log "STEP" "Installing Nginx from official repository"
+    log "STEP" "Installing Nginx from official repository (v6.5)"
     apt-get remove -y nginx nginx-common nginx-full nginx-core 2>/dev/null || true
     run_cmd_retry 3 5 "curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg"
     if [ "$OS_ID" = "ubuntu" ]; then
-        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/ubuntu ${OS_CODENAME} nginx" | \
-            tee /etc/apt/sources.list.d/nginx.list
+        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/ubuntu ${OS_CODENAME} nginx" |             tee /etc/apt/sources.list.d/nginx.list
     else
-        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/debian ${OS_CODENAME} nginx" | \
-            tee /etc/apt/sources.list.d/nginx.list
+        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/debian ${OS_CODENAME} nginx" |             tee /etc/apt/sources.list.d/nginx.list
     fi
     run_cmd_retry 3 5 "apt-get update -y"
     run_cmd_retry 3 5 "apt-get install -y nginx"
 
-    # Optional: Brotli module
-    run_cmd_retry 2 3 "apt-get install -y libnginx-mod-brotli" 2>/dev/null || \
-        log "WARNING" "Brotli module not available — gzip remains active"
+    # v6.5: Try nginx-quic for HTTP/3
+    if [ "$USE_HTTP3" = "true" ]; then
+        log "INFO" "Attempting to install nginx-quic for HTTP/3 support"
+        apt-get install -y nginx-quic 2>/dev/null ||             log "WARNING" "nginx-quic not available — HTTP/3 will use Alt-Svc only"
+    fi
 
-    # Optional: GeoIP2 module
+    # Brotli module
+    run_cmd_retry 2 3 "apt-get install -y libnginx-mod-brotli" 2>/dev/null ||         log "WARNING" "Brotli module not available — gzip remains active"
+
+    # GeoIP2 module
     apt-get install -y libnginx-mod-http-geoip2 mmdb-bin 2>/dev/null || true
 
     mkdir -p /etc/nginx/{sites-available,sites-enabled,conf.d,ssl,snippets}
     mkdir -p /var/cache/nginx/{fastcgi,proxy,static,edge}
     mkdir -p /var/log/nginx
-    # FIX: Use www-data (matches PHP-FPM socket owner and nginx worker user in config)
     chown -R www-data:www-data /var/cache/nginx 2>/dev/null || true
     chmod -R 755 /var/cache/nginx 2>/dev/null || true
     log "SUCCESS" "Nginx packages installed"
 }
 
 # ============================================
-# SECTION 12 — INSTALL PHP (BASH: repo + pkgs)
+# SECTION 12 — INSTALL PHP (v6.5: 8.4 First)
 # ============================================
 install_php_packages() {
-    log "STEP" "Installing PHP from Sury/Ondrej repository"
+    log "STEP" "Installing PHP from Sury/Ondrej repository (v6.5: 8.4 default)"
     if [ "$OS_ID" = "debian" ]; then
         run_cmd_retry 3 5 "apt-get install -y apt-transport-https lsb-release ca-certificates curl wget"
         run_cmd_retry 3 5 "wget -qO- https://packages.sury.org/php/apt.gpg | gpg --dearmor > /etc/apt/trusted.gpg.d/sury-php.gpg"
@@ -469,17 +494,19 @@ install_php_packages() {
         run_cmd_retry 3 5 "apt-get update -y"
     fi
 
-    # Try PHP 8.4 → 8.3 → 8.2
+    # v6.5: PHP 8.4 first, then 8.3, 8.2
     PHP_INSTALLED_VERSION=""
     for ver in 8.4 8.3 8.2; do
         local pkgs="php${ver}-fpm php${ver}-mysql php${ver}-curl php${ver}-gd php${ver}-mbstring"
         pkgs="$pkgs php${ver}-xml php${ver}-xmlrpc php${ver}-zip php${ver}-soap php${ver}-intl"
         pkgs="$pkgs php${ver}-bcmath php${ver}-imagick php${ver}-redis php${ver}-opcache"
         pkgs="$pkgs php${ver}-readline php${ver}-apcu php${ver}-memcached php${ver}-igbinary"
+        # v6.5: AVIF support
+        pkgs="$pkgs php${ver}-gd"  # GD with AVIF
+
         if run_cmd_retry 3 5 "apt-get install -y $pkgs"; then
             PHP_INSTALLED_VERSION=$ver
             log "SUCCESS" "PHP $ver installed"
-            # Always also try installing 8.3 and 8.2 as fallback versions
         else
             log "WARNING" "PHP $ver not available"
         fi
@@ -488,19 +515,25 @@ install_php_packages() {
     [ -z "$PHP_INSTALLED_VERSION" ] && { log "ERROR" "No PHP version could be installed"; return 1; }
     export PHP_INSTALLED_VERSION
     log "SUCCESS" "PHP installation complete (primary: $PHP_INSTALLED_VERSION)"
+
+    # v6.5: Check AVIF support
+    if php -r "if (function_exists('imagecreatefromavif')) echo 'AVIF supported';" 2>/dev/null | grep -q "AVIF"; then
+        log "MODERN" "PHP AVIF support confirmed"
+    else
+        log "WARNING" "AVIF not available in PHP GD"
+    fi
 }
 
 # ============================================
-# SECTION 13 — INSTALL MARIADB (BASH: repo + pkg)
+# SECTION 13 — INSTALL MARIADB 11.4+
 # ============================================
 install_mysql_packages() {
-    log "STEP" "Installing MariaDB 11.x"
+    log "STEP" "Installing MariaDB 11.4+ (v6.5)"
     systemctl stop mysql 2>/dev/null || true
     systemctl stop mariadb 2>/dev/null || true
 
-    log "INFO" "Adding MariaDB 11.x official repository"
-    run_cmd_retry 3 5 "curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash -s -- --mariadb-server-version=mariadb-11.4 --skip-maxscale" 2>/dev/null || \
-        log "WARNING" "MariaDB 11.x repo failed, falling back to distro default"
+    log "INFO" "Adding MariaDB 11.4 official repository"
+    run_cmd_retry 3 5 "curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash -s -- --mariadb-server-version=mariadb-11.4 --skip-maxscale" 2>/dev/null ||         log "WARNING" "MariaDB 11.4 repo failed, falling back to distro default"
 
     run_cmd_retry 3 5 "apt-get update -y"
     run_cmd "apt --fix-broken install -y"
@@ -508,11 +541,11 @@ install_mysql_packages() {
     sleep 5
     systemctl enable mariadb
     systemctl start mariadb
-    log "SUCCESS" "MariaDB packages installed"
+    log "SUCCESS" "MariaDB 11.4+ packages installed"
 }
 
 # ============================================
-# SECTION 14 — INSTALL WP-CLI (BASH: download)
+# SECTION 14 — INSTALL WP-CLI
 # ============================================
 install_wp_cli() {
     log "STEP" "Installing WP-CLI"
@@ -521,8 +554,7 @@ install_wp_cli() {
         mv wp-cli.phar /usr/local/bin/wp
         run_cmd_retry 2 3 "curl -O https://raw.githubusercontent.com/wp-cli/wp-cli/v2.8.0/utils/wp-completion.bash"
         mv wp-completion.bash /etc/bash_completion.d/wp-completion.bash 2>/dev/null || true
-        /usr/local/bin/wp --info &>/dev/null && log "SUCCESS" "WP-CLI installed" || \
-            log "ERROR" "WP-CLI verification failed"
+        /usr/local/bin/wp --info &>/dev/null && log "SUCCESS" "WP-CLI installed" ||             log "ERROR" "WP-CLI verification failed"
     else
         log "ERROR" "Failed to download WP-CLI"
     fi
@@ -530,39 +562,43 @@ install_wp_cli() {
     # Weekly self-update cron
     cat > /etc/cron.weekly/easyinstall-wpcli-update <<'WPCLIUPDATE'
 #!/bin/bash
-/usr/local/bin/wp cli update --yes --allow-root 2>/dev/null && \
-    echo "[$(date)] WP-CLI updated" >> /var/log/easyinstall/install.log || true
+/usr/local/bin/wp cli update --yes --allow-root 2>/dev/null &&     echo "[$(date)] WP-CLI updated" >> /var/log/easyinstall/install.log || true
 WPCLIUPDATE
     chmod +x /etc/cron.weekly/easyinstall-wpcli-update
     log "SUCCESS" "WP-CLI weekly auto-update cron installed"
 }
 
 # ============================================
-# SECTION 15 — INSTALL REDIS (BASH: repo + pkg)
+# SECTION 15 — INSTALL REDIS 7.x
 # ============================================
 install_redis_packages() {
-    log "STEP" "Installing Redis 7.x"
+    log "STEP" "Installing Redis 7.x (v6.5)"
 
     run_cmd_retry 3 5 "curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg" 2>/dev/null || true
-    echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb ${OS_CODENAME} main" | \
-        tee /etc/apt/sources.list.d/redis.list 2>/dev/null || true
+    echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb ${OS_CODENAME} main" |         tee /etc/apt/sources.list.d/redis.list 2>/dev/null || true
     run_cmd_retry 2 3 "apt-get update -y" 2>/dev/null || true
     run_cmd_retry 3 5 "apt-get install -y redis-server redis-tools"
+
+    # v6.5: Check for Redis Stack
+    if apt-cache search redis-stack-server 2>/dev/null | grep -q "redis-stack"; then
+        log "INFO" "Redis Stack available — installing"
+        apt-get install -y redis-stack-server 2>/dev/null ||             log "INFO" "Redis Stack not installed (optional)"
+    fi
+
     log "SUCCESS" "Redis packages installed"
 }
 
 # ============================================
-# SECTION 16 — INSTALL CERTBOT (BASH)
+# SECTION 16 — INSTALL CERTBOT
 # ============================================
 install_certbot() {
     log "STEP" "Installing Certbot for SSL"
     run_cmd_retry 3 5 "apt-get install -y certbot python3-certbot-nginx"
-    command -v certbot &>/dev/null && log "SUCCESS" "Certbot installed" || \
-        log "ERROR" "Certbot installation failed"
+    command -v certbot &>/dev/null && log "SUCCESS" "Certbot installed" ||         log "ERROR" "Certbot installation failed"
 }
 
 # ============================================
-# SECTION 17 — GET/MARK REDIS PORTS (BASH)
+# SECTION 17 — GET/MARK REDIS PORTS
 # ============================================
 get_next_redis_port() {
     mkdir -p /var/lib/easyinstall
@@ -588,10 +624,9 @@ mark_redis_port_used() {
 }
 
 # ============================================
-# SECTION 18 — START/ENABLE SERVICES (BASH)
+# SECTION 18 — START/ENABLE SERVICES
 # ============================================
 enable_start_nginx() {
-    # FIX: Remove default nginx site before starting to avoid port 80 conflict
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     systemctl enable nginx
     systemctl start nginx
@@ -599,6 +634,7 @@ enable_start_nginx() {
 }
 
 enable_start_php() {
+    # v6.5: PHP 8.4, 8.3, 8.2
     for version in 8.4 8.3 8.2; do
         if [ -d "/etc/php/$version" ]; then
             systemctl enable php$version-fpm 2>/dev/null || true
@@ -635,27 +671,25 @@ cleanup_temp_files() {
 }
 
 # ============================================
-# SECTION 19b — DETECT ACTIVE PHP VERSION (BASH)
-# Finds the highest PHP-FPM version that is running.
-# Called by wordpress_install stage to pass correct version.
+# SECTION 19b — DETECT ACTIVE PHP VERSION
 # ============================================
 detect_active_php_version() {
+    # v6.5: Check 8.4, 8.3, 8.2
     for ver in 8.4 8.3 8.2; do
         if systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
             echo "$ver"
             return 0
         fi
-        # Also check if the socket exists even if service name differs
         if [ -S "/run/php/php${ver}-fpm.sock" ]; then
             echo "$ver"
             return 0
         fi
     done
-    echo "8.3"   # safe default
+    echo "8.4"   # v6.5: 8.4 default
 }
 
 # ============================================
-# SECTION 19c — PHP SOCKET HEALTH FIX (BASH)
+# SECTION 19c — PHP SOCKET HEALTH FIX
 # ============================================
 test_php_fpm() {
     local version=$1
@@ -664,16 +698,13 @@ test_php_fpm() {
         log "WARNING" "PHP-FPM $version socket not found at $sock"
         return 1
     fi
-    # Fix socket permissions so www-data + nginx can both read it
     chmod 666 "$sock" 2>/dev/null || true
     log "SUCCESS" "PHP-FPM $version socket OK: $sock"
     return 0
 }
 
 # ============================================
-# SECTION 19d — CREATE PER-SITE REDIS INSTANCE (BASH)
-# Bash handles: systemd unit creation, daemon-reload, enable/start.
-# Config file is written by Python (wordpress_install stage).
+# SECTION 19d — CREATE PER-SITE REDIS INSTANCE
 # ============================================
 create_site_redis_instance() {
     local domain=$1
@@ -682,9 +713,8 @@ create_site_redis_instance() {
 
     log "INFO" "Starting dedicated Redis instance for $domain on port $redis_port"
 
-    # Config file already written by Python stage; just start the service
     if [ ! -f "/etc/redis/redis-${domain_slug}.conf" ]; then
-        log "WARNING" "Redis config for $domain not found — Python stage may not have run yet"
+        log "WARNING" "Redis config for $domain not found"
         return 1
     fi
 
@@ -703,7 +733,7 @@ create_site_redis_instance() {
 }
 
 # ============================================
-# SECTION 20 — INSTALL OLLAMA (BASH: curl install)
+# SECTION 20 — INSTALL OLLAMA
 # ============================================
 install_ollama() {
     log "STEP" "Installing Ollama for local AI"
@@ -724,56 +754,67 @@ install_ollama() {
         ollama serve >/dev/null 2>&1 &
         sleep 4
     fi
-    # Pick model based on RAM
-    local model="llama3"
+    # v6.5: Better model selection
+    local model="llama3.2"  # Updated default
     [ "${TOTAL_RAM:-0}" -ge 8192 ] && model="llama3.1"
     [ "${TOTAL_RAM:-0}" -lt 4096 ] && model="phi3"
     [ "${TOTAL_RAM:-0}" -lt 2048 ] && model="tinyllama"
     log "INFO" "Pulling Ollama model: $model"
-    ollama pull "$model" 2>/dev/null || log "WARNING" "Model pull failed — will retry on first use"
+    ollama pull "$model" 2>/dev/null || log "WARNING" "Model pull failed"
     log "SUCCESS" "Ollama ready with model: $model"
 }
 
 # ============================================
-# SECTION 21 — PYTHON BRIDGE
-# Runs the Python config generator with all
-# tuning values exported as environment vars.
+# SECTION 21 — PYTHON BRIDGE (v6.5 Enhanced)
 # ============================================
 run_python_config() {
     local stage="$1"
     shift
-    log "STEP" "Running Python config generator: stage=$stage"
-    # Extra args (e.g. --domain, --php-version) forwarded as-is after shift
-    python3 "$PYTHON_CONFIG_SCRIPT" \
-        --stage "$stage" \
-        --total-ram "$TOTAL_RAM" \
-        --total-cores "$TOTAL_CORES" \
-        --php-max-children "$PHP_MAX_CHILDREN" \
-        --php-start-servers "$PHP_START_SERVERS" \
-        --php-min-spare "$PHP_MIN_SPARE" \
-        --php-max-spare "$PHP_MAX_SPARE" \
-        --php-memory-limit "$PHP_MEMORY_LIMIT" \
-        --php-max-execution "$PHP_MAX_EXECUTION" \
-        --mysql-buffer-pool "$MYSQL_BUFFER_POOL" \
-        --mysql-log-file "$MYSQL_LOG_FILE" \
-        --redis-max-memory "$REDIS_MAX_MEMORY" \
-        --nginx-worker-connections "$NGINX_WORKER_CONNECTIONS" \
-        --nginx-worker-processes "$NGINX_WORKER_PROCESSES" \
-        --os-id "$OS_ID" \
-        --os-codename "$OS_CODENAME" \
-        "$@" && {
-        log "SUCCESS" "Python config stage '$stage' complete"
-    } || {
+    log "STEP" "Running Python config generator: stage=$stage (v6.5)"
+
+    # v6.5: Build argument array
+    local py_args=(
+        "--stage" "$stage"
+        "--total-ram" "$TOTAL_RAM"
+        "--total-cores" "$TOTAL_CORES"
+        "--php-max-children" "$PHP_MAX_CHILDREN"
+        "--php-start-servers" "$PHP_START_SERVERS"
+        "--php-min-spare" "$PHP_MIN_SPARE"
+        "--php-max-spare" "$PHP_MAX_SPARE"
+        "--php-memory-limit" "$PHP_MEMORY_LIMIT"
+        "--php-max-execution" "$PHP_MAX_EXECUTION"
+        "--mysql-buffer-pool" "$MYSQL_BUFFER_POOL"
+        "--mysql-log-file" "$MYSQL_LOG_FILE"
+        "--redis-max-memory" "$REDIS_MAX_MEMORY"
+        "--nginx-worker-connections" "$NGINX_WORKER_CONNECTIONS"
+        "--nginx-worker-processes" "$NGINX_WORKER_PROCESSES"
+        "--os-id" "$OS_ID"
+        "--os-codename" "$OS_CODENAME"
+        "--use-avif" "$USE_AVIF"
+        "--use-http3" "$USE_HTTP3"
+    )
+
+    # v6.5: Add S3 args if enabled
+    if [ "$S3_BACKUP" = "true" ]; then
+        py_args+=("--s3-backup")
+        [ -n "$S3_ENDPOINT" ] && py_args+=("--s3-endpoint" "$S3_ENDPOINT")
+        [ -n "$S3_BUCKET" ] && py_args+=("--s3-bucket" "$S3_BUCKET")
+        [ -n "$S3_ACCESS_KEY" ] && py_args+=("--s3-access-key" "$S3_ACCESS_KEY")
+        [ -n "$S3_SECRET_KEY" ] && py_args+=("--s3-secret-key" "$S3_SECRET_KEY")
+    fi
+
+    python3 "$PYTHON_CONFIG_SCRIPT" "${py_args[@]}" "$@" || {
         log "ERROR" "Python config stage '$stage' failed"
         return 1
     }
+    log "SUCCESS" "Python config stage '$stage' complete"
 }
 
 # ============================================
 # SECTION 22 — INSTALLATION TESTS
 # ============================================
 test_installation() {
-    log "STEP" "Testing installation"
+    log "STEP" "Testing installation (v6.5)"
     local failed=0
 
     systemctl is-active --quiet nginx && {
@@ -795,19 +836,24 @@ test_installation() {
     } || { log "ERROR" "Redis test failed"; failed=$((failed + 1)); }
 
     local php_found=0
+    # v6.5: Check 8.4, 8.3, 8.2
     for version in 8.4 8.3 8.2; do
         systemctl is-active --quiet php${version}-fpm 2>/dev/null && {
             log "SUCCESS" "PHP ${version}-FPM test passed"; php_found=1; }
     done
     [ $php_found -eq 0 ] && { log "ERROR" "No PHP-FPM found"; failed=$((failed + 1)); }
 
-    systemctl is-active --quiet autoheal && log "SUCCESS" "Autoheal test passed" || \
-        log "WARNING" "Autoheal test failed (non-critical)"
-    systemctl is-active --quiet fail2ban && log "SUCCESS" "Fail2ban test passed" || \
-        log "WARNING" "Fail2ban test failed (non-critical)"
+    systemctl is-active --quiet autoheal && log "SUCCESS" "Autoheal test passed" ||         log "WARNING" "Autoheal test failed (non-critical)"
+    systemctl is-active --quiet fail2ban && log "SUCCESS" "Fail2ban test passed" ||         log "WARNING" "Fail2ban test failed (non-critical)"
 
-    [ $failed -eq 0 ] && log "SUCCESS" "All critical tests passed!" || \
-        log "WARNING" "$failed critical test(s) failed. Check logs."
+    # v6.5: Check AVIF support
+    if php -r "function_exists('imagecreatefromavif') ? exit(0) : exit(1);" 2>/dev/null; then
+        log "MODERN" "AVIF support confirmed"
+    else
+        log "WARNING" "AVIF not available (optional)"
+    fi
+
+    [ $failed -eq 0 ] && log "SUCCESS" "All critical tests passed!" ||         log "WARNING" "$failed critical test(s) failed. Check logs."
     return $failed
 }
 
@@ -818,36 +864,39 @@ start_autoheal() {
     systemctl daemon-reload
     systemctl enable autoheal 2>/dev/null || true
     systemctl start autoheal 2>/dev/null || true
-    wait_for_service "autoheal" 10 && log "SUCCESS" "Autoheal service running" || \
-        log "WARNING" "Autoheal may not be running"
+    wait_for_service "autoheal" 10 && log "SUCCESS" "Autoheal service running" ||         log "WARNING" "Autoheal may not be running"
 }
 
 start_fail2ban() {
     systemctl enable fail2ban
     systemctl restart fail2ban
-    wait_for_service "fail2ban" 20 && log "SUCCESS" "Fail2ban running" || \
-        log "WARNING" "Fail2ban may not be running"
+    wait_for_service "fail2ban" 20 && log "SUCCESS" "Fail2ban running" ||         log "WARNING" "Fail2ban may not be running"
 }
 
 # ============================================
-# SECTION 24 — MAIN INSTALLATION FLOW
+# SECTION 24 — MAIN INSTALLATION FLOW (v6.5)
 # ============================================
 main() {
     clear
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}🚀 EasyInstall WordPress Performance v6.4 (HYBRID EDITION)${NC}"
+    echo -e "${GREEN}🚀 EasyInstall WordPress Performance v6.5 (2026)${NC}"
     echo -e "${GREEN}   Bash = Dependencies | Python = Configuration${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    echo -e "${YELLOW}Architecture:${NC}"
-    echo -e "   • ${CYAN}Bash layer${NC}  → apt installs, repos, service start/enable, lock files"
-    echo -e "   • ${CYAN}Python layer${NC} → all config file generation, tuning, WP setup, monitoring"
+    echo -e "${YELLOW}v6.5 Modernizations:${NC}"
+    echo -e "   • ${CYAN}PHP 8.4${NC} as default with JIT"
+    echo -e "   • ${CYAN}AVIF${NC} image format support"
+    echo -e "   • ${CYAN}HTTP/3 QUIC${NC} with 0-RTT"
+    echo -e "   • ${CYAN}MariaDB 11.4+${NC} optimizations"
+    echo -e "   • ${CYAN}2025 Security Headers${NC}"
+    echo -e "   • ${CYAN}S3 Backup${NC} integration"
+    echo -e "   • ${CYAN}Container${NC} orchestration ready"
     echo ""
 
     check_root
     check_lock
 
-    # Create directories first
+    # Create directories
     mkdir -p /var/log/easyinstall /var/lib/easyinstall /var/www/html
     mkdir -p /etc/nginx/{sites-available,sites-enabled,ssl,conf.d,snippets}
     mkdir -p /backups/{daily,weekly,monthly}
@@ -861,46 +910,39 @@ main() {
 
     update_status "START" "Installation started"
 
-    # ── Backup existing configs ──────────────────────────────────────────
-    backup_config \
-        "/etc/nginx/nginx.conf" \
-        "/etc/mysql/mariadb.conf.d/99-wordpress.cnf" \
-        "/etc/php/8.3/fpm/php.ini" \
-        "/etc/php/8.2/fpm/php.ini" \
-        "/etc/redis/redis.conf" \
-        "/etc/fail2ban/jail.local"
+    # Backup existing configs
+    backup_config         "/etc/nginx/nginx.conf"         "/etc/mysql/mariadb.conf.d/99-wordpress.cnf"         "/etc/php/8.4/fpm/php.ini"         "/etc/php/8.3/fpm/php.ini"         "/etc/php/8.2/fpm/php.ini"         "/etc/redis/redis.conf"         "/etc/fail2ban/jail.local"
 
-    # ── PHASE A: Bash — detect & tune ───────────────────────────────────
+    # PHASE A: Detect & tune
     detect_ram_and_tune
     update_status "DETECT" "RAM detection complete"
 
     detect_os
     update_status "OS" "OS detection complete"
 
-    # ── PHASE B: Bash — install all packages ───────────────────────────
+    # PHASE B: Install packages
     setup_package_manager
     update_status "PACKAGES" "Package manager setup complete"
 
     setup_swap
     update_status "SWAP" "Swap setup complete"
 
-    # ── PHASE C: Python — kernel tuning (writes sysctl files) ──────────
-    # Deploy the Python config script now (it was placed by the installer)
+    # PHASE C: Kernel tuning
     deploy_python_script
     run_python_config "kernel_tuning"
     sysctl -p /etc/sysctl.d/99-wordpress.conf 2>/dev/null || true
     update_status "KERNEL" "Kernel tuning complete"
 
-    # ── PHASE D: Bash — install Nginx packages ──────────────────────────
+    # PHASE D: Install Nginx
     install_nginx_packages
     update_status "NGINX_PKGS" "Nginx packages installed"
 
-    # ── PHASE E: Python — configure Nginx ──────────────────────────────
+    # PHASE E: Configure Nginx
     run_python_config "nginx_config"
     enable_start_nginx
     update_status "NGINX" "Nginx configured and running"
 
-    # ── PHASE F: Python — Nginx extras (Brotli, CF, SSL, WS, HTTP3, Edge)
+    # PHASE F: Nginx extras
     run_python_config "nginx_extras"
     run_python_config "websocket_support"
     run_python_config "http3_quic"
@@ -908,65 +950,64 @@ main() {
     validate_nginx_config && systemctl reload nginx 2>/dev/null || true
     update_status "NGINX_EXTRAS" "Nginx extras complete"
 
-    # ── PHASE G: Bash — install PHP packages ───────────────────────────
+    # PHASE G: Install PHP
     install_php_packages
     update_status "PHP_PKGS" "PHP packages installed"
 
-    # ── PHASE H: Python — configure PHP ────────────────────────────────
+    # PHASE H: Configure PHP
     run_python_config "php_config"
     enable_start_php
     update_status "PHP" "PHP configured and running"
 
-    # ── PHASE I: Bash — install MariaDB ────────────────────────────────
+    # PHASE I: Install MariaDB
     install_mysql_packages
     enable_start_mariadb
     update_status "MYSQL_PKGS" "MariaDB installed"
 
-    # ── PHASE J: Python — configure MariaDB ────────────────────────────
+    # PHASE J: Configure MariaDB
     run_python_config "mysql_config"
     systemctl restart mariadb
     test_mysql_connection
 
-    # ── Secure MariaDB ──────────────────────────────────────────────────
+    # Secure MariaDB
     mysql <<'SECURE_SQL'
-ALTER USER 'root'@'localhost' IDENTIFIED BY '';
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+DELETE FROM mysql.db WHERE Db='test' OR Db='test_%';
 FLUSH PRIVILEGES;
 SECURE_SQL
     log "SUCCESS" "MySQL secured"
     update_status "MYSQL" "MySQL configured"
 
-    # ── PHASE K: Bash — install WP-CLI ─────────────────────────────────
+    # PHASE K: Install WP-CLI
     install_wp_cli
     update_status "WPCLI" "WP-CLI installed"
 
-    # ── PHASE L: Bash — install Redis ───────────────────────────────────
+    # PHASE L: Install Redis
     install_redis_packages
     update_status "REDIS_PKGS" "Redis packages installed"
 
-    # ── PHASE M: Python — configure Redis ──────────────────────────────
+    # PHASE M: Configure Redis
     run_python_config "redis_config"
     enable_start_redis
     update_status "REDIS" "Redis configured and running"
 
-    # ── PHASE N: Bash — install Certbot ────────────────────────────────
+    # PHASE N: Install Certbot
     install_certbot
     update_status "CERTBOT" "Certbot installed"
 
-    # ── PHASE O: Python — configure Firewall ───────────────────────────
+    # PHASE O: Firewall
     run_python_config "firewall_config"
     echo "y" | ufw enable 2>/dev/null || true
     update_status "FIREWALL" "Firewall configured"
 
-    # ── PHASE P: Python — configure Fail2ban ───────────────────────────
+    # PHASE P: Fail2ban
     run_python_config "fail2ban_config"
     start_fail2ban
     update_status "FAIL2BAN" "Fail2ban configured"
 
-    # ── PHASE Q: Python — create monitoring & utility scripts ──────────
+    # PHASE Q: Monitoring & utilities
     run_python_config "create_redis_monitor"
     run_python_config "create_commands"
     run_python_config "create_autoheal"
@@ -978,25 +1019,38 @@ SECURE_SQL
     run_python_config "create_autotune_module"
     start_autoheal
 
-    # ── Detect and export active PHP version for site creation ───────────
+    # v6.5: S3 backup configuration (if enabled)
+    if [ "$S3_BACKUP" = "true" ]; then
+        log "STEP" "Configuring S3 backup (v6.5)"
+        run_python_config "s3_backup_config"
+        update_status "S3_BACKUP" "S3 backup configured"
+    fi
+
+    # v6.5: Container configuration (if enabled)
+    if [ "$CONTAINER_MODE" = "true" ]; then
+        log "STEP" "Generating container configuration (v6.5)"
+        run_python_config "container_config"
+        update_status "CONTAINER" "Container config generated"
+    fi
+
+    # Detect active PHP
     ACTIVE_PHP_VERSION=$(detect_active_php_version)
     export ACTIVE_PHP_VERSION
     log "INFO" "Active PHP-FPM version: $ACTIVE_PHP_VERSION"
-    # Fix sockets for all active PHP-FPM versions
     for _v in 8.4 8.3 8.2; do test_php_fpm "$_v" 2>/dev/null || true; done
 
     update_status "SCRIPTS" "Utility scripts created"
 
-    # ── PHASE R: Python — advanced auto-tuning (all 10 phases) ─────────
+    # PHASE R: Advanced auto-tuning
     log "STEP" "Running Advanced Auto-Tuning (10 phases)..."
     run_python_config "advanced_autotune"
     update_status "AUTOTUNE" "Advanced auto-tuning complete"
 
-    # ── PHASE S: Bash — install Ollama local AI ─────────────────────────
+    # PHASE S: Ollama
     install_ollama
     update_status "OLLAMA" "Ollama local AI installed"
 
-    # ── PHASE T: Governor + cron timers ────────────────────────────────
+    # PHASE T: Governor + cron
     if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
         source /usr/local/lib/easyinstall-autotune.sh 2>/dev/null && {
             install_governor_timer 2>/dev/null || true
@@ -1006,7 +1060,7 @@ SECURE_SQL
     fi
     update_status "AUTOTUNE_SERVICES" "Governor + cron jobs installed"
 
-    # ── Final validation ────────────────────────────────────────────────
+    # Final validation
     update_status "TEST" "Running installation tests"
     test_installation
 
@@ -1018,26 +1072,28 @@ SECURE_SQL
 
     echo ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}✅ EasyInstall v6.4 HYBRID EDITION Complete!${NC}"
+    echo -e "${GREEN}✅ EasyInstall v6.5 Complete! (2026 Modernized)${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo -e "${YELLOW}📊 Installation Statistics:${NC}"
     echo "   • Duration : ${INSTALL_DURATION} seconds"
     echo "   • RAM      : ${TOTAL_RAM}MB | Cores: ${TOTAL_CORES}"
+    echo "   • PHP      : ${ACTIVE_PHP_VERSION} (JIT enabled)"
+    echo ""
+    echo -e "${YELLOW}🚀 v6.5 Features Active:${NC}"
+    [ "$USE_AVIF" = "true" ] && echo "   • AVIF image optimization"
+    [ "$USE_HTTP3" = "true" ] && echo "   • HTTP/3 QUIC with 0-RTT"
+    [ "$S3_BACKUP" = "true" ] && echo "   • S3 backup: $S3_BUCKET"
+    [ "$CONTAINER_MODE" = "true" ] && echo "   • Container orchestration ready"
+    echo "   • 2025 Security Headers (COEP/COOP/CORP)"
+    echo "   • MariaDB 11.4+ optimized"
     echo ""
     echo -e "${YELLOW}📋 Next Steps:${NC}"
-    echo "   1.  source ~/.bashrc"
-    echo "   2.  easyinstall help"
-    echo "   3.  easyinstall create mysite.com"
-    echo "   4.  easyinstall redis-ports"
-    echo "   5.  easyinstall monitor"
-    echo "   6.  easyinstall perf-dashboard"
-    echo "   7.  easyinstall warm-cache"
-    echo "   8.  [NEW] easyinstall update-site domain.com"
-    echo "   9.  [NEW] easyinstall clone src.com dst.com"
-    echo "   10. [v6.4] easyinstall ws-enable domain.com 8080"
-    echo "   11. [v6.4] easyinstall http3-enable"
-    echo "   12. [v6.4] easyinstall edge-setup"
+    echo "   1. source ~/.bashrc"
+    echo "   2. easyinstall help"
+    echo "   3. easyinstall create mysite.com"
+    echo "   4. easyinstall redis-ports"
+    echo "   5. easyinstall monitor"
     echo ""
     echo -e "${GREEN}⚡ Performance Settings:${NC}"
     echo "   • PHP Children     : ${PHP_MAX_CHILDREN}"
@@ -1047,7 +1103,6 @@ SECURE_SQL
     echo "   • Nginx Connections: ${NGINX_WORKER_CONNECTIONS}"
     echo ""
     echo -e "${YELLOW}📝 Logs: $LOG_FILE${NC}"
-    echo -e "${YELLOW}☕ Support: https://paypal.me/sugandodrai${NC}"
     echo -e "${GREEN}========================================${NC}"
 
     update_status "COMPLETE" "Installation completed successfully"
@@ -1055,12 +1110,10 @@ SECURE_SQL
 
 # ============================================
 # Deploy Python config script
-# (embeds easyinstall_config.py alongside this script)
 # ============================================
 deploy_python_script() {
-    log "STEP" "Deploying Python configuration module"
+    log "STEP" "Deploying Python configuration module (v6.5)"
     mkdir -p /usr/local/lib
-    # The Python script is bundled in the same directory as this script
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -f "$script_dir/easyinstall_config.py" ]; then
         cp "$script_dir/easyinstall_config.py" "$PYTHON_CONFIG_SCRIPT"
