@@ -125,52 +125,91 @@ def parse_args():
 def stage_kernel_tuning(cfg):
     log("STEP", "Configuring kernel parameters")
 
-    sysctl_content = textwrap.dedent("""\
+    # Scale sysctl values based on available RAM (optimised for 512 MB – 2 GB)
+    ram_mb = cfg.total_ram
+    # TCP buffer ceiling: 64 MB on ≤512 MB RAM, 128 MB on ≤1 GB, 256 MB otherwise
+    if ram_mb <= 512:
+        tcp_buf   = 67108864    # 64 MB
+        somaxconn = 512
+        syn_backlog = 2048
+        tw_buckets  = 262144
+        pid_max     = 32768
+        threads_max = 16384
+        dirty_ratio = 20
+        dirty_bg    = 3
+        swappiness  = 5
+    elif ram_mb <= 1024:
+        tcp_buf   = 134217728   # 128 MB
+        somaxconn = 1024
+        syn_backlog = 4096
+        tw_buckets  = 1000000
+        pid_max     = 65536
+        threads_max = 30938
+        dirty_ratio = 25
+        dirty_bg    = 5
+        swappiness  = 10
+    else:
+        tcp_buf   = 268435456   # 256 MB
+        somaxconn = 65535
+        syn_backlog = 8192
+        tw_buckets  = 2000000
+        pid_max     = 131072
+        threads_max = 65536
+        dirty_ratio = 30
+        dirty_bg    = 5
+        swappiness  = 10
+
+    sysctl_content = textwrap.dedent(f"""\
         # EasyInstall v6.4 — Maximum Network Performance
-        net.core.rmem_max = 134217728
-        net.core.wmem_max = 134217728
-        net.ipv4.tcp_rmem = 4096 87380 134217728
-        net.ipv4.tcp_wmem = 4096 65536 134217728
-        net.core.netdev_max_backlog = 5000
+        # Auto-tuned for {ram_mb} MB RAM (512 MB – 2 GB range)
+        net.core.rmem_max = {tcp_buf}
+        net.core.wmem_max = {tcp_buf}
+        net.ipv4.tcp_rmem = 4096 87380 {tcp_buf}
+        net.ipv4.tcp_wmem = 4096 65536 {tcp_buf}
+        net.core.netdev_max_backlog = 50000
         net.ipv4.tcp_congestion_control = bbr
         net.core.default_qdisc = fq
         net.ipv4.tcp_notsent_lowat = 16384
         net.ipv4.tcp_slow_start_after_idle = 0
         net.ipv4.tcp_mtu_probing = 1
 
-        # Connection handling
+        # Connection handling — tuned for high-traffic at low RAM
         net.ipv4.tcp_fin_timeout = 10
         net.ipv4.tcp_tw_reuse = 1
-        net.ipv4.tcp_max_syn_backlog = 4096
-        net.core.somaxconn = 1024
+        net.ipv4.tcp_max_syn_backlog = {syn_backlog}
+        net.core.somaxconn = {somaxconn}
         net.ipv4.tcp_syncookies = 1
         net.ipv4.tcp_syn_retries = 2
         net.ipv4.tcp_synack_retries = 2
-        net.ipv4.tcp_max_tw_buckets = 2000000
-        net.ipv4.tcp_keepalive_time = 300
-        net.ipv4.tcp_keepalive_intvl = 30
+        net.ipv4.tcp_max_tw_buckets = {tw_buckets}
+        net.ipv4.tcp_keepalive_time = 60
+        net.ipv4.tcp_keepalive_intvl = 10
         net.ipv4.tcp_keepalive_probes = 3
         net.ipv4.ip_local_port_range = 1024 65535
+        net.ipv4.tcp_fastopen = 3
+        net.ipv4.tcp_window_scaling = 1
 
         # File system
         fs.file-max = 2097152
         fs.inotify.max_user_watches = 524288
         fs.aio-max-nr = 1048576
 
-        # Virtual memory
-        vm.swappiness = 10
+        # Virtual memory — conserve RAM for 512 MB – 2 GB servers
+        vm.swappiness = {swappiness}
         vm.vfs_cache_pressure = 50
-        vm.dirty_ratio = 30
-        vm.dirty_background_ratio = 5
-        vm.dirty_expire_centisecs = 3000
-        vm.dirty_writeback_centisecs = 500
+        vm.dirty_ratio = {dirty_ratio}
+        vm.dirty_background_ratio = {dirty_bg}
+        vm.dirty_expire_centisecs = 1500
+        vm.dirty_writeback_centisecs = 300
         vm.overcommit_memory = 1
         vm.panic_on_oom = 0
+        vm.min_free_kbytes = 65536
 
         # Kernel
-        kernel.pid_max = 65536
-        kernel.threads-max = 30938
+        kernel.pid_max = {pid_max}
+        kernel.threads-max = {threads_max}
         kernel.sched_autogroup_enabled = 0
+        kernel.sched_migration_cost_ns = 5000000
     """)
     write_file("/etc/sysctl.d/99-wordpress.conf", sysctl_content)
 
@@ -198,14 +237,66 @@ def stage_kernel_tuning(cfg):
 def stage_nginx_config(cfg):
     log("STEP", "Writing optimized Nginx configuration")
 
+    # ── RAM-aware sizing (512 MB – 2 GB) ──────────────────────────────────────
+    ram_mb = cfg.total_ram
+    if ram_mb <= 512:
+        # Tight buffers — protect RAM; small fastcgi cache
+        fastcgi_keys_zone   = "WORDPRESS:32m"
+        fastcgi_max_size    = "256m"
+        fastcgi_inactive    = "30m"
+        ssl_cache_size      = "shared:SSL:10m"
+        open_file_max       = "5000"
+        client_body_buf     = "64k"
+        proxy_buf_size      = "8k"
+        proxy_bufs          = "4 8k"
+        fastcgi_buf_size    = "8k"
+        fastcgi_bufs        = "8 8k"
+        access_log_buf      = "16k"
+        keepalive_timeout   = "15"
+        keepalive_requests  = "500"
+        worker_connections  = max(cfg.nginx_worker_connections, 512)
+    elif ram_mb <= 1024:
+        fastcgi_keys_zone   = "WORDPRESS:128m"
+        fastcgi_max_size    = "512m"
+        fastcgi_inactive    = "60m"
+        ssl_cache_size      = "shared:SSL:20m"
+        open_file_max       = "8000"
+        client_body_buf     = "128k"
+        proxy_buf_size      = "16k"
+        proxy_bufs          = "4 16k"
+        fastcgi_buf_size    = "16k"
+        fastcgi_bufs        = "8 16k"
+        access_log_buf      = "32k"
+        keepalive_timeout   = "30"
+        keepalive_requests  = "1000"
+        worker_connections  = max(cfg.nginx_worker_connections, 1024)
+    else:
+        # 1–2 GB — balanced high-traffic config
+        fastcgi_keys_zone   = "WORDPRESS:256m"
+        fastcgi_max_size    = "2g"
+        fastcgi_inactive    = "60m"
+        ssl_cache_size      = "shared:SSL:50m"
+        open_file_max       = "20000"
+        client_body_buf     = "256k"
+        proxy_buf_size      = "32k"
+        proxy_bufs          = "4 32k"
+        fastcgi_buf_size    = "32k"
+        fastcgi_bufs        = "8 32k"
+        access_log_buf      = "64k"
+        keepalive_timeout   = "30"
+        keepalive_requests  = "2000"
+        worker_connections  = max(cfg.nginx_worker_connections, 2048)
+
     nginx_conf = textwrap.dedent(f"""\
+        # EasyInstall v6.4 — Nginx (auto-tuned for {ram_mb} MB RAM, high-traffic)
         user www-data;
         worker_processes {cfg.nginx_worker_processes};
         worker_rlimit_nofile 1048576;
         pid /run/nginx.pid;
+        worker_priority -5;
 
         events {{
-            worker_connections {cfg.nginx_worker_connections};
+            worker_connections {worker_connections};
             use epoll;
             multi_accept on;
             accept_mutex off;
@@ -216,18 +307,29 @@ def stage_nginx_config(cfg):
             tcp_nopush on;
             tcp_nodelay on;
             sendfile_max_chunk 512k;
-            keepalive_timeout 30;
-            keepalive_requests 1000;
+            keepalive_timeout {keepalive_timeout};
+            keepalive_requests {keepalive_requests};
+            keepalive_disable msie6;
             reset_timedout_connection on;
-            client_body_timeout 30;
-            client_header_timeout 30;
-            send_timeout 30;
+            client_body_timeout 15;
+            client_header_timeout 15;
+            send_timeout 15;
             types_hash_max_size 2048;
             server_tokens off;
             client_max_body_size 128M;
-            client_body_buffer_size 128k;
+            client_body_buffer_size {client_body_buf};
             client_header_buffer_size 1k;
             large_client_header_buffers 4 8k;
+            client_body_temp_path /var/cache/nginx/client_body;
+
+            # Proxy/FastCGI buffers — RAM-aware
+            proxy_buffer_size {proxy_buf_size};
+            proxy_buffers {proxy_bufs};
+            proxy_busy_buffers_size {proxy_buf_size};
+            fastcgi_buffer_size {fastcgi_buf_size};
+            fastcgi_buffers {fastcgi_bufs};
+            fastcgi_busy_buffers_size {fastcgi_buf_size};
+            fastcgi_temp_file_write_size 256k;
 
             include /etc/nginx/mime.types;
             default_type application/octet-stream;
@@ -238,15 +340,17 @@ def stage_nginx_config(cfg):
                             'rt=$request_time uct="$upstream_connect_time" '
                             'uht="$upstream_header_time" urt="$upstream_response_time"';
 
-            access_log /var/log/nginx/access.log main buffer=32k flush=5s;
+            access_log /var/log/nginx/access.log main buffer={access_log_buf} flush=5s;
             error_log  /var/log/nginx/error.log warn;
 
             gzip on;
             gzip_vary on;
             gzip_proxied any;
-            gzip_comp_level 6;
+            gzip_comp_level 4;
             gzip_min_length 1000;
             gzip_disable "msie6";
+            gzip_http_version 1.1;
+            gzip_buffers 16 8k;
             gzip_types
                 text/plain text/css text/xml text/javascript
                 application/json application/javascript application/xml+rss
@@ -254,28 +358,42 @@ def stage_nginx_config(cfg):
                 application/x-javascript application/x-httpd-php
                 application/x-font-ttf font/opentype image/svg+xml image/x-icon;
 
+            # FastCGI cache — RAM-aware sizing
             fastcgi_cache_path /var/cache/nginx/fastcgi levels=1:2
-                keys_zone=WORDPRESS:256m inactive=60m max_size=2g;
+                keys_zone={fastcgi_keys_zone} inactive={fastcgi_inactive} max_size={fastcgi_max_size}
+                use_temp_path=off;
             fastcgi_cache_key "$scheme$request_method$host$request_uri";
             fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_503;
             fastcgi_cache_valid 200 301 302 60m;
             fastcgi_cache_valid 404 1m;
             fastcgi_cache_lock on;
             fastcgi_cache_lock_timeout 5s;
+            fastcgi_cache_background_update on;
+            fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+            fastcgi_read_timeout 300;
+            fastcgi_connect_timeout 60;
+            fastcgi_send_timeout 300;
 
-            open_file_cache max=10000 inactive=30s;
+            # Open file cache
+            open_file_cache max={open_file_max} inactive=30s;
             open_file_cache_valid 60s;
             open_file_cache_min_uses 2;
             open_file_cache_errors on;
 
             ssl_protocols TLSv1.2 TLSv1.3;
-            ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+            ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384;
             ssl_prefer_server_ciphers off;
-            ssl_session_cache shared:SSL:50m;
+            ssl_session_cache {ssl_cache_size};
             ssl_session_timeout 1d;
             ssl_session_tickets off;
+            ssl_buffer_size 4k;
+            ssl_ecdh_curve X25519:secp384r1;
 
-            limit_req_zone $binary_remote_addr zone=login:10m rate=10r/m;
+            # Rate limiting zones — high-traffic hardened
+            limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+            limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
+            limit_req_zone $binary_remote_addr zone=global:20m rate=100r/s;
+            limit_conn_zone $binary_remote_addr zone=addr:10m;
 
             map $request_method $skip_cache {{
                 default 0;
@@ -292,6 +410,10 @@ def stage_nginx_config(cfg):
                 ~*woocommerce_items_in_cart 1;
                 ~*wp_woocommerce_session 1;
             }}
+
+            # Protect against slow-loris & flood
+            limit_req zone=global burst=200 nodelay;
+            limit_conn addr 50;
 
             include /etc/nginx/conf.d/*.conf;
             include /etc/nginx/sites-enabled/*;
@@ -666,12 +788,29 @@ def stage_php_config(cfg):
             php_ini.write_text(content)
             log("SUCCESS", f"php.ini tuned for PHP {version}")
 
-        # opcache
-        write_file(f"/etc/php/{version}/fpm/conf.d/10-opcache.ini", textwrap.dedent("""\
+        # opcache — scale memory to available RAM
+        ram_mb = cfg.total_ram
+        if ram_mb <= 512:
+            opcache_mem = 64
+            opcache_strings = 8
+            opcache_max_files = 8000
+            apcu_size = "32M"
+        elif ram_mb <= 1024:
+            opcache_mem = 128
+            opcache_strings = 12
+            opcache_max_files = 12000
+            apcu_size = "64M"
+        else:
+            opcache_mem = 256
+            opcache_strings = 16
+            opcache_max_files = 20000
+            apcu_size = "128M"
+
+        write_file(f"/etc/php/{version}/fpm/conf.d/10-opcache.ini", textwrap.dedent(f"""\
             opcache.enable=1
-            opcache.memory_consumption=256
-            opcache.interned_strings_buffer=16
-            opcache.max_accelerated_files=20000
+            opcache.memory_consumption={opcache_mem}
+            opcache.interned_strings_buffer={opcache_strings}
+            opcache.max_accelerated_files={opcache_max_files}
             opcache.revalidate_freq=60
             opcache.fast_shutdown=1
             opcache.enable_cli=1
@@ -682,12 +821,14 @@ def stage_php_config(cfg):
             opcache.consistency_checks=0
             opcache.huge_code_pages=1
             opcache.lockfile_path=/tmp
+            opcache.jit=tracing
+            opcache.jit_buffer_size=64M
         """))
 
-        # apcu
-        write_file(f"/etc/php/{version}/fpm/conf.d/20-apcu.ini", textwrap.dedent("""\
+        # apcu — RAM-scaled
+        write_file(f"/etc/php/{version}/fpm/conf.d/20-apcu.ini", textwrap.dedent(f"""\
             apcu.enabled=1
-            apcu.shm_size=128M
+            apcu.shm_size={apcu_size}
             apcu.ttl=7200
             apcu.gc_ttl=3600
             apcu.mmap_file_mask=/tmp/apcu.XXXXXX
@@ -704,7 +845,57 @@ def stage_php_config(cfg):
 
 def stage_mysql_config(cfg):
     log("STEP", "Writing optimized MariaDB configuration")
+
+    # Scale DB settings to available RAM (512 MB – 2 GB)
+    ram_mb = cfg.total_ram
+    if ram_mb <= 512:
+        max_conn        = 75
+        thread_cache    = 16
+        tmp_table       = "16M"
+        max_heap        = "16M"
+        sort_buf        = "1M"
+        join_buf        = "1M"
+        read_buf        = "1M"
+        read_rnd_buf    = "1M"
+        bulk_insert_buf = "8M"
+        key_buf         = "16M"
+        table_open      = 2000
+        table_def       = 2000
+        open_files      = 20000
+        pool_instances  = 1       # must be 1 when pool < 1 GB
+    elif ram_mb <= 1024:
+        max_conn        = 150
+        thread_cache    = 64
+        tmp_table       = "32M"
+        max_heap        = "32M"
+        sort_buf        = "2M"
+        join_buf        = "2M"
+        read_buf        = "1M"
+        read_rnd_buf    = "2M"
+        bulk_insert_buf = "32M"
+        key_buf         = "32M"
+        table_open      = 5000
+        table_def       = 5000
+        open_files      = 50000
+        pool_instances  = 1
+    else:
+        max_conn        = 300
+        thread_cache    = 128
+        tmp_table       = "64M"
+        max_heap        = "64M"
+        sort_buf        = "4M"
+        join_buf        = "4M"
+        read_buf        = "2M"
+        read_rnd_buf    = "4M"
+        bulk_insert_buf = "64M"
+        key_buf         = "64M"
+        table_open      = 10000
+        table_def       = 10000
+        open_files      = 100000
+        pool_instances  = 2
+
     mysql_conf = textwrap.dedent(f"""\
+        # EasyInstall v6.4 — MariaDB (auto-tuned for {ram_mb} MB RAM)
         [mysqld]
         user = mysql
         pid-file = /var/run/mysqld/mysqld.pid
@@ -716,43 +907,51 @@ def stage_mysql_config(cfg):
         skip-external-locking
         bind-address = 127.0.0.1
 
-        max_connections = 500
+        max_connections = {max_conn}
         connect_timeout = 10
-        wait_timeout = 600
+        wait_timeout = 300
+        interactive_timeout = 300
         max_allowed_packet = 256M
         max_connect_errors = 1000000
 
-        key_buffer_size = 64M
-        sort_buffer_size = 4M
-        read_buffer_size = 2M
-        read_rnd_buffer_size = 4M
-        join_buffer_size = 4M
-        bulk_insert_buffer_size = 64M
-        tmp_table_size = 64M
-        max_heap_table_size = 64M
+        key_buffer_size = {key_buf}
+        sort_buffer_size = {sort_buf}
+        read_buffer_size = {read_buf}
+        read_rnd_buffer_size = {read_rnd_buf}
+        join_buffer_size = {join_buf}
+        bulk_insert_buffer_size = {bulk_insert_buf}
+        tmp_table_size = {tmp_table}
+        max_heap_table_size = {max_heap}
 
         innodb_buffer_pool_size = {cfg.mysql_buffer_pool}
+        innodb_buffer_pool_instances = {pool_instances}
         innodb_log_file_size = {cfg.mysql_log_file}
         innodb_log_buffer_size = 16M
         innodb_flush_method = O_DIRECT
         innodb_file_per_table = 1
         innodb_flush_log_at_trx_commit = 2
-        innodb_read_io_threads = 64
-        innodb_write_io_threads = 64
-        innodb_io_capacity = 2000
-        innodb_io_capacity_max = 3000
-        innodb_purge_threads = 4
-        innodb_page_cleaners = 4
-        innodb_buffer_pool_instances = 8
+        innodb_read_io_threads = 4
+        innodb_write_io_threads = 4
+        innodb_io_capacity = 1000
+        innodb_io_capacity_max = 2000
+        innodb_purge_threads = 2
+        innodb_page_cleaners = 2
         innodb_autoinc_lock_mode = 2
         innodb_change_buffering = all
         innodb_old_blocks_time = 1000
         innodb_stats_on_metadata = OFF
-        innodb_lock_wait_timeout = 50
+        innodb_lock_wait_timeout = 30
+        innodb_doublewrite = 1
+        innodb_adaptive_hash_index = ON
+        innodb_adaptive_flushing = ON
 
-        table_open_cache = 20000
-        table_definition_cache = 20000
-        open_files_limit = 100000
+        table_open_cache = {table_open}
+        table_definition_cache = {table_def}
+        open_files_limit = {open_files}
+
+        # Query cache disabled (superseded by ProxySQL/Redis)
+        query_cache_type = 0
+        query_cache_size = 0
 
         log_error = /var/log/mysql/error.log
         slow_query_log = 1
@@ -763,8 +962,9 @@ def stage_mysql_config(cfg):
         character-set-server = utf8mb4
         collation-server = utf8mb4_unicode_ci
 
-        thread_cache_size = 256
+        thread_cache_size = {thread_cache}
         thread_stack = 256K
+        performance_schema = OFF
     """)
     write_file("/etc/mysql/mariadb.conf.d/99-wordpress.cnf", mysql_conf)
     log("SUCCESS", "MariaDB configuration written")
@@ -776,13 +976,20 @@ def stage_mysql_config(cfg):
 
 def stage_redis_config(cfg):
     log("STEP", "Writing optimized Redis configuration")
+
+    # IO threads: only useful on multi-core; keep conservative for low RAM
+    ram_mb   = cfg.total_ram
+    cores    = cfg.total_cores
+    io_threads = min(max(1, cores // 2), 4) if ram_mb > 512 else 1
+
     redis_conf = textwrap.dedent(f"""\
         # EasyInstall v6.4 Redis Configuration
+        # Auto-tuned for {ram_mb} MB RAM
         bind 127.0.0.1
         port 6379
         tcp-backlog 65535
         timeout 0
-        tcp-keepalive 300
+        tcp-keepalive 60
 
         daemonize yes
         supervised systemd
@@ -795,11 +1002,33 @@ def stage_redis_config(cfg):
         maxmemory {cfg.redis_max_memory}
         maxmemory-policy allkeys-lru
         maxmemory-samples 10
+        active-expire-enabled yes
+        active-expire-effort 1
 
         save ""
         appendonly no
 
-        maxclients 10000
+        # Lazy free — release memory in background (safe on low RAM)
+        lazyfree-lazy-eviction yes
+        lazyfree-lazy-expire yes
+        lazyfree-lazy-server-del yes
+        replica-lazy-flush yes
+
+        # IO threads for high-traffic (1 = single-thread on 512 MB)
+        io-threads {io_threads}
+        io-threads-do-reads yes
+
+        # Disable unused features to save RAM
+        activerehashing yes
+        no-appendfsync-on-rewrite yes
+        auto-aof-rewrite-percentage 100
+        auto-aof-rewrite-min-size 64mb
+
+        # Connection hardening
+        maxclients 1000
+        hz 15
+        dynamic-hz yes
+        aof-use-rdb-preamble yes
     """)
     write_file("/etc/redis/redis.conf", redis_conf)
     log("SUCCESS", "Redis configuration written")
