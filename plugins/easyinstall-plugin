@@ -1,0 +1,298 @@
+#!/bin/bash
+# /usr/local/bin/easyinstall-plugin
+# EasyInstall Plugin Manager CLI v1.0
+# =====================================
+# NEW command — does NOT modify any core EasyInstall files.
+# Manages optional feature plugins in /usr/local/lib/easyinstall_plugins/
+
+VERSION="1.0"
+PLUGIN_LIB="/usr/local/lib"
+PLUGINS_DIR="/usr/local/lib/easyinstall_plugins"
+PLUGIN_MANAGER="${PLUGIN_LIB}/easyinstall_plugin_manager.py"
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'
+B='\033[0;34m'; P='\033[0;35m'; C='\033[0;36m'; N='\033[0m'
+BOLD='\033[1m'
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+die()  { echo -e "${R}❌ $*${N}" >&2; exit 1; }
+info() { echo -e "${B}ℹ  $*${N}"; }
+ok()   { echo -e "${G}✅ $*${N}"; }
+warn() { echo -e "${Y}⚠  $*${N}"; }
+step() { echo -e "${P}▶  $*${N}"; }
+
+need_python() {
+    command -v python3 >/dev/null 2>&1 || die "python3 is required"
+}
+
+need_manager() {
+    [ -f "${PLUGIN_MANAGER}" ] || die "Plugin manager not found: ${PLUGIN_MANAGER}\nRun: easyinstall-worker-setup"
+}
+
+py_pm() {
+    python3 -c "
+import sys
+sys.path.insert(0, '${PLUGIN_LIB}')
+from easyinstall_plugin_manager import PluginManager
+pm = PluginManager()
+$1
+"
+}
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+show_banner() {
+    echo -e "${B}══════════════════════════════════════════════${N}"
+    echo -e "${G}${BOLD}🔌 EasyInstall Plugin Manager v${VERSION}${N}"
+    echo -e "${B}══════════════════════════════════════════════${N}"
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+show_help() {
+    show_banner
+    echo ""
+    echo -e "${Y}${BOLD}Usage:${N}  easyinstall-plugin <command> [options]"
+    echo ""
+    echo -e "${Y}Commands:${N}"
+    printf "  ${C}%-25s${N} %s\n" "list"              "List all available plugins"
+    printf "  ${C}%-25s${N} %s\n" "enable  <plugin>"  "Enable a plugin"
+    printf "  ${C}%-25s${N} %s\n" "disable <plugin>"  "Disable a plugin"
+    printf "  ${C}%-25s${N} %s\n" "status  [plugin]"  "Show plugin status"
+    printf "  ${C}%-25s${N} %s\n" "info    <plugin>"  "Show plugin details"
+    printf "  ${C}%-25s${N} %s\n" "install <plugin>"  "Install plugin from file/URL"
+    printf "  ${C}%-25s${N} %s\n" "uninstall <plugin>" "Uninstall a plugin"
+    printf "  ${C}%-25s${N} %s\n" "update  [plugin]"  "Update plugin(s)"
+    printf "  ${C}%-25s${N} %s\n" "webui   start|stop" "Start/stop the web dashboard"
+    printf "  ${C}%-25s${N} %s\n" "doctor"             "Check plugin system health"
+    echo ""
+    echo -e "${Y}Available Plugins:${N}"
+    printf "  ${G}%-22s${N} %s\n" "cloudflare-worker"   "Deploy to Cloudflare Workers"
+    printf "  ${G}%-22s${N} %s\n" "docker"              "Docker Compose stacks"
+    printf "  ${G}%-22s${N} %s\n" "kubernetes"          "Kubernetes manifests & Helm"
+    printf "  ${G}%-22s${N} %s\n" "podman"              "Rootless containers"
+    printf "  ${G}%-22s${N} %s\n" "microvm"             "Firecracker microVMs"
+    printf "  ${G}%-22s${N} %s\n" "webui"               "Browser dashboard"
+    printf "  ${G}%-22s${N} %s\n" "debian-package"      ".deb package generation"
+    printf "  ${G}%-22s${N} %s\n" "systemd-extended"    "Extended systemd services"
+    printf "  ${G}%-22s${N} %s\n" "edge-script"         "Edge function templates"
+    printf "  ${G}%-22s${N} %s\n" "pkg-manager"         "Plugin package manager"
+    printf "  ${G}%-22s${N} %s\n" "ts-worker"           "TypeScript worker projects"
+    printf "  ${G}%-22s${N} %s\n" "build-system"        "CI/CD & build automation"
+    echo ""
+    echo -e "${Y}Examples:${N}"
+    echo -e "  easyinstall-plugin ${C}list${N}"
+    echo -e "  easyinstall-plugin ${C}enable cloudflare_worker${N}"
+    echo -e "  easyinstall-plugin ${C}webui start --port 8080${N}"
+    echo -e "  easyinstall-plugin ${C}status${N}"
+    echo ""
+    echo -e "${B}══════════════════════════════════════════════${N}"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    need_python; need_manager
+    echo -e "\n${B}📦 Installed Plugins:${N}\n"
+    python3 "${PLUGIN_MANAGER}" list
+    echo ""
+}
+
+cmd_enable() {
+    [ -z "$1" ] && die "Usage: easyinstall-plugin enable <plugin>"
+    need_python; need_manager
+    step "Enabling plugin: $1"
+    python3 "${PLUGIN_MANAGER}" enable "$1" && ok "Plugin enabled: $1" || die "Failed to enable: $1"
+}
+
+cmd_disable() {
+    [ -z "$1" ] && die "Usage: easyinstall-plugin disable <plugin>"
+    need_python; need_manager
+    step "Disabling plugin: $1"
+    python3 "${PLUGIN_MANAGER}" disable "$1" && ok "Plugin disabled: $1" || die "Failed to disable: $1"
+}
+
+cmd_status() {
+    need_python; need_manager
+    if [ -n "$1" ]; then
+        python3 "${PLUGIN_MANAGER}" status "$1"
+    else
+        echo -e "\n${B}Plugin Status:${N}\n"
+        python3 "${PLUGIN_MANAGER}" status
+        echo ""
+    fi
+}
+
+cmd_info() {
+    [ -z "$1" ] && die "Usage: easyinstall-plugin info <plugin>"
+    need_python; need_manager
+    echo -e "\n${B}Plugin Info: $1${N}\n"
+    python3 "${PLUGIN_MANAGER}" info "$1"
+    echo ""
+}
+
+cmd_install() {
+    [ -z "$1" ] && die "Usage: easyinstall-plugin install <plugin> [--file=path|--url=url]"
+    PLUGIN="$1"; shift
+    FILE=""; URL=""
+    for arg in "$@"; do
+        case "$arg" in
+            --file=*) FILE="${arg#--file=}" ;;
+            --url=*)  URL="${arg#--url=}"   ;;
+        esac
+    done
+    need_python; need_manager; step "Installing plugin: ${PLUGIN}"
+    python3 - <<PYEOF
+import sys
+sys.path.insert(0, '${PLUGIN_LIB}')
+from easyinstall_plugins.pkg_manager import PkgManagerPlugin
+p = PkgManagerPlugin({})
+p.initialize()
+ok = p.install('${PLUGIN}', source_file='${FILE}', source_url='${URL}')
+sys.exit(0 if ok else 1)
+PYEOF
+    [ $? -eq 0 ] && ok "Plugin installed: ${PLUGIN}" || die "Installation failed"
+}
+
+cmd_uninstall() {
+    [ -z "$1" ] && die "Usage: easyinstall-plugin uninstall <plugin>"
+    need_python; need_manager; step "Uninstalling plugin: $1"
+    python3 - <<PYEOF
+import sys
+sys.path.insert(0, '${PLUGIN_LIB}')
+from easyinstall_plugins.pkg_manager import PkgManagerPlugin
+p = PkgManagerPlugin({})
+p.initialize()
+ok = p.uninstall('$1')
+sys.exit(0 if ok else 1)
+PYEOF
+    [ $? -eq 0 ] && ok "Plugin uninstalled: $1" || warn "Uninstall returned non-zero"
+}
+
+cmd_update() {
+    need_python; need_manager
+    if [ -z "$1" ]; then
+        step "Updating all plugins..."
+        python3 - <<'PYEOF'
+import sys
+sys.path.insert(0, '/usr/local/lib')
+from easyinstall_plugins.pkg_manager import PkgManagerPlugin
+p = PkgManagerPlugin({})
+p.initialize()
+updated = p.update_all()
+print(f"Updated {len(updated)} package(s): {', '.join(updated) or 'none'}")
+PYEOF
+    else
+        step "Updating plugin: $1"
+        warn "Single-plugin update: re-install from original source"
+    fi
+}
+
+cmd_webui() {
+    need_python; need_manager
+    SUBCMD="${1:-start}"; shift || true
+    PORT=8080
+    for arg in "$@"; do
+        case "$arg" in --port=*) PORT="${arg#--port=}" ;; esac
+    done
+    case "${SUBCMD}" in
+        start)
+            step "Starting Web UI on port ${PORT}..."
+            python3 - <<PYEOF
+import sys
+sys.path.insert(0, '${PLUGIN_LIB}')
+from easyinstall_plugins.webui_plugin import WebUIPlugin
+p = WebUIPlugin({})
+p.initialize()
+p.start(port=${PORT})
+PYEOF
+            ok "Web UI started → http://0.0.0.0:${PORT}"
+            ;;
+        stop)
+            step "Stopping Web UI..."
+            python3 - <<'PYEOF'
+import sys
+sys.path.insert(0, '/usr/local/lib')
+from easyinstall_plugins.webui_plugin import WebUIPlugin
+p = WebUIPlugin({})
+p.stop()
+PYEOF
+            ok "Web UI stopped"
+            ;;
+        *)
+            die "Usage: easyinstall-plugin webui <start|stop> [--port=8080]"
+            ;;
+    esac
+}
+
+cmd_doctor() {
+    need_python
+    echo -e "\n${B}🩺 Plugin System Health Check${N}\n"
+
+    # Python check
+    PY=$(python3 --version 2>&1)
+    echo -e "  Python   : ${G}${PY}${N}"
+
+    # Plugin manager
+    if [ -f "${PLUGIN_MANAGER}" ]; then
+        echo -e "  Manager  : ${G}Found${N}"
+    else
+        echo -e "  Manager  : ${R}Missing — run easyinstall-worker-setup${N}"
+    fi
+
+    # Plugins dir
+    if [ -d "${PLUGINS_DIR}" ]; then
+        COUNT=$(ls "${PLUGINS_DIR}"/*.py 2>/dev/null | wc -l)
+        echo -e "  Plugins  : ${G}${COUNT} plugin file(s) in ${PLUGINS_DIR}${N}"
+    else
+        echo -e "  Plugins  : ${Y}Directory not found: ${PLUGINS_DIR}${N}"
+    fi
+
+    # Optional tools
+    for tool in docker podman kubectl wrangler node npm firecracker; do
+        if command -v "${tool}" >/dev/null 2>&1; then
+            VER=$(${tool} --version 2>&1 | head -1)
+            echo -e "  ${tool}    : ${G}${VER}${N}"
+        else
+            echo -e "  ${tool}    : ${Y}not installed (optional)${N}"
+        fi
+    done
+
+    # Config dir
+    if [ -d "/etc/easyinstall/plugins" ]; then
+        echo -e "  Config   : ${G}/etc/easyinstall/plugins${N}"
+    else
+        echo -e "  Config   : ${Y}Not created yet${N}"
+    fi
+
+    # Log file
+    if [ -f "/var/log/easyinstall/plugins.log" ]; then
+        LINES=$(wc -l < /var/log/easyinstall/plugins.log)
+        echo -e "  Log      : ${G}/var/log/easyinstall/plugins.log (${LINES} lines)${N}"
+    else
+        echo -e "  Log      : ${Y}Not created yet${N}"
+    fi
+    echo ""
+}
+
+# ── Main dispatcher ───────────────────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+case "${CMD}" in
+    list)                 cmd_list      "$@" ;;
+    enable)               cmd_enable    "$@" ;;
+    disable)              cmd_disable   "$@" ;;
+    status)               cmd_status    "$@" ;;
+    info)                 cmd_info      "$@" ;;
+    install)              cmd_install   "$@" ;;
+    uninstall|remove)     cmd_uninstall "$@" ;;
+    update|upgrade)       cmd_update    "$@" ;;
+    webui|web-ui|web)     cmd_webui     "$@" ;;
+    doctor|check|health)  cmd_doctor    "$@" ;;
+    help|--help|-h|"")    show_help          ;;
+    *)
+        echo -e "${R}❌ Unknown command: ${CMD}${N}"
+        show_help
+        exit 1
+        ;;
+esac

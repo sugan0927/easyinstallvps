@@ -1,0 +1,191 @@
+#!/bin/bash
+# /usr/local/bin/easyinstall-worker-setup
+# EasyInstall Worker Features — One-Command Setup
+# ================================================
+# Installs the plugin infrastructure WITHOUT touching any core files.
+
+set -eE
+
+VERSION="1.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'
+B='\033[0;34m'; P='\033[0;35m'; C='\033[0;36m'; N='\033[0m'
+BOLD='\033[1m'
+
+ok()   { echo -e "${G}✅ $*${N}"; }
+step() { echo -e "${P}▶  $*${N}"; }
+warn() { echo -e "${Y}⚠  $*${N}"; }
+die()  { echo -e "${R}❌ $*${N}" >&2; exit 1; }
+
+# ── Directories created by this script (none overlap core paths) ───────────
+PLUGIN_LIB="/usr/local/lib/easyinstall_plugins"
+PLUGIN_MGR="/usr/local/lib/easyinstall_plugin_manager.py"
+PLUGIN_CLI="/usr/local/bin/easyinstall-plugin"
+PLUGIN_CFG="/etc/easyinstall/plugins"
+PLUGIN_LOG="/var/log/easyinstall"
+WEBUI_LIB="/usr/local/lib/easyinstall_webui"
+DOC_DIR="/usr/share/doc/easyinstall"
+
+echo -e "${B}══════════════════════════════════════════════${N}"
+echo -e "${G}${BOLD}🚀 EasyInstall Worker Features Setup v${VERSION}${N}"
+echo -e "${B}══════════════════════════════════════════════${N}"
+echo ""
+
+# ── Root check ────────────────────────────────────────────────────────────────
+[ "${EUID}" -eq 0 ] || die "Please run as root: sudo bash easyinstall-worker-setup"
+
+# ── Source directory detection ────────────────────────────────────────────────
+# Support running from repo root or from the plugins/ sub-directory
+if [ -d "${SCRIPT_DIR}/easyinstall_plugins" ]; then
+    SRC_PLUGINS="${SCRIPT_DIR}/easyinstall_plugins"
+    SRC_MANAGER="${SCRIPT_DIR}/easyinstall_plugin_manager.py"
+    SRC_CLI="${SCRIPT_DIR}/easyinstall-plugin"
+elif [ -d "${SCRIPT_DIR}/../plugins/easyinstall_plugins" ]; then
+    BASE="${SCRIPT_DIR}/../plugins"
+    SRC_PLUGINS="${BASE}/easyinstall_plugins"
+    SRC_MANAGER="${BASE}/easyinstall_plugin_manager.py"
+    SRC_CLI="${BASE}/easyinstall-plugin"
+else
+    die "Cannot locate plugin source files. Run from the 'plugins/' directory."
+fi
+
+# ── Create directories ────────────────────────────────────────────────────────
+step "Creating directories..."
+mkdir -p "${PLUGIN_LIB}"
+mkdir -p "${PLUGIN_CFG}"
+mkdir -p "${PLUGIN_LOG}"
+mkdir -p "${WEBUI_LIB}"
+mkdir -p "${DOC_DIR}"
+ok "Directories created"
+
+# ── Install plugin manager ────────────────────────────────────────────────────
+step "Installing plugin manager..."
+cp -f "${SRC_MANAGER}" "${PLUGIN_MGR}"
+chmod 644 "${PLUGIN_MGR}"
+ok "Plugin manager installed: ${PLUGIN_MGR}"
+
+# ── Install plugin files ──────────────────────────────────────────────────────
+step "Installing plugin files..."
+for f in "${SRC_PLUGINS}"/*.py; do
+    cp -f "${f}" "${PLUGIN_LIB}/"
+    chmod 644 "${PLUGIN_LIB}/$(basename "${f}")"
+done
+PLUGIN_COUNT=$(ls "${PLUGIN_LIB}"/*.py 2>/dev/null | wc -l)
+ok "${PLUGIN_COUNT} plugin file(s) installed in ${PLUGIN_LIB}"
+
+# ── Install CLI command ───────────────────────────────────────────────────────
+step "Installing CLI command..."
+cp -f "${SRC_CLI}" "${PLUGIN_CLI}"
+chmod 755 "${PLUGIN_CLI}"
+ok "CLI installed: ${PLUGIN_CLI}"
+
+# ── Add plugin lib to Python path ─────────────────────────────────────────────
+step "Configuring Python path..."
+PTH_FILE="/usr/local/lib/python3/dist-packages/easyinstall_plugins.pth"
+# Fallback path for systems where dist-packages differs
+if [ ! -d "/usr/local/lib/python3/dist-packages" ]; then
+    PTH_FILE="$(python3 -c 'import site; print(site.getsitepackages()[0])')/easyinstall_plugins.pth" 2>/dev/null || PTH_FILE="/tmp/ei_plugins.pth"
+fi
+echo "/usr/local/lib" > "${PTH_FILE}" 2>/dev/null || warn "Could not write .pth file (non-fatal)"
+ok "Python path configured"
+
+# ── Install Python dependencies ───────────────────────────────────────────────
+step "Installing Python dependencies..."
+pip3 install flask requests --quiet 2>/dev/null && ok "Flask + requests installed" || warn "pip3 install failed (install manually if needed)"
+
+# ── Write default plugin configs ──────────────────────────────────────────────
+step "Writing default plugin configs..."
+
+write_default_cfg() {
+    local name="$1"; local content="$2"
+    local path="${PLUGIN_CFG}/${name}.json"
+    [ -f "${path}" ] || echo "${content}" > "${path}"
+}
+
+write_default_cfg "cloudflare_worker" '{
+  "enabled": false,
+  "api_token": "",
+  "account_id": "",
+  "zone_id": "",
+  "worker_name": "easyinstall-wp",
+  "kv_namespace_id": ""
+}'
+
+write_default_cfg "docker_plugin" '{
+  "enabled": false,
+  "php_version": "8.2",
+  "mariadb_version": "10.11",
+  "wp_version": "latest"
+}'
+
+write_default_cfg "webui_plugin" '{
+  "enabled": false,
+  "port": 8080,
+  "bind": "0.0.0.0"
+}'
+
+write_default_cfg "ts_worker" '{
+  "enabled": false,
+  "output_dir": "/opt/easyinstall/workers"
+}'
+
+ok "Default configs written to ${PLUGIN_CFG}"
+
+# ── Create systemd service for web UI ─────────────────────────────────────────
+step "Creating Web UI systemd unit..."
+cat > /etc/systemd/system/easyinstall-webui.service <<'UNITEOF'
+[Unit]
+Description=EasyInstall Web Dashboard (Plugin)
+After=network.target
+
+[Service]
+Type=simple
+Environment=EASYINSTALL_WEBUI_PORT=8080
+ExecStart=/usr/bin/python3 /usr/local/lib/easyinstall_webui/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+systemctl daemon-reload 2>/dev/null || true
+ok "Web UI service unit created (not started — use: easyinstall-plugin webui start)"
+
+# ── Install optional npm toolchain ───────────────────────────────────────────
+if command -v npm &>/dev/null; then
+    step "Installing Wrangler (Cloudflare Worker CLI)..."
+    npm install -g wrangler --silent 2>/dev/null && ok "Wrangler installed" || warn "Wrangler install failed (optional)"
+else
+    warn "npm not found — Wrangler not installed. Install Node.js to deploy Workers."
+fi
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+step "Running health check..."
+python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/lib')
+from easyinstall_plugin_manager import PluginManager
+pm = PluginManager()
+plugins = pm.list_plugins()
+print(f'  Plugin manager OK — {len(plugins)} plugins discovered')
+for p in plugins:
+    print(f\"    📦 {p['module']:30s} v{p['version']}\")
+" || warn "Plugin manager check failed — check Python path"
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${G}${BOLD}══════════════════════════════════════════════${N}"
+echo -e "${G}${BOLD}✅ EasyInstall Worker Features Setup Complete!${N}"
+echo -e "${G}${BOLD}══════════════════════════════════════════════${N}"
+echo ""
+echo -e "${Y}Next steps:${N}"
+echo -e "  1. ${C}easyinstall-plugin list${N}                    # List all plugins"
+echo -e "  2. ${C}easyinstall-plugin doctor${N}                  # Health check"
+echo -e "  3. ${C}easyinstall-plugin enable cloudflare_worker${N} # Enable CF Worker"
+echo -e "  4. ${C}easyinstall-plugin webui start --port 8080${N}  # Launch dashboard"
+echo -e "  5. ${C}easyinstall-plugin status${N}                  # Check plugin status"
+echo ""
+echo -e "${B}Core EasyInstall files were NOT modified.${N}"
+echo -e "${B}All plugins are optional and isolated.${N}"
+echo ""
