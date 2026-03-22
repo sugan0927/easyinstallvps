@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "api_token": "",
+  "account_id": "",
+  "zone_id": "",
+  "worker_name": "easyinstall-wp",
+  "kv_namespace_id": "",
+  "routes": ["*"],
+  "environment": "production",
+  "durable_objects": []
+}
