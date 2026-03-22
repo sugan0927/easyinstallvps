@@ -1,0 +1,377 @@
+#!/bin/bash
+# ============================================================
+# EasyInstall AI Page Generator — CLI Entry Point
+# Separate command: easyinstall-pages
+# Does NOT modify existing easyinstall command.
+#
+# Install: place at /usr/local/bin/easyinstall-pages
+# Usage:   easyinstall-pages help
+# ============================================================
+
+VERSION="1.0"
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+LIB="/usr/local/lib"
+LOG_DIR="/var/log/easyinstall"
+PID_FILE="/var/run/easyinstall-page-web.pid"
+SYSTEMD_DIR="/etc/systemd/system"
+
+# ── Helper ────────────────────────────────────────────────────────────────────
+_check_module() {
+    if [ ! -f "$LIB/easyinstall_ai_pages.py" ]; then
+        echo -e "${RED}❌ AI Pages module not installed.${NC}"
+        echo "   Run the installer: bash /path/to/easyinstall_pages_install.sh"
+        exit 1
+    fi
+}
+
+_check_domain() {
+    if [ -z "$1" ]; then
+        echo -e "${RED}❌ Domain required.${NC}"
+        return 1
+    fi
+    if [ ! -d "/var/www/html/$1" ]; then
+        echo -e "${RED}❌ WordPress site not found: $1${NC}"
+        echo "   Create one first: easyinstall create $1"
+        return 1
+    fi
+    return 0
+}
+
+_server_ip() {
+    hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1"
+}
+
+show_help() {
+    clear
+    echo -e "${BLUE}══════════════════════════════════════════════════${NC}"
+    echo -e "${PURPLE}  🎨 EasyInstall AI Page Generator v${VERSION}${NC}"
+    echo -e "${BLUE}══════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${YELLOW}Commands:${NC}"
+    echo ""
+    echo -e "  ${GREEN}custom-login${NC} <domain> [description] [style]"
+    echo "      Generate a custom WordPress login page"
+    echo -e "      Styles: ${CYAN}modern${NC} | dark | minimal | corporate | creative"
+    echo ""
+    echo -e "  ${GREEN}custom-setup${NC} <domain> [description]"
+    echo "      Generate a multi-step setup wizard plugin"
+    echo ""
+    echo -e "  ${GREEN}custom-theme${NC} <domain> [description] [colors]"
+    echo "      Generate a theme customizer plugin"
+    echo "      Colors: comma-separated hex e.g. #667eea,#764ba2"
+    echo ""
+    echo -e "  ${GREEN}custom-plugin${NC} <domain> [description] [features]"
+    echo "      Generate a custom WordPress plugin"
+    echo "      Features: shortcode,widget,settings,cpt,rest,ajax,dashboard,cron"
+    echo ""
+    echo -e "  ${GREEN}page-assist${NC} <domain>"
+    echo "      Interactive AI design assistant"
+    echo ""
+    echo -e "  ${GREEN}web-start${NC} [port]"
+    echo "      Start web interface (default port: 8080)"
+    echo ""
+    echo -e "  ${GREEN}web-stop${NC}"
+    echo "      Stop web interface"
+    echo ""
+    echo -e "  ${GREEN}web-status${NC}"
+    echo "      Show web interface status"
+    echo ""
+    echo -e "  ${GREEN}list-plugins${NC} [domain]"
+    echo "      List AI-generated plugins"
+    echo ""
+    echo -e "  ${GREEN}delete-plugin${NC} <domain> <plugin-slug>"
+    echo "      Remove a generated plugin"
+    echo ""
+    echo -e "  ${GREEN}ai-status${NC}"
+    echo "      Show current AI provider configuration"
+    echo ""
+    echo -e "${YELLOW}Examples:${NC}"
+    echo "  easyinstall-pages custom-login mysite.com \"Dark branded login\" dark"
+    echo "  easyinstall-pages custom-setup mysite.com \"E-commerce 6-step wizard\""
+    echo "  easyinstall-pages custom-theme mysite.com \"SaaS theme\" \"#e74c3c,#c0392b\""
+    echo "  easyinstall-pages custom-plugin mysite.com \"Lead form\" shortcode,settings,cron"
+    echo "  easyinstall-pages page-assist mysite.com"
+    echo "  easyinstall-pages web-start 8080"
+    echo ""
+    echo -e "${YELLOW}AI Setup:${NC}"
+    echo "  easyinstall ai-setup          (configure provider)"
+    echo "  easyinstall-pages ai-status   (check current config)"
+    echo ""
+    echo -e "${YELLOW}Logs:${NC}   ${LOG_DIR}/ai-pages.log"
+    echo -e "${YELLOW}Repo:${NC}   github.com/sugan0927/easyinstallvps"
+    echo ""
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+case "$1" in
+
+    custom-login)
+        _check_module
+        _check_domain "$2" || exit 1
+        DOMAIN="$2"
+        DESC="${3:-Modern login page with gradient background and smooth animations}"
+        STYLE="${4:-modern}"
+        echo -e "${PURPLE}🎨 Generating custom login page for ${CYAN}${DOMAIN}${NC}..."
+        echo -e "${BLUE}   Style: ${STYLE}${NC}"
+        PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-login \
+            --domain "$DOMAIN" \
+            --description "$DESC" \
+            --style "$STYLE"
+        ;;
+
+    custom-login-colored)
+        # Extended version with color support: easyinstall-pages custom-login-colored domain desc style color1 color2
+        _check_module
+        _check_domain "$2" || exit 1
+        DOMAIN="$2"; DESC="${3:-Modern login}"; STYLE="${4:-modern}"
+        C1="${5:-#667eea}"; C2="${6:-#764ba2}"
+        PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-login \
+            --domain "$DOMAIN" --description "$DESC" --style "$STYLE" --colors "${C1},${C2}"
+        ;;
+
+    custom-setup)
+        _check_module
+        _check_domain "$2" || exit 1
+        DOMAIN="$2"
+        DESC="${3:-Modern 8-step installation wizard with progress bar and demo content}"
+        echo -e "${PURPLE}🚀 Generating setup wizard for ${CYAN}${DOMAIN}${NC}..."
+        PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-setup \
+            --domain "$DOMAIN" \
+            --description "$DESC"
+        ;;
+
+    custom-theme)
+        _check_module
+        _check_domain "$2" || exit 1
+        DOMAIN="$2"
+        DESC="${3:-Modern business theme with responsive design}"
+        COLORS="${4:-#667eea,#764ba2}"
+        echo -e "${PURPLE}🎨 Generating theme plugin for ${CYAN}${DOMAIN}${NC}..."
+        PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-theme \
+            --domain "$DOMAIN" \
+            --description "$DESC" \
+            --colors "$COLORS"
+        ;;
+
+    custom-plugin)
+        _check_module
+        _check_domain "$2" || exit 1
+        DOMAIN="$2"
+        DESC="${3:-Custom WordPress functionality plugin}"
+        FEATURES="${4:-shortcode,widget,settings}"
+        echo -e "${PURPLE}🔌 Generating custom plugin for ${CYAN}${DOMAIN}${NC}..."
+        echo -e "${BLUE}   Features: ${FEATURES}${NC}"
+        PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-plugin \
+            --domain "$DOMAIN" \
+            --description "$DESC" \
+            --features "$FEATURES"
+        ;;
+
+    page-assist)
+        _check_module
+        _check_domain "$2" || exit 1
+        DOMAIN="$2"
+        echo -e "${PURPLE}╔══════════════════════════════════╗${NC}"
+        echo -e "${PURPLE}║  🤖 AI Design Assistant          ║${NC}"
+        echo -e "${PURPLE}║  Site: ${CYAN}${DOMAIN}${PURPLE}                 ║${NC}"
+        echo -e "${PURPLE}╚══════════════════════════════════╝${NC}"
+        echo ""
+        echo "What would you like to create?"
+        echo -e "  ${GREEN}1)${NC} Custom Login Page"
+        echo -e "  ${GREEN}2)${NC} Custom Setup Wizard"
+        echo -e "  ${GREEN}3)${NC} Theme Plugin"
+        echo -e "  ${GREEN}4)${NC} Custom Plugin"
+        echo ""
+        read -rp "Select [1-4]: " choice
+        echo ""
+
+        case $choice in
+            1)
+                read -rp "Describe your login page (or press Enter for default): " desc
+                echo ""
+                echo -e "Choose style: ${CYAN}modern${NC} | dark | minimal | corporate | creative"
+                read -rp "Style [modern]: " style
+                style="${style:-modern}"
+                read -rp "Primary color [#667eea]: " c1; c1="${c1:-#667eea}"
+                read -rp "Secondary color [#764ba2]: " c2; c2="${c2:-#764ba2}"
+                desc="${desc:-Modern login page with gradient background}"
+                echo ""
+                PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-login \
+                    --domain "$DOMAIN" --description "$desc" --style "$style" --colors "${c1},${c2}"
+                ;;
+            2)
+                read -rp "Describe your setup wizard (or press Enter for default): " desc
+                desc="${desc:-Modern 8-step installation wizard with progress bar}"
+                echo ""
+                PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-setup \
+                    --domain "$DOMAIN" --description "$desc"
+                ;;
+            3)
+                read -rp "Describe your theme (or press Enter for default): " desc
+                read -rp "Primary color [#667eea]: " c1; c1="${c1:-#667eea}"
+                read -rp "Secondary color [#764ba2]: " c2; c2="${c2:-#764ba2}"
+                desc="${desc:-Modern business theme with responsive design}"
+                echo ""
+                PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-theme \
+                    --domain "$DOMAIN" --description "$desc" --colors "${c1},${c2}"
+                ;;
+            4)
+                read -rp "Describe your plugin: " desc
+                echo ""
+                echo "Available features: shortcode widget settings cpt rest ajax dashboard cron"
+                read -rp "Features [shortcode,widget,settings]: " features
+                features="${features:-shortcode,widget,settings}"
+                desc="${desc:-Custom WordPress functionality plugin}"
+                echo ""
+                PYTHONPATH="$LIB" python3 "$LIB/easyinstall_ai_pages.py" generate-plugin \
+                    --domain "$DOMAIN" --description "$desc" --features "$features"
+                ;;
+            *)
+                echo -e "${RED}❌ Invalid choice${NC}"; exit 1 ;;
+        esac
+        ;;
+
+    web-start)
+        _check_module
+        PORT="${2:-8080}"
+        if [ ! -f "$LIB/easyinstall_page_web.py" ]; then
+            echo -e "${RED}❌ Web interface module not found: $LIB/easyinstall_page_web.py${NC}"; exit 1
+        fi
+        if pgrep -f "easyinstall_page_web.py" > /dev/null 2>&1; then
+            echo -e "${YELLOW}⚠️  Web interface already running${NC}"
+            easyinstall-pages web-status
+            exit 0
+        fi
+        mkdir -p "$LOG_DIR"
+        echo -e "${PURPLE}🌐 Starting web interface on port ${PORT}...${NC}"
+        PYTHONPATH="$LIB" nohup python3 "$LIB/easyinstall_page_web.py" \
+            --port "$PORT" --host "0.0.0.0" \
+            > "$LOG_DIR/page-web.log" 2>&1 &
+        echo $! > "$PID_FILE"
+        sleep 2
+        if pgrep -f "easyinstall_page_web.py" > /dev/null 2>&1; then
+            IP=$(_server_ip)
+            echo -e "${GREEN}✅ Web interface running!${NC}"
+            echo -e "   URL  : ${CYAN}http://${IP}:${PORT}${NC}"
+            echo -e "   Logs : ${LOG_DIR}/page-web.log"
+            echo ""
+            echo -e "${YELLOW}ℹ️  Open in browser: http://${IP}:${PORT}${NC}"
+        else
+            echo -e "${RED}❌ Failed to start web interface${NC}"
+            echo "   Check logs: $LOG_DIR/page-web.log"
+            cat "$LOG_DIR/page-web.log" 2>/dev/null | tail -10
+        fi
+        ;;
+
+    web-stop)
+        echo -e "${PURPLE}🛑 Stopping web interface...${NC}"
+        if [ -f "$PID_FILE" ]; then
+            PID=$(cat "$PID_FILE")
+            kill "$PID" 2>/dev/null && echo -e "${GREEN}✅ Stopped (PID: $PID)${NC}"
+            rm -f "$PID_FILE"
+        fi
+        pkill -f "easyinstall_page_web.py" 2>/dev/null || true
+        echo -e "${GREEN}✅ Web interface stopped${NC}"
+        ;;
+
+    web-status)
+        if pgrep -f "easyinstall_page_web.py" > /dev/null 2>&1; then
+            PID=$(pgrep -f "easyinstall_page_web.py" | head -1)
+            PORT=$(ss -tlnp 2>/dev/null | grep "$PID" | grep -oP ':\K\d+' | head -1 || echo "8080")
+            IP=$(_server_ip)
+            echo -e "${GREEN}✅ Web interface is RUNNING${NC}"
+            echo -e "   PID  : $PID"
+            echo -e "   URL  : ${CYAN}http://${IP}:${PORT}${NC}"
+        else
+            echo -e "${RED}❌ Web interface is NOT running${NC}"
+            echo "   Start: easyinstall-pages web-start [port]"
+        fi
+        ;;
+
+    list-plugins)
+        DOMAIN="${2:-}"
+        echo -e "${CYAN}📋 AI-Generated Plugins${NC}"
+        echo ""
+        _found=0
+        for site_dir in /var/www/html/*/; do
+            [ -d "$site_dir" ] || continue
+            site=$(basename "$site_dir")
+            [ -n "$DOMAIN" ] && [ "$site" != "$DOMAIN" ] && continue
+            plugins_dir="${site_dir}wp-content/plugins"
+            [ -d "$plugins_dir" ] || continue
+            found_in_site=0
+            for plugin in "${plugins_dir}"/ei-*/; do
+                [ -d "$plugin" ] || continue
+                slug=$(basename "$plugin")
+                # Get plugin name from PHP header
+                name=$(grep -m1 "Plugin Name:" "${plugin}${slug}.php" 2>/dev/null | sed 's/.*Plugin Name:\s*//' | tr -d '\r' || echo "$slug")
+                echo -e "  ${GREEN}✓${NC} ${YELLOW}${site}${NC} → ${slug}"
+                echo -e "    Name: ${name}"
+                echo -e "    Path: ${plugin}"
+                found_in_site=1
+                _found=$((_found + 1))
+            done
+        done
+        echo ""
+        if [ "$_found" -eq 0 ]; then
+            echo -e "  ${YELLOW}No AI-generated plugins found.${NC}"
+            echo "  Generate one: easyinstall-pages custom-login domain.com"
+        else
+            echo -e "  Total: ${_found} plugin(s)"
+        fi
+        ;;
+
+    delete-plugin)
+        if [ -z "$2" ] || [ -z "$3" ]; then
+            echo -e "${RED}❌ Usage: easyinstall-pages delete-plugin <domain> <plugin-slug>${NC}"
+            exit 1
+        fi
+        DOMAIN="$2"; SLUG="$3"
+        PLUGIN_DIR="/var/www/html/${DOMAIN}/wp-content/plugins/${SLUG}"
+        if [ ! -d "$PLUGIN_DIR" ]; then
+            echo -e "${RED}❌ Plugin not found: ${PLUGIN_DIR}${NC}"; exit 1
+        fi
+        # Deactivate first
+        wp --path="/var/www/html/${DOMAIN}" --allow-root plugin deactivate "$SLUG" 2>/dev/null || true
+        rm -rf "$PLUGIN_DIR"
+        echo -e "${GREEN}✅ Plugin deleted: ${SLUG}${NC}"
+        ;;
+
+    ai-status)
+        echo -e "${CYAN}🤖 AI Configuration${NC}"
+        echo ""
+        CONF="/etc/easyinstall/ai.conf"
+        if [ -f "$CONF" ]; then
+            source "$CONF" 2>/dev/null || true
+            echo -e "  Provider : ${GREEN}${AI_PROVIDER:-ollama}${NC}"
+            echo -e "  Model    : ${GREEN}${AI_MODEL:-phi3}${NC}"
+            echo -e "  Endpoint : ${AI_ENDPOINT:-http://localhost:11434/api/chat}"
+            echo ""
+            echo -e "${YELLOW}Config file: $CONF${NC}"
+        else
+            echo -e "${YELLOW}⚠️  AI config not found: $CONF${NC}"
+            echo "   Run: easyinstall ai-setup"
+        fi
+        echo ""
+        # Quick connectivity test
+        if curl -s --max-time 3 "http://localhost:11434/api/tags" > /dev/null 2>&1; then
+            echo -e "  Ollama : ${GREEN}✅ Running${NC}"
+            echo -e "  Models : $(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}' | tr '\n' ' ' || echo "none")"
+        else
+            echo -e "  Ollama : ${YELLOW}not running (OK if using cloud provider)${NC}"
+        fi
+        ;;
+
+    help|--help|-h|"")
+        show_help
+        ;;
+
+    *)
+        echo -e "${RED}❌ Unknown command: $1${NC}"
+        echo ""
+        show_help
+        exit 1
+        ;;
+esac
