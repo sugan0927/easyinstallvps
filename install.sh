@@ -43,6 +43,30 @@ EI_LOG_DIR="/var/log/easyinstall"
 SYSTEMD_DIR="/etc/systemd/system"
 COMPLETION_DIR="/etc/bash_completion.d"
 
+# ── Plugin system paths ───────────────────────────────────────────────────────
+PLUGINS_REPO_DIR="${REPO_RAW}/plugins"
+PLUGIN_MANAGER_DEST="${LIB_DIR}/easyinstall_plugin_manager.py"
+PLUGIN_CLI_DEST="${BIN_DIR}/easyinstall-plugin"
+PLUGIN_LIB_DIR="${LIB_DIR}/easyinstall_plugins"
+PLUGIN_CFG_DIR="${CONF_DIR}/plugins"
+PLUGIN_LOG_DIR="${EI_LOG_DIR}"   # shared with existing log dir
+
+# Plugin Python modules to download from GitHub /plugins/easyinstall_plugins/
+PLUGIN_MODULES=(
+    "cloudflare_worker.py"
+    "docker_plugin.py"
+    "kubernetes_plugin.py"
+    "podman_plugin.py"
+    "microvm_plugin.py"
+    "webui_plugin.py"
+    "debian_package.py"
+    "systemd_plugin.py"
+    "edge_script.py"
+    "pkg_manager.py"
+    "ts_worker.py"
+    "build_system.py"
+)
+
 # Enterprise Python modules to download from GitHub /etc/ folder
 ENTERPRISE_MODULES=(
     "easyinstall_api.py"
@@ -1345,9 +1369,324 @@ print_summary() {
     echo "   easyinstall page-assist domain.com    — Interactive assistant"
     echo "   easyinstall-pages web-start 8080      — Web UI"
     echo ""
+    echo -e "${YELLOW}🔌 Plugin System (Phase 5):${NC}"
+    echo "   easyinstall-plugin list               — List all 12 plugins"
+    echo "   easyinstall-plugin doctor             — Health check"
+    echo "   easyinstall plugin-enable <n>         — Enable a plugin"
+    echo "   easyinstall webui start               — Start web dashboard (:8080)"
+    echo "   easyinstall-plugin enable cloudflare_worker  — Edge caching"
+    echo "   easyinstall-plugin enable docker_plugin      — Docker stacks"
+    echo "   easyinstall-plugin enable kubernetes_plugin  — K8s manifests"
+    echo "   Plugin files: /usr/local/lib/easyinstall_plugins/"
+    echo "   Plugin CLI  : /usr/local/bin/easyinstall-plugin"
+    echo ""
     echo -e "${YELLOW}📝 Log File: ${LOG_FILE}${NC}"
     echo -e "${YELLOW}☕ Support: https://paypal.me/sugandodrai${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 5 — Plugin System (all NEW functions, nothing existing is touched)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Download plugin manager + all plugin files from GitHub /plugins/ ──────────
+download_plugin_system() {
+    log "STEP" "Downloading Plugin Manager from GitHub /plugins/..."
+    mkdir -p "${PLUGIN_LIB_DIR}" "${PLUGIN_CFG_DIR}"
+    chmod 755 "${PLUGIN_LIB_DIR}"
+    chmod 700 "${PLUGIN_CFG_DIR}"
+
+    # 1. Core plugin manager
+    local mgr_url="${PLUGINS_REPO_DIR}/easyinstall_plugin_manager.py"
+    if download_file "${mgr_url}" "${PLUGIN_MANAGER_DEST}" "easyinstall_plugin_manager.py"; then
+        if python3 -m py_compile "${PLUGIN_MANAGER_DEST}" 2>/dev/null; then
+            chmod 644 "${PLUGIN_MANAGER_DEST}"
+            log "SUCCESS" "Plugin manager installed: ${PLUGIN_MANAGER_DEST}"
+        else
+            log "WARNING" "Plugin manager has syntax issues — plugin system may not work"
+        fi
+    else
+        log "WARNING" "Could not download plugin manager — plugin system unavailable"
+        return 0   # Never fail the whole install
+    fi
+
+    # 2. __init__.py for the package
+    local init_url="${PLUGINS_REPO_DIR}/easyinstall_plugins/__init__.py"
+    local init_dest="${PLUGIN_LIB_DIR}/__init__.py"
+    download_file "${init_url}" "${init_dest}" "__init__.py" 2>/dev/null || \
+        echo '"""EasyInstall plugins package"""' > "${init_dest}"
+    chmod 644 "${init_dest}"
+
+    # 3. Individual plugin modules
+    local ok_count=0 fail_count=0
+    for module in "${PLUGIN_MODULES[@]}"; do
+        local url="${PLUGINS_REPO_DIR}/easyinstall_plugins/${module}"
+        local dest="${PLUGIN_LIB_DIR}/${module}"
+        if download_file "${url}" "${dest}" "${module}"; then
+            if python3 -m py_compile "${dest}" 2>/dev/null; then
+                chmod 644 "${dest}"
+                log "SUCCESS" "Plugin installed: ${module}"
+                ok_count=$((ok_count + 1))
+            else
+                log "WARNING" "${module} has syntax issues — kept but may not work"
+                fail_count=$((fail_count + 1))
+            fi
+        else
+            log "WARNING" "Could not download ${module} — skipping"
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    log "INFO" "Plugins: ${ok_count} installed, ${fail_count} failed"
+
+    # 4. CLI command
+    local cli_url="${PLUGINS_REPO_DIR}/easyinstall-plugin"
+    if download_file "${cli_url}" "${PLUGIN_CLI_DEST}" "easyinstall-plugin"; then
+        chmod 755 "${PLUGIN_CLI_DEST}"
+        log "SUCCESS" "Plugin CLI installed: ${PLUGIN_CLI_DEST}"
+    else
+        log "WARNING" "Could not download easyinstall-plugin CLI — generate minimal stub"
+        _write_plugin_cli_stub
+    fi
+
+    # 5. Default plugin config files
+    _write_default_plugin_configs
+
+    return 0
+}
+
+# ── Write a minimal easyinstall-plugin stub if GitHub download fails ──────────
+_write_plugin_cli_stub() {
+    cat > "${PLUGIN_CLI_DEST}" <<'STUBEOF'
+#!/bin/bash
+# easyinstall-plugin — minimal stub (full CLI failed to download)
+G='\033[0;32m'; B='\033[0;34m'; N='\033[0m'
+echo -e "${B}EasyInstall Plugin Manager${N}"
+python3 /usr/local/lib/easyinstall_plugin_manager.py "$@" 2>/dev/null || \
+    echo -e "${G}Plugins dir: /usr/local/lib/easyinstall_plugins/${N}"
+STUBEOF
+    chmod 755 "${PLUGIN_CLI_DEST}"
+    log "INFO" "Minimal plugin CLI stub written"
+}
+
+# ── Write default JSON configs for plugins that need credentials ──────────────
+_write_default_plugin_configs() {
+    # Only write if not already present (idempotent)
+    local cf_cfg="${PLUGIN_CFG_DIR}/cloudflare_worker.json"
+    [ -f "${cf_cfg}" ] || cat > "${cf_cfg}" <<'EOF'
+{
+    "enabled": false,
+    "api_token": "",
+    "account_id": "",
+    "zone_id": "",
+    "worker_name": "easyinstall-wp",
+    "kv_namespace_id": ""
+}
+EOF
+
+    local webui_cfg="${PLUGIN_CFG_DIR}/webui_plugin.json"
+    [ -f "${webui_cfg}" ] || cat > "${webui_cfg}" <<'EOF'
+{
+    "enabled": false,
+    "port": 8080,
+    "bind": "0.0.0.0"
+}
+EOF
+
+    local docker_cfg="${PLUGIN_CFG_DIR}/docker_plugin.json"
+    [ -f "${docker_cfg}" ] || cat > "${docker_cfg}" <<'EOF'
+{
+    "enabled": false,
+    "php_version": "8.2",
+    "mariadb_version": "10.11",
+    "wp_version": "latest"
+}
+EOF
+    chmod 600 "${PLUGIN_CFG_DIR}"/*.json 2>/dev/null || true
+    log "SUCCESS" "Default plugin configs written to ${PLUGIN_CFG_DIR}"
+}
+
+# ── Install Python deps needed by plugins (flask already done in Phase 2) ─────
+install_plugin_python_deps() {
+    log "STEP" "Installing plugin Python dependencies..."
+    if ! command -v pip3 &>/dev/null; then
+        log "WARNING" "pip3 not found — skipping plugin Python deps"
+        return 0
+    fi
+    # Flask already installed in install_python_deps(); add plugin-specific extras
+    local pkgs=("pyyaml")
+    for pkg in "${pkgs[@]}"; do
+        pip3 install "${pkg}" --break-system-packages --quiet 2>/dev/null || \
+        pip3 install "${pkg}" --quiet 2>/dev/null || \
+            log "WARNING" "pip: ${pkg} install failed (optional)"
+    done
+    log "SUCCESS" "Plugin Python deps installed"
+}
+
+# ── Configure Python path so plugins are importable ───────────────────────────
+configure_plugin_python_path() {
+    local pth_dir
+    pth_dir=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null \
+              || echo "/usr/local/lib/python3/dist-packages")
+    local pth_file="${pth_dir}/easyinstall_plugins.pth"
+    mkdir -p "${pth_dir}" 2>/dev/null || true
+    echo "/usr/local/lib" > "${pth_file}" 2>/dev/null || true
+    log "SUCCESS" "Python path configured: ${pth_file}"
+}
+
+# ── Write easyinstall-webui systemd service (plugin-specific) ─────────────────
+write_plugin_systemd_units() {
+    log "STEP" "Writing plugin systemd unit (easyinstall-webui)..."
+    cat > "${SYSTEMD_DIR}/easyinstall-webui.service" <<'UNIT'
+[Unit]
+Description=EasyInstall Web Dashboard (Plugin)
+After=network.target
+
+[Service]
+Type=simple
+Environment=EASYINSTALL_WEBUI_PORT=8080
+ExecStart=/usr/bin/python3 /usr/local/lib/easyinstall_webui/app.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=easyinstall-webui
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/usr/local/lib
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload 2>/dev/null || true
+    log "SUCCESS" "easyinstall-webui.service written (not started — use: easyinstall-plugin webui start)"
+}
+
+# ── Inject plugin CLI commands into /usr/local/bin/easyinstall ────────────────
+inject_plugin_cli() {
+    log "STEP" "Injecting plugin CLI commands into easyinstall..."
+
+    local EASYINSTALL_BIN="${BIN_DIR}/easyinstall"
+    local MARKER="# ── EasyInstall Plugin Commands v1.0"
+
+    if [ ! -f "${EASYINSTALL_BIN}" ]; then
+        log "WARNING" "${EASYINSTALL_BIN} not found — plugin CLI injection skipped"
+        return 0
+    fi
+    if grep -q "${MARKER}" "${EASYINSTALL_BIN}" 2>/dev/null; then
+        log "INFO" "Plugin CLI already injected — skipping"
+        return 0
+    fi
+
+    # Backup before modifying
+    cp "${EASYINSTALL_BIN}" "${EASYINSTALL_BIN}.bak.plugins.$(date +%Y%m%d%H%M%S)"
+
+    python3 - "${EASYINSTALL_BIN}" <<'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+src  = open(path).read()
+
+plugin_block = """
+        # ── EasyInstall Plugin Commands v1.0 ─────────────────────────────────
+        # Injected by install.sh Phase 5 — do not edit manually
+
+        plugin|plugins)
+            shift || true
+            exec /usr/local/bin/easyinstall-plugin "$@" ;;
+
+        plugin-list)
+            /usr/local/bin/easyinstall-plugin list ;;
+
+        plugin-enable)
+            [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall plugin-enable <name>${NC}"; exit 1; }
+            /usr/local/bin/easyinstall-plugin enable "$2" ;;
+
+        plugin-disable)
+            [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall plugin-disable <name>${NC}"; exit 1; }
+            /usr/local/bin/easyinstall-plugin disable "$2" ;;
+
+        plugin-status)
+            /usr/local/bin/easyinstall-plugin status "${2:-}" ;;
+
+        webui)
+            subcmd="${2:-start}"
+            port="${3:-8080}"
+            /usr/local/bin/easyinstall-plugin webui "${subcmd}" "--port=${port}" ;;
+
+        plugin-doctor)
+            /usr/local/bin/easyinstall-plugin doctor ;;
+
+"""
+
+# Insert before the final *) catch-all
+patched = re.sub(
+    r'^        \*\)',
+    plugin_block + '        *)',
+    src,
+    count=1,
+    flags=re.MULTILINE
+)
+if patched == src:
+    # Fallback: insert before last esac
+    idx = src.rfind('\n        esac')
+    if idx != -1:
+        patched = src[:idx] + plugin_block + src[idx:]
+
+with open(path, 'w') as f:
+    f.write(patched)
+
+print("plugin CLI injection done")
+PYEOF
+
+    if grep -q "${MARKER}" "${EASYINSTALL_BIN}" 2>/dev/null; then
+        chmod 755 "${EASYINSTALL_BIN}"
+        log "SUCCESS" "Plugin CLI commands injected into ${EASYINSTALL_BIN}"
+    else
+        log "WARNING" "Plugin CLI injection may not have worked — verify manually"
+    fi
+    return 0
+}
+
+# ── Update bash completion to include plugin commands ─────────────────────────
+update_bash_completion_for_plugins() {
+    local comp_file="${COMPLETION_DIR}/easyinstall-enterprise"
+    [ -f "${comp_file}" ] || return 0
+
+    if grep -q "plugin" "${comp_file}" 2>/dev/null; then
+        log "INFO" "Plugin commands already in bash completion"
+        return 0
+    fi
+
+    # Append plugin commands to the existing all_cmds line
+    sed -i 's/enterprise-status"/enterprise-status plugin plugins plugin-list plugin-enable plugin-disable plugin-status plugin-doctor webui"/' \
+        "${comp_file}" 2>/dev/null || true
+
+    log "SUCCESS" "Bash completion updated with plugin commands"
+}
+
+# ── Verify plugin system is working ───────────────────────────────────────────
+verify_plugin_system() {
+    log "STEP" "Verifying plugin system..."
+    local count
+    count=$(python3 - 2>/dev/null <<'PYEOF'
+import sys
+sys.path.insert(0, '/usr/local/lib')
+try:
+    from easyinstall_plugin_manager import PluginManager
+    pm = PluginManager()
+    plugins = pm.list_plugins()
+    print(len(plugins))
+except Exception as e:
+    print(0)
+PYEOF
+)
+    if [ "${count:-0}" -gt 0 ]; then
+        log "SUCCESS" "Plugin system OK — ${count} plugin(s) discovered"
+    else
+        log "WARNING" "Plugin manager loaded but no plugins discovered yet"
+        log "INFO"    "Check: ls ${PLUGIN_LIB_DIR}/"
+    fi
+    return 0
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1422,6 +1761,22 @@ main() {
         inject_pages_cli
 
         start_enterprise_services_now
+
+        # ── Phase 5: Plugin System ────────────────────────────────────────────
+        echo ""
+        echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}  Phase 5: Plugin System Installation${NC}"
+        echo -e "${CYAN}  Source: github.com/sugan0927/easyinstallvps/plugins${NC}"
+        echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+        echo ""
+        download_plugin_system
+        install_plugin_python_deps
+        configure_plugin_python_path
+        write_plugin_systemd_units
+        inject_plugin_cli
+        update_bash_completion_for_plugins
+        verify_plugin_system
+
         print_summary
     else
         echo ""
