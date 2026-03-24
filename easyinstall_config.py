@@ -1375,8 +1375,279 @@ def stage_create_info_file(cfg):
 # STAGE: create_commands  (/usr/local/bin/easyinstall)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: Write standalone Redis port-management helper script
+# Called by stage_create_commands so it exists before any 'create' is run.
+# Using a real file avoids ALL bash heredoc / f-string quoting problems.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_redis_helper_script():
+    """Write /usr/local/lib/easyinstall-redis-helper.py — a standalone script
+    that handles port allocation, conflict fixing, and port-file rebuilding.
+    Called with:
+      python3 /usr/local/lib/easyinstall-redis-helper.py alloc
+      python3 /usr/local/lib/easyinstall-redis-helper.py fix
+      python3 /usr/local/lib/easyinstall-redis-helper.py rebuild
+    """
+    helper = textwrap.dedent(r'''
+        #!/usr/bin/env python3
+        """
+        easyinstall-redis-helper.py
+        Standalone Redis port manager for EasyInstall.
+        Commands:
+          alloc    - allocate next free port and print it (also appends to ports file)
+          fix      - fix all duplicate/conflict ports across existing sites
+          rebuild  - rebuild used_redis_ports.txt from actual conf files
+        """
+        import os, sys, re, glob, socket, subprocess
+        from pathlib import Path
+
+        PORTS_FILE = Path("/var/lib/easyinstall/used_redis_ports.txt")
+        LOCK_FILE  = Path("/var/lib/easyinstall/used_redis_ports.txt.lock")
+        REDIS_CONF_GLOB = "/etc/redis/redis-*.conf"
+
+        GREEN  = "\033[0;32m"
+        YELLOW = "\033[1;33m"
+        RED    = "\033[0;31m"
+        CYAN   = "\033[0;36m"
+        BOLD   = "\033[1m"
+        NC     = "\033[0m"
+
+        # ── Utilities ────────────────────────────────────────────────────────
+
+        def port_in_conf_files(p):
+            """Return True if port p already appears in any Redis conf file."""
+            for f in glob.glob(REDIS_CONF_GLOB):
+                try:
+                    for line in open(f, errors="ignore"):
+                        m = re.match(r"^\s*port\s+(\d+)", line)
+                        if m and int(m.group(1)) == p:
+                            return True
+                except Exception:
+                    pass
+            return False
+
+        def port_listening(p):
+            """Return True if something is already bound to 127.0.0.1:p."""
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.15)
+                result = s.connect_ex(("127.0.0.1", p))
+                s.close()
+                return result == 0
+            except Exception:
+                return False
+
+        def read_used_ports():
+            """Read used_redis_ports.txt and return a set of ints."""
+            used = {6379}  # main Redis is always taken
+            if PORTS_FILE.exists():
+                for tok in PORTS_FILE.read_text().split():
+                    if tok.strip().isdigit():
+                        used.add(int(tok.strip()))
+            return used
+
+        def all_conf_ports():
+            """Return dict {conf_path: port} for every per-site Redis conf."""
+            result = {}
+            for f in sorted(glob.glob(REDIS_CONF_GLOB)):
+                for line in open(f, errors="ignore"):
+                    m = re.match(r"^\s*port\s+(\d+)", line)
+                    if m:
+                        result[f] = int(m.group(1))
+                        break
+            return result
+
+        def next_free_port(taken_set):
+            """Return next free port >= 6380 not in taken_set and not listening."""
+            p = 6380
+            while p <= 6500:
+                if p not in taken_set and not port_in_conf_files(p) and not port_listening(p):
+                    return p
+                p += 1
+            return 6380  # safety fallback
+
+        def rebuild_ports_file(used_set):
+            """Write sorted used_set to PORTS_FILE."""
+            PORTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PORTS_FILE.write_text("\n".join(str(p) for p in sorted(used_set)) + "\n")
+
+        # ── Command: alloc ───────────────────────────────────────────────────
+
+        def cmd_alloc():
+            """Atomically allocate next free Redis port.  Print it to stdout."""
+            import fcntl
+            PORTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            lf = open(LOCK_FILE, "w")
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX)  # blocking lock – safe for sequential installs
+            except Exception:
+                pass
+
+            used = read_used_ports()
+            # Also include ports from conf files (handles installs without ports file)
+            for p in all_conf_ports().values():
+                used.add(p)
+
+            port = next_free_port(used)
+
+            # Append immediately while lock is held
+            with open(PORTS_FILE, "a") as pf:
+                pf.write(str(port) + "\n")
+
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lf.close()
+
+            print(port)  # consumed by bash $() subshell
+
+        # ── Command: fix ─────────────────────────────────────────────────────
+
+        def cmd_fix():
+            """Detect and fix duplicate Redis ports across all sites."""
+            confs = all_conf_ports()
+
+            taken  = {6379}
+            seen   = {}        # port -> first conf that claimed it
+            conflicts = []
+
+            for f, p in confs.items():
+                if p in seen or p == 6379:
+                    conflicts.append(f)
+                else:
+                    seen[p] = f
+                    taken.add(p)
+
+            if not conflicts:
+                print(GREEN + "✅ No port conflicts found — all sites have unique ports." + NC)
+                rebuild_ports_file(taken | set(confs.values()))
+                sys.exit(0)
+
+            print(YELLOW + "Found " + str(len(conflicts)) + " conflict(s) — reassigning..." + NC)
+
+            for f in conflicts:
+                domain_slug = Path(f).stem.replace("redis-", "", 1)
+                # Reconstruct domain: slug uses - for both . and -
+                # wp-config.php is under /var/www/html/<domain>
+                # We try slug as-is first, then replace - with .
+                old_port = confs[f]
+                new_port = next_free_port(taken)
+                taken.add(new_port)
+
+                print("  " + YELLOW + "•" + NC + " " + domain_slug +
+                      ": port " + str(old_port) + " -> " + str(new_port))
+
+                # 1. Stop the service
+                subprocess.run(
+                    ["systemctl", "stop", "redis-" + domain_slug],
+                    capture_output=True
+                )
+
+                # 2. Rewrite redis conf
+                content = open(f).read()
+                content = re.sub(
+                    r"^(\s*port\s+)\d+",
+                    lambda m: m.group(1) + str(new_port),
+                    content,
+                    flags=re.MULTILINE
+                )
+                open(f, "w").write(content)
+
+                # 3. Rewrite systemd service ExecStop
+                svc = Path("/etc/systemd/system/redis-" + domain_slug + ".service")
+                if svc.exists():
+                    sc = svc.read_text()
+                    sc = re.sub(r"-p\s+\d+", "-p " + str(new_port), sc)
+                    svc.write_text(sc)
+
+                # 4. Rewrite wp-config.php — try both slug and dotted domain
+                wp_cfg = None
+                candidates = [
+                    Path("/var/www/html/" + domain_slug + "/wp-config.php"),
+                ]
+                # Also try replacing hyphens with dots progressively
+                dotted = domain_slug.replace("-", ".")
+                candidates.append(Path("/var/www/html/" + dotted + "/wp-config.php"))
+                # Scan /var/www/html for any dir whose name converts to this slug
+                for site_dir in Path("/var/www/html").iterdir():
+                    if site_dir.is_dir():
+                        if site_dir.name.replace(".", "-") == domain_slug:
+                            candidates.append(site_dir / "wp-config.php")
+
+                for candidate in candidates:
+                    if candidate.exists():
+                        wp_cfg = candidate
+                        break
+
+                if wp_cfg:
+                    wc = wp_cfg.read_text()
+                    wc = re.sub(
+                        r"define\s*\(\s*'WP_REDIS_PORT'\s*,\s*\d+\s*\)",
+                        "define('WP_REDIS_PORT', " + str(new_port) + ")",
+                        wc
+                    )
+                    wc = re.sub(
+                        r"tcp://127\.0\.0\.1:\d+\?database=1",
+                        "tcp://127.0.0.1:" + str(new_port) + "?database=1",
+                        wc
+                    )
+                    wp_cfg.write_text(wc)
+                    print("    " + GREEN + "✓" + NC + " wp-config.php updated (" + str(wp_cfg) + ")")
+                else:
+                    print("    " + YELLOW + "⚠ wp-config.php not found for " + domain_slug + NC)
+
+                # 5. Restart service
+                subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+                subprocess.run(
+                    ["systemctl", "enable", "redis-" + domain_slug],
+                    capture_output=True
+                )
+                r = subprocess.run(
+                    ["systemctl", "start", "redis-" + domain_slug],
+                    capture_output=True
+                )
+                ok = r.returncode == 0
+                status_str = (GREEN + "started" + NC) if ok else (RED + "failed" + NC)
+                print("    " + GREEN + "✓" + NC + " Redis service " + status_str +
+                      " on :" + str(new_port))
+
+            rebuild_ports_file(taken)
+            print("\n" + GREEN + "✅ Port registry rebuilt: " + str(PORTS_FILE) + NC)
+            print(GREEN + "✅ Run: easyinstall redis-status  to verify" + NC)
+
+        # ── Command: rebuild ─────────────────────────────────────────────────
+
+        def cmd_rebuild():
+            """Rebuild used_redis_ports.txt from actual conf files (no changes to confs)."""
+            ports = {6379}
+            for p in all_conf_ports().values():
+                ports.add(p)
+            rebuild_ports_file(ports)
+            print(GREEN + "✅ Rebuilt " + str(PORTS_FILE) +
+                  " from conf files (" + str(len(ports)) + " ports)" + NC)
+
+        # ── Entry point ──────────────────────────────────────────────────────
+
+        cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
+        if   cmd == "alloc":   cmd_alloc()
+        elif cmd == "fix":     cmd_fix()
+        elif cmd == "rebuild": cmd_rebuild()
+        else:
+            print("Usage: easyinstall-redis-helper.py <alloc|fix|rebuild>")
+            sys.exit(1)
+    ''')
+    write_file("/usr/local/lib/easyinstall-redis-helper.py", helper, mode=0o755)
+    log("SUCCESS", "Redis helper script written: /usr/local/lib/easyinstall-redis-helper.py")
+
+
 def stage_create_commands(cfg):
     log("STEP", "Creating easyinstall command dispatcher")
+
+    # ── Write standalone Redis helper script (avoids all heredoc quoting issues) ──
+    _write_redis_helper_script()
+
     # The dispatcher is written as a Bash script but config sub-commands
     # delegate to Python (easyinstall_config.py --stage wordpress_install)
     script = textwrap.dedent("""\
@@ -1469,66 +1740,8 @@ def stage_create_commands(cfg):
             DOMAIN=$2; shift 2; parse_args "$@"
             log_command "create $DOMAIN php=$PHP_VERSION ssl=$USE_SSL"
             echo -e "${YELLOW}📦 Installing WordPress for $DOMAIN...${NC}"
-            REDIS_PORT=$(python3 -c "
-import os, glob, re, socket, fcntl
-
-def _port_in_use_by_conf(p):
-    for f in glob.glob('/etc/redis/redis-*.conf'):
-        try:
-            for line in open(f, errors='ignore'):
-                m = re.match(r'^\s*port\s+(\d+)', line)
-                if m and int(m.group(1)) == p:
-                    return True
-        except Exception:
-            pass
-    return False
-
-def _port_listening(p):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.15)
-        result = s.connect_ex(('127.0.0.1', p))
-        s.close()
-        return result == 0
-    except Exception:
-        return False
-
-PORTS_FILE = '/var/lib/easyinstall/used_redis_ports.txt'
-lock_file  = PORTS_FILE + '.lock'
-os.makedirs(os.path.dirname(PORTS_FILE), exist_ok=True)
-
-# Atomic lock to prevent race condition on concurrent installs
-lf = open(lock_file, 'w')
-try:
-    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except Exception:
-    pass
-
-used = set([6379])
-if os.path.exists(PORTS_FILE):
-    for tok in open(PORTS_FILE).read().split():
-        if tok.strip().isdigit():
-            used.add(int(tok.strip()))
-
-p = 6380
-while p <= 6500:
-    if p not in used and not _port_in_use_by_conf(p) and not _port_listening(p):
-        break
-    p += 1
-if p > 6500:
-    p = 6380  # safety fallback
-
-# Write immediately so parallel runs see this port as taken
-with open(PORTS_FILE, 'a') as pf:
-    pf.write(str(p) + '\n')
-
-try:
-    fcntl.flock(lf, fcntl.LOCK_UN)
-except Exception:
-    pass
-lf.close()
-print(p)
-" 2>/dev/null || echo "6380")
+            # Use standalone helper — no quoting/heredoc issues, works on Python 3.12+
+            REDIS_PORT=$(python3 /usr/local/lib/easyinstall-redis-helper.py alloc 2>/dev/null || echo "6380")
             ssl_flag=""
             [ "$USE_SSL" = "true" ] && ssl_flag="--use-ssl"
             py_config wordpress_install \
@@ -1536,9 +1749,8 @@ print(p)
                 --php-version "$PHP_VERSION" \
                 --redis-port "$REDIS_PORT" \
                 $ssl_flag
-            # Deduplicate port file (allocator already appended)
-            sort -un /var/lib/easyinstall/used_redis_ports.txt \
-                -o /var/lib/easyinstall/used_redis_ports.txt 2>/dev/null || true
+            # Deduplicate port file
+            python3 /usr/local/lib/easyinstall-redis-helper.py rebuild 2>/dev/null || true
             ;;
 
         list)
@@ -1572,11 +1784,10 @@ print(p)
             rm -f "/etc/redis/redis-${DOMAIN//./-}.conf" "/etc/systemd/system/redis-${DOMAIN//./-}.service"
             systemctl daemon-reload
             nginx -t 2>/dev/null && systemctl reload nginx
-            # Release the port from the used-ports registry
-            if [ -n "$DELETED_PORT" ] && [ -f "/var/lib/easyinstall/used_redis_ports.txt" ]; then
+            # Rebuild ports file from remaining conf files (cleanest approach)
+            python3 /usr/local/lib/easyinstall-redis-helper.py rebuild 2>/dev/null || \
                 sed -i "/^${DELETED_PORT}$/d" /var/lib/easyinstall/used_redis_ports.txt 2>/dev/null || true
-                echo -e "${GREEN}  Port ${DELETED_PORT} released${NC}"
-            fi
+            [ -n "$DELETED_PORT" ] && echo -e "${GREEN}  Port ${DELETED_PORT} released${NC}"
             echo -e "${GREEN}✅ $DOMAIN deleted${NC}" ;;
 
         status)
@@ -1604,124 +1815,10 @@ print(p)
             systemctl restart "redis-${2//./-}" && echo -e "${GREEN}✅ Redis restarted for $2${NC}" ;;
 
         redis-fix-ports)
-            # ── Fix duplicate/wrong Redis ports for all existing sites ────────
-            # Assigns a fresh unique port to every site whose Redis conf shares
-            # a port with another site or with the main instance (6379).
+            # Fix duplicate/conflict Redis ports — delegates to standalone helper
             log_command "redis-fix-ports"
             echo -e "${CYAN}🔧 Scanning for Redis port conflicts...${NC}"
-            python3 - <<'PYEOF'
-import os, sys, re, glob, socket, subprocess
-from pathlib import Path
-
-PORTS_FILE = '/var/lib/easyinstall/used_redis_ports.txt'
-GREEN = '\033[0;32m'; YELLOW = '\033[1;33m'; RED = '\033[0;31m'; NC = '\033[0m'
-
-def port_listening(p):
-    try:
-        s = socket.socket(); s.settimeout(0.15)
-        r = s.connect_ex(('127.0.0.1', p)); s.close()
-        return r == 0
-    except Exception:
-        return False
-
-def next_free_port(taken):
-    p = 6380
-    while p in taken or port_listening(p):
-        p += 1
-        if p > 6500:
-            break
-    return p
-
-# Build map: conf_file -> current_port
-confs = {}
-for f in sorted(glob.glob('/etc/redis/redis-*.conf')):
-    port = None
-    for line in open(f, errors='ignore'):
-        m = re.match(r'^\s*port\s+(\d+)', line)
-        if m:
-            port = int(m.group(1)); break
-    if port:
-        confs[f] = port
-
-# Detect duplicates (include main Redis 6379 as taken)
-taken_globally = {6379}
-seen           = {}   # port -> first conf that claimed it
-conflicts      = []   # confs that need reassignment
-
-for f, p in confs.items():
-    if p in seen or p == 6379:
-        conflicts.append(f)
-    else:
-        seen[p] = f
-        taken_globally.add(p)
-
-if not conflicts:
-    print(f"{GREEN}✅ No port conflicts found — all sites have unique ports.{NC}")
-    # Rebuild ports file cleanly
-    all_ports = sorted(taken_globally | set(confs.values()))
-    Path(PORTS_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(PORTS_FILE).write_text('\n'.join(str(p) for p in all_ports) + '\n')
-    sys.exit(0)
-
-print(f"{YELLOW}Found {len(conflicts)} conflict(s) — reassigning...{NC}")
-
-for f in conflicts:
-    domain_slug = Path(f).stem.replace('redis-', '', 1)
-    domain      = domain_slug.replace('-', '.')
-    old_port    = confs[f]
-    new_port    = next_free_port(taken_globally)
-    taken_globally.add(new_port)
-
-    print(f"  {YELLOW}•{NC} {domain_slug}: port {old_port} → {new_port}")
-
-    # 1. Stop the service
-    subprocess.run(['systemctl', 'stop', f'redis-{domain_slug}'],
-                   capture_output=True)
-
-    # 2. Rewrite redis conf
-    content = open(f).read()
-    content = re.sub(r'^(\s*port\s+)\d+', lambda m: m.group(1) + str(new_port),
-                     content, flags=re.MULTILINE)
-    open(f, 'w').write(content)
-
-    # 3. Rewrite systemd service ExecStop port
-    svc = f'/etc/systemd/system/redis-{domain_slug}.service'
-    if Path(svc).exists():
-        sc = Path(svc).read_text()
-        sc = re.sub(r'-p\s+\d+', f'-p {new_port}', sc)
-        Path(svc).write_text(sc)
-
-    # 4. Rewrite wp-config.php
-    wp_cfg = Path(f'/var/www/html/{domain}/wp-config.php')
-    if not wp_cfg.exists():
-        # try dotted form
-        wp_cfg = Path(f'/var/www/html/{domain_slug}/wp-config.php')
-    if wp_cfg.exists():
-        wc = wp_cfg.read_text()
-        wc = re.sub(r"define\s*\(\s*'WP_REDIS_PORT'\s*,\s*\d+\s*\)",
-                    f"define('WP_REDIS_PORT', {new_port})", wc)
-        # Also fix session save_path
-        wc = re.sub(r'tcp://127\.0\.0\.1:\d+\?database=1',
-                    f'tcp://127.0.0.1:{new_port}?database=1', wc)
-        wp_cfg.write_text(wc)
-        print(f"    {GREEN}✓{NC} wp-config.php updated")
-
-    # 5. Restart with new port
-    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
-    subprocess.run(['systemctl', 'enable', f'redis-{domain_slug}'],
-                   capture_output=True)
-    r = subprocess.run(['systemctl', 'start', f'redis-{domain_slug}'],
-                       capture_output=True)
-    status = f"{GREEN}started{NC}" if r.returncode == 0 else f"{RED}failed to start{NC}"
-    print(f"    {GREEN}✓{NC} Redis service {status} on :{new_port}")
-
-# Rebuild ports file
-all_ports = sorted(taken_globally)
-Path(PORTS_FILE).parent.mkdir(parents=True, exist_ok=True)
-Path(PORTS_FILE).write_text('\n'.join(str(p) for p in all_ports) + '\n')
-print(f"\n{GREEN}✅ Port registry rebuilt: {PORTS_FILE}{NC}")
-print(f"{GREEN}✅ Run: easyinstall redis-status  to verify{NC}")
-PYEOF
+            python3 /usr/local/lib/easyinstall-redis-helper.py fix
             ;;
 
         redis-cli)
@@ -1874,71 +1971,16 @@ PYEOF
             echo -e "${CYAN}🔁 Cloning $SRC_DOMAIN → $DST_DOMAIN...${NC}"
             [ -d "/var/www/html/$SRC_DOMAIN" ] || { echo -e "${RED}❌ Source not found: $SRC_DOMAIN${NC}"; exit 1; }
             [ -d "/var/www/html/$DST_DOMAIN" ] && { echo -e "${RED}❌ Destination already exists: $DST_DOMAIN${NC}"; exit 1; }
-            DST_REDIS_PORT=$(python3 -c "
-import os, glob, re, socket, fcntl
-
-def _port_in_use_by_conf(p):
-    for f in glob.glob('/etc/redis/redis-*.conf'):
-        try:
-            for line in open(f, errors='ignore'):
-                m = re.match(r'^\s*port\s+(\d+)', line)
-                if m and int(m.group(1)) == p:
-                    return True
-        except Exception:
-            pass
-    return False
-
-def _port_listening(p):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.15)
-        result = s.connect_ex(('127.0.0.1', p))
-        s.close()
-        return result == 0
-    except Exception:
-        return False
-
-PORTS_FILE = '/var/lib/easyinstall/used_redis_ports.txt'
-lock_file  = PORTS_FILE + '.lock'
-os.makedirs(os.path.dirname(PORTS_FILE), exist_ok=True)
-
-lf = open(lock_file, 'w')
-try:
-    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except Exception:
-    pass
-
-used = set([6379])
-if os.path.exists(PORTS_FILE):
-    for tok in open(PORTS_FILE).read().split():
-        if tok.strip().isdigit():
-            used.add(int(tok.strip()))
-
-p = 6380
-while p <= 6500:
-    if p not in used and not _port_in_use_by_conf(p) and not _port_listening(p):
-        break
-    p += 1
-if p > 6500:
-    p = 6381
-
-with open(PORTS_FILE, 'a') as pf:
-    pf.write(str(p) + '\n')
-
-try:
-    fcntl.flock(lf, fcntl.LOCK_UN)
-except Exception:
-    pass
-lf.close()
-print(p)
-" 2>/dev/null || echo "6381")
+            DST_REDIS_PORT=$(python3 /usr/local/lib/easyinstall-redis-helper.py alloc 2>/dev/null || echo "6381")
             py_config clone_site --domain "$DST_DOMAIN" --clone-from "$SRC_DOMAIN" --redis-port "$DST_REDIS_PORT"
-            # Start the new Redis instance (Bash layer)
+            # Start the new Redis instance
             systemctl daemon-reload 2>/dev/null || true
             systemctl enable "redis-${DST_DOMAIN//./-}" 2>/dev/null || true
             systemctl start  "redis-${DST_DOMAIN//./-}" 2>/dev/null || true
-            echo "$DST_REDIS_PORT" >> /var/lib/easyinstall/used_redis_ports.txt
-            sort -u /var/lib/easyinstall/used_redis_ports.txt -o /var/lib/easyinstall/used_redis_ports.txt
+            python3 /usr/local/lib/easyinstall-redis-helper.py rebuild 2>/dev/null || true
+            echo -e "${GREEN}✅ Clone complete: $SRC_DOMAIN → $DST_DOMAIN${NC}"
+            echo -e "${YELLOW}  Next: easyinstall ssl $DST_DOMAIN  (if needed)${NC}"
+            echo -e "${YELLOW}  Creds: /root/${DST_DOMAIN}-credentials.txt${NC}" ;;
             echo -e "${GREEN}✅ Clone complete: $SRC_DOMAIN → $DST_DOMAIN${NC}"
             echo -e "${YELLOW}  Next: easyinstall ssl $DST_DOMAIN  (if needed)${NC}"
             echo -e "${YELLOW}  Creds: /root/${DST_DOMAIN}-credentials.txt${NC}" ;;
