@@ -1981,6 +1981,9 @@ def stage_create_commands(cfg):
             echo -e "${GREEN}✅ Clone complete: $SRC_DOMAIN → $DST_DOMAIN${NC}"
             echo -e "${YELLOW}  Next: easyinstall ssl $DST_DOMAIN  (if needed)${NC}"
             echo -e "${YELLOW}  Creds: /root/${DST_DOMAIN}-credentials.txt${NC}" ;;
+            echo -e "${GREEN}✅ Clone complete: $SRC_DOMAIN → $DST_DOMAIN${NC}"
+            echo -e "${YELLOW}  Next: easyinstall ssl $DST_DOMAIN  (if needed)${NC}"
+            echo -e "${YELLOW}  Creds: /root/${DST_DOMAIN}-credentials.txt${NC}" ;;
         remote-install)
             [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall remote-install domain.com [--php=8.3] [--ssl]${NC}"; exit 1; }
             DOMAIN=$2; shift 2; parse_args "$@"
