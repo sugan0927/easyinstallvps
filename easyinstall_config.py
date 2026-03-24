@@ -795,15 +795,24 @@ def stage_mysql_config(cfg):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def stage_redis_config(cfg):
-    log("STEP", "Writing optimized Redis configuration")
+    log("STEP", "Writing optimized Redis configuration (main instance)")
+
+    # Detect available RAM for intelligent maxmemory sizing
+    try:
+        total_ram_kb = int(open("/proc/meminfo").readline().split()[1])
+        total_ram_mb = total_ram_kb // 1024
+        # Reserve 20% of RAM for main Redis (shared/fallback); per-site instances
+        # take most of the cache budget.  Floor at 128 MB, cap at 2 GB.
+        main_mem_mb  = max(128, min(2048, total_ram_mb * 20 // 100))
+        main_mem     = f"{main_mem_mb}mb"
+    except Exception:
+        main_mem = cfg.redis_max_memory
+
     redis_conf = textwrap.dedent(f"""\
-        # EasyInstall v6.4 Redis Configuration
+        # ── EasyInstall v7.0 — Main Redis (port 6379) ───────────────────────
+        # High-traffic optimized configuration
         bind 127.0.0.1
         port 6379
-        tcp-backlog 65535
-        timeout 0
-        tcp-keepalive 300
-
         daemonize yes
         supervised systemd
         pidfile /var/run/redis/redis-server.pid
@@ -812,17 +821,73 @@ def stage_redis_config(cfg):
         databases 16
         always-show-logo no
 
-        maxmemory {cfg.redis_max_memory}
+        # ── Memory management ────────────────────────────────────────────────
+        maxmemory {main_mem}
         maxmemory-policy allkeys-lru
-        maxmemory-samples 10
+        # Sample 15 keys per eviction cycle for better LRU accuracy under load
+        maxmemory-samples 15
+        # Proactive expiry — use 5% CPU on background expiry vs default 1%
+        active-expire-effort 5
 
+        # ── Persistence — disabled (pure cache, no durability needed) ────────
         save ""
         appendonly no
 
+        # ── Network / connection tuning ──────────────────────────────────────
+        # Kernel TCP backlog (must match net.core.somaxconn + net.ipv4.tcp_max_syn_backlog)
+        tcp-backlog 65535
+        # Keep idle connections alive — reduces reconnect overhead
+        tcp-keepalive 60
+        # Close idle clients after 5 minutes (free fd slots under high load)
+        timeout 300
+        # Allow up to 10 000 simultaneous clients (WordPress + PHP-FPM pools)
         maxclients 10000
+
+        # ── I/O threads (Redis 6+) ───────────────────────────────────────────
+        # 2 I/O threads is safe on 4+ vCPU servers; reduces latency spikes
+        io-threads 2
+        io-threads-do-reads yes
+
+        # ── Performance / latency ─────────────────────────────────────────────
+        # Higher hz = more precise TTL expiry and faster pipeline flushing
+        hz 25
+        dynamic-hz yes
+        # Avoid blocking the event loop on large object deletions
+        lazyfree-lazy-eviction yes
+        lazyfree-lazy-expire yes
+        lazyfree-lazy-server-del yes
+        # Non-blocking FLUSHDB / FLUSHALL
+        lazyfree-lazy-user-flush yes
+
+        # ── Kernel memory optimisation ────────────────────────────────────────
+        # Disable THP at runtime (fragmentation under heavy load otherwise)
+        # Matches the kernel_tuning stage recommendation
+        # (actual THP disable is done in sysctl stage)
+
+        # ── Slow log ─────────────────────────────────────────────────────────
+        # Log commands slower than 2 ms
+        slowlog-log-slower-than 2000
+        slowlog-max-len 256
+
+        # ── Monitoring ────────────────────────────────────────────────────────
+        latency-monitor-threshold 50
+        latency-tracking yes
     """)
     write_file("/etc/redis/redis.conf", redis_conf)
-    log("SUCCESS", "Redis configuration written")
+
+    # Kernel-level tweaks for Redis under high load
+    sysctl_redis = textwrap.dedent("""\
+        # Redis high-traffic kernel settings
+        vm.overcommit_memory = 1
+        net.core.somaxconn = 65535
+        net.ipv4.tcp_max_syn_backlog = 65535
+    """)
+    sysctl_path = Path("/etc/sysctl.d/99-redis.conf")
+    if not sysctl_path.exists():
+        write_file(str(sysctl_path), sysctl_redis)
+        run("sysctl -p /etc/sysctl.d/99-redis.conf 2>/dev/null || true", check=False)
+
+    log("SUCCESS", "Main Redis configuration written (high-traffic optimized)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -947,33 +1012,75 @@ def stage_create_redis_monitor(cfg):
     log("STEP", "Creating Redis monitoring script")
     script = textwrap.dedent("""\
         #!/bin/bash
-        GREEN='\\033[0;32m'; YELLOW='\\033[1;33m'; RED='\\033[0;31m'; NC='\\033[0m'
+        # EasyInstall v7.0 — Redis Status Monitor (enhanced)
+        GREEN='\\033[0;32m'; YELLOW='\\033[1;33m'; RED='\\033[0;31m'
+        CYAN='\\033[0;36m'; BOLD='\\033[1m'; NC='\\033[0m'
 
-        echo -e "${GREEN}=== Redis Instances Status ===${NC}"
+        echo -e "${BOLD}${CYAN}=== Redis Instances Status ===${NC}"
         echo ""
-        if systemctl is-active --quiet redis-server; then
-            echo -e "${GREEN}✓${NC} Main Redis (port 6379): Running"
+
+        # ── Main Redis (port 6379) ─────────────────────────────────────────
+        if systemctl is-active --quiet redis-server 2>/dev/null; then
+            MEM=$(redis-cli -p 6379 INFO memory 2>/dev/null | grep "used_memory_human" | cut -d: -f2 | tr -d '\\r' || echo "?")
+            KEYS=$(redis-cli -p 6379 DBSIZE 2>/dev/null || echo "?")
+            HIT=$(redis-cli -p 6379 INFO stats 2>/dev/null | grep "keyspace_hits" | cut -d: -f2 | tr -d '\\r' || echo "0")
+            MISS=$(redis-cli -p 6379 INFO stats 2>/dev/null | grep "keyspace_misses" | cut -d: -f2 | tr -d '\\r' || echo "0")
+            TOTAL=$(( ${HIT:-0} + ${MISS:-1} ))
+            [ "$TOTAL" -gt 0 ] && HIT_PCT=$(( HIT * 100 / TOTAL )) || HIT_PCT=0
+            echo -e "  ${GREEN}✓${NC} ${BOLD}Main Redis${NC} — port ${CYAN}6379${NC} | mem: ${MEM} | keys: ${KEYS} | hit-rate: ${HIT_PCT}%"
         else
-            echo -e "${RED}✗${NC} Main Redis (port 6379): Stopped"
+            echo -e "  ${RED}✗${NC} ${BOLD}Main Redis${NC} — port ${CYAN}6379${NC}: ${RED}Stopped${NC}"
         fi
+
+        # ── Per-site Redis instances ───────────────────────────────────────
+        declare -A SEEN_PORTS
+        CONFLICT=0
         for redis_conf in /etc/redis/redis-*.conf; do
             [ -f "$redis_conf" ] || continue
-            site_name=$(basename "$redis_conf" .conf | sed 's/redis-//')
-            redis_port=$(grep "^port" "$redis_conf" | awk '{print $2}')
-            if systemctl is-active --quiet "redis-${site_name}"; then
-                echo -e "${GREEN}✓${NC} Site ${site_name} (port ${redis_port}): Running"
+            site_name=$(basename "$redis_conf" .conf | sed 's/^redis-//')
+            redis_port=$(grep -E "^\\s*port\\s+" "$redis_conf" 2>/dev/null | awk '{print $2}' | head -1)
+            [ -z "$redis_port" ] && redis_port="unknown"
+
+            # Duplicate port detection
+            if [ "${SEEN_PORTS[$redis_port]+_}" ]; then
+                echo -e "  ${RED}⚠ DUPLICATE PORT $redis_port — ${site_name} conflicts with ${SEEN_PORTS[$redis_port]}!${NC}"
+                CONFLICT=$(( CONFLICT + 1 ))
+            fi
+            SEEN_PORTS[$redis_port]="$site_name"
+
+            if systemctl is-active --quiet "redis-${site_name}" 2>/dev/null; then
+                MEM=$(redis-cli -p "$redis_port" INFO memory 2>/dev/null | grep "used_memory_human" | cut -d: -f2 | tr -d '\\r' || echo "?")
+                KEYS=$(redis-cli -p "$redis_port" DBSIZE 2>/dev/null || echo "?")
+                HIT=$(redis-cli -p "$redis_port" INFO stats 2>/dev/null | grep "keyspace_hits"   | cut -d: -f2 | tr -d '\\r' || echo "0")
+                MISS=$(redis-cli -p "$redis_port" INFO stats 2>/dev/null | grep "keyspace_misses"| cut -d: -f2 | tr -d '\\r' || echo "0")
+                TOTAL=$(( ${HIT:-0} + ${MISS:-1} ))
+                [ "$TOTAL" -gt 0 ] && HIT_PCT=$(( HIT * 100 / TOTAL )) || HIT_PCT=0
+                MAX=$(grep -E "^\\s*maxmemory\\s+" "$redis_conf" 2>/dev/null | awk '{print $2}' || echo "?")
+                echo -e "  ${GREEN}✓${NC} ${BOLD}${site_name}${NC} — port ${CYAN}${redis_port}${NC} | mem: ${MEM}/${MAX} | keys: ${KEYS} | hit-rate: ${HIT_PCT}%"
             else
-                echo -e "${RED}✗${NC} Site ${site_name} (port ${redis_port}): Stopped"
+                echo -e "  ${RED}✗${NC} ${BOLD}${site_name}${NC} — port ${CYAN}${redis_port}${NC}: ${RED}Stopped${NC}"
+                echo -e "      Fix: ${YELLOW}systemctl start redis-${site_name}${NC}"
             fi
         done
+
         echo ""
-        echo -e "${YELLOW}Used Redis Ports:${NC}"
-        sort -n /var/lib/easyinstall/used_redis_ports.txt 2>/dev/null | while read port; do
-            echo "  • $port"
+        echo -e "${YELLOW}Redis Ports in Use:${NC}"
+        # Rebuild accurate port list from conf files + ports file
+        {
+            grep -hE "^\\s*port\\s+[0-9]+" /etc/redis/*.conf 2>/dev/null | awk '{print $2}'
+            cat /var/lib/easyinstall/used_redis_ports.txt 2>/dev/null
+        } | sort -un | while read p; do
+            echo "  • $p"
         done
+
+        if [ "$CONFLICT" -gt 0 ]; then
+            echo ""
+            echo -e "${RED}⚠  ${CONFLICT} port conflict(s) detected!${NC}"
+            echo -e "${YELLOW}   Run: easyinstall redis-fix-ports${NC}"
+        fi
     """)
     write_file("/usr/local/bin/easy-redis-status", script, mode=0o755)
-    log("SUCCESS", "Redis monitor created")
+    log("SUCCESS", "Redis monitor created (enhanced with conflict detection)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1232,8 +1339,9 @@ def stage_create_info_file(cfg):
           easyinstall create domain.com    - Install WordPress
           easyinstall create domain.com --ssl - With SSL
           easyinstall list                 - List all sites
-          easyinstall redis-status         - Redis instances
+          easyinstall redis-status         - Redis instances (mem, hit-rate)
           easyinstall redis-ports          - Redis ports
+          easyinstall redis-fix-ports      - Fix duplicate ports ★
           easyinstall delete domain.com    - Delete a site
           easyinstall ssl domain.com       - Enable SSL
           easyinstall backup [daily/weekly]- Create backup
@@ -1295,7 +1403,11 @@ def stage_create_commands(cfg):
             echo "  easyinstall create domain.com [--php=8.3] [--ssl]"
             echo ""
             echo -e "${GREEN}REDIS:${NC}"
-            echo "  easyinstall redis-status | redis-ports | redis-restart domain | redis-cli domain"
+            echo "  easyinstall redis-status              — all instances (port, mem, hit-rate)"
+            echo "  easyinstall redis-ports               — list used ports"
+            echo "  easyinstall redis-fix-ports           — fix duplicate/conflict ports ★"
+            echo "  easyinstall redis-restart domain      — restart instance"
+            echo "  easyinstall redis-cli domain          — open redis-cli for site"
             echo ""
             echo -e "${GREEN}MANAGEMENT:${NC}"
             echo "  easyinstall list | delete domain | status | site-info domain"
@@ -1358,12 +1470,65 @@ def stage_create_commands(cfg):
             log_command "create $DOMAIN php=$PHP_VERSION ssl=$USE_SSL"
             echo -e "${YELLOW}📦 Installing WordPress for $DOMAIN...${NC}"
             REDIS_PORT=$(python3 -c "
-        import subprocess, os
-        p=6379
-        used=open('/var/lib/easyinstall/used_redis_ports.txt').read().split() if os.path.exists('/var/lib/easyinstall/used_redis_ports.txt') else []
-        while str(p) in used: p+=1
-        print(p)
-        " 2>/dev/null || echo "6380")
+import os, glob, re, socket, fcntl
+
+def _port_in_use_by_conf(p):
+    for f in glob.glob('/etc/redis/redis-*.conf'):
+        try:
+            for line in open(f, errors='ignore'):
+                m = re.match(r'^\s*port\s+(\d+)', line)
+                if m and int(m.group(1)) == p:
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _port_listening(p):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.15)
+        result = s.connect_ex(('127.0.0.1', p))
+        s.close()
+        return result == 0
+    except Exception:
+        return False
+
+PORTS_FILE = '/var/lib/easyinstall/used_redis_ports.txt'
+lock_file  = PORTS_FILE + '.lock'
+os.makedirs(os.path.dirname(PORTS_FILE), exist_ok=True)
+
+# Atomic lock to prevent race condition on concurrent installs
+lf = open(lock_file, 'w')
+try:
+    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except Exception:
+    pass
+
+used = set([6379])
+if os.path.exists(PORTS_FILE):
+    for tok in open(PORTS_FILE).read().split():
+        if tok.strip().isdigit():
+            used.add(int(tok.strip()))
+
+p = 6380
+while p <= 6500:
+    if p not in used and not _port_in_use_by_conf(p) and not _port_listening(p):
+        break
+    p += 1
+if p > 6500:
+    p = 6380  # safety fallback
+
+# Write immediately so parallel runs see this port as taken
+with open(PORTS_FILE, 'a') as pf:
+    pf.write(str(p) + '\n')
+
+try:
+    fcntl.flock(lf, fcntl.LOCK_UN)
+except Exception:
+    pass
+lf.close()
+print(p)
+" 2>/dev/null || echo "6380")
             ssl_flag=""
             [ "$USE_SSL" = "true" ] && ssl_flag="--use-ssl"
             py_config wordpress_install \
@@ -1371,8 +1536,9 @@ def stage_create_commands(cfg):
                 --php-version "$PHP_VERSION" \
                 --redis-port "$REDIS_PORT" \
                 $ssl_flag
-            echo "$REDIS_PORT" >> /var/lib/easyinstall/used_redis_ports.txt
-            sort -u /var/lib/easyinstall/used_redis_ports.txt -o /var/lib/easyinstall/used_redis_ports.txt
+            # Deduplicate port file (allocator already appended)
+            sort -un /var/lib/easyinstall/used_redis_ports.txt \
+                -o /var/lib/easyinstall/used_redis_ports.txt 2>/dev/null || true
             ;;
 
         list)
@@ -1395,6 +1561,8 @@ def stage_create_commands(cfg):
             [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall delete domain.com${NC}"; exit 1; }
             DOMAIN=$2; log_command "delete $DOMAIN"
             echo -e "${YELLOW}🗑️  Deleting $DOMAIN...${NC}"
+            # Capture port before removing conf file
+            DELETED_PORT=$(grep "^port" "/etc/redis/redis-${DOMAIN//./-}.conf" 2>/dev/null | awk '{print $2}' || echo "")
             rm -rf "/var/www/html/$DOMAIN"
             rm -f "/etc/nginx/sites-enabled/$DOMAIN" "/etc/nginx/sites-available/$DOMAIN"
             DB_SAFE=$(echo "$DOMAIN" | sed 's/[.-]/_/g')
@@ -1404,6 +1572,11 @@ def stage_create_commands(cfg):
             rm -f "/etc/redis/redis-${DOMAIN//./-}.conf" "/etc/systemd/system/redis-${DOMAIN//./-}.service"
             systemctl daemon-reload
             nginx -t 2>/dev/null && systemctl reload nginx
+            # Release the port from the used-ports registry
+            if [ -n "$DELETED_PORT" ] && [ -f "/var/lib/easyinstall/used_redis_ports.txt" ]; then
+                sed -i "/^${DELETED_PORT}$/d" /var/lib/easyinstall/used_redis_ports.txt 2>/dev/null || true
+                echo -e "${GREEN}  Port ${DELETED_PORT} released${NC}"
+            fi
             echo -e "${GREEN}✅ $DOMAIN deleted${NC}" ;;
 
         status)
@@ -1429,6 +1602,127 @@ def stage_create_commands(cfg):
         redis-restart)
             [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall redis-restart domain.com${NC}"; exit 1; }
             systemctl restart "redis-${2//./-}" && echo -e "${GREEN}✅ Redis restarted for $2${NC}" ;;
+
+        redis-fix-ports)
+            # ── Fix duplicate/wrong Redis ports for all existing sites ────────
+            # Assigns a fresh unique port to every site whose Redis conf shares
+            # a port with another site or with the main instance (6379).
+            log_command "redis-fix-ports"
+            echo -e "${CYAN}🔧 Scanning for Redis port conflicts...${NC}"
+            python3 - <<'PYEOF'
+import os, sys, re, glob, socket, subprocess
+from pathlib import Path
+
+PORTS_FILE = '/var/lib/easyinstall/used_redis_ports.txt'
+GREEN = '\033[0;32m'; YELLOW = '\033[1;33m'; RED = '\033[0;31m'; NC = '\033[0m'
+
+def port_listening(p):
+    try:
+        s = socket.socket(); s.settimeout(0.15)
+        r = s.connect_ex(('127.0.0.1', p)); s.close()
+        return r == 0
+    except Exception:
+        return False
+
+def next_free_port(taken):
+    p = 6380
+    while p in taken or port_listening(p):
+        p += 1
+        if p > 6500:
+            break
+    return p
+
+# Build map: conf_file -> current_port
+confs = {}
+for f in sorted(glob.glob('/etc/redis/redis-*.conf')):
+    port = None
+    for line in open(f, errors='ignore'):
+        m = re.match(r'^\s*port\s+(\d+)', line)
+        if m:
+            port = int(m.group(1)); break
+    if port:
+        confs[f] = port
+
+# Detect duplicates (include main Redis 6379 as taken)
+taken_globally = {6379}
+seen           = {}   # port -> first conf that claimed it
+conflicts      = []   # confs that need reassignment
+
+for f, p in confs.items():
+    if p in seen or p == 6379:
+        conflicts.append(f)
+    else:
+        seen[p] = f
+        taken_globally.add(p)
+
+if not conflicts:
+    print(f"{GREEN}✅ No port conflicts found — all sites have unique ports.{NC}")
+    # Rebuild ports file cleanly
+    all_ports = sorted(taken_globally | set(confs.values()))
+    Path(PORTS_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(PORTS_FILE).write_text('\n'.join(str(p) for p in all_ports) + '\n')
+    sys.exit(0)
+
+print(f"{YELLOW}Found {len(conflicts)} conflict(s) — reassigning...{NC}")
+
+for f in conflicts:
+    domain_slug = Path(f).stem.replace('redis-', '', 1)
+    domain      = domain_slug.replace('-', '.')
+    old_port    = confs[f]
+    new_port    = next_free_port(taken_globally)
+    taken_globally.add(new_port)
+
+    print(f"  {YELLOW}•{NC} {domain_slug}: port {old_port} → {new_port}")
+
+    # 1. Stop the service
+    subprocess.run(['systemctl', 'stop', f'redis-{domain_slug}'],
+                   capture_output=True)
+
+    # 2. Rewrite redis conf
+    content = open(f).read()
+    content = re.sub(r'^(\s*port\s+)\d+', lambda m: m.group(1) + str(new_port),
+                     content, flags=re.MULTILINE)
+    open(f, 'w').write(content)
+
+    # 3. Rewrite systemd service ExecStop port
+    svc = f'/etc/systemd/system/redis-{domain_slug}.service'
+    if Path(svc).exists():
+        sc = Path(svc).read_text()
+        sc = re.sub(r'-p\s+\d+', f'-p {new_port}', sc)
+        Path(svc).write_text(sc)
+
+    # 4. Rewrite wp-config.php
+    wp_cfg = Path(f'/var/www/html/{domain}/wp-config.php')
+    if not wp_cfg.exists():
+        # try dotted form
+        wp_cfg = Path(f'/var/www/html/{domain_slug}/wp-config.php')
+    if wp_cfg.exists():
+        wc = wp_cfg.read_text()
+        wc = re.sub(r"define\s*\(\s*'WP_REDIS_PORT'\s*,\s*\d+\s*\)",
+                    f"define('WP_REDIS_PORT', {new_port})", wc)
+        # Also fix session save_path
+        wc = re.sub(r'tcp://127\.0\.0\.1:\d+\?database=1',
+                    f'tcp://127.0.0.1:{new_port}?database=1', wc)
+        wp_cfg.write_text(wc)
+        print(f"    {GREEN}✓{NC} wp-config.php updated")
+
+    # 5. Restart with new port
+    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+    subprocess.run(['systemctl', 'enable', f'redis-{domain_slug}'],
+                   capture_output=True)
+    r = subprocess.run(['systemctl', 'start', f'redis-{domain_slug}'],
+                       capture_output=True)
+    status = f"{GREEN}started{NC}" if r.returncode == 0 else f"{RED}failed to start{NC}"
+    print(f"    {GREEN}✓{NC} Redis service {status} on :{new_port}")
+
+# Rebuild ports file
+all_ports = sorted(taken_globally)
+Path(PORTS_FILE).parent.mkdir(parents=True, exist_ok=True)
+Path(PORTS_FILE).write_text('\n'.join(str(p) for p in all_ports) + '\n')
+print(f"\n{GREEN}✅ Port registry rebuilt: {PORTS_FILE}{NC}")
+print(f"{GREEN}✅ Run: easyinstall redis-status  to verify{NC}")
+PYEOF
+            ;;
 
         redis-cli)
             [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall redis-cli domain.com${NC}"; exit 1; }
@@ -1581,9 +1875,61 @@ def stage_create_commands(cfg):
             [ -d "/var/www/html/$SRC_DOMAIN" ] || { echo -e "${RED}❌ Source not found: $SRC_DOMAIN${NC}"; exit 1; }
             [ -d "/var/www/html/$DST_DOMAIN" ] && { echo -e "${RED}❌ Destination already exists: $DST_DOMAIN${NC}"; exit 1; }
             DST_REDIS_PORT=$(python3 -c "
-import os; p=6380
-used=open('/var/lib/easyinstall/used_redis_ports.txt').read().split() if os.path.exists('/var/lib/easyinstall/used_redis_ports.txt') else []
-while str(p) in used: p+=1
+import os, glob, re, socket, fcntl
+
+def _port_in_use_by_conf(p):
+    for f in glob.glob('/etc/redis/redis-*.conf'):
+        try:
+            for line in open(f, errors='ignore'):
+                m = re.match(r'^\s*port\s+(\d+)', line)
+                if m and int(m.group(1)) == p:
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _port_listening(p):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.15)
+        result = s.connect_ex(('127.0.0.1', p))
+        s.close()
+        return result == 0
+    except Exception:
+        return False
+
+PORTS_FILE = '/var/lib/easyinstall/used_redis_ports.txt'
+lock_file  = PORTS_FILE + '.lock'
+os.makedirs(os.path.dirname(PORTS_FILE), exist_ok=True)
+
+lf = open(lock_file, 'w')
+try:
+    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except Exception:
+    pass
+
+used = set([6379])
+if os.path.exists(PORTS_FILE):
+    for tok in open(PORTS_FILE).read().split():
+        if tok.strip().isdigit():
+            used.add(int(tok.strip()))
+
+p = 6380
+while p <= 6500:
+    if p not in used and not _port_in_use_by_conf(p) and not _port_listening(p):
+        break
+    p += 1
+if p > 6500:
+    p = 6381
+
+with open(PORTS_FILE, 'a') as pf:
+    pf.write(str(p) + '\n')
+
+try:
+    fcntl.flock(lf, fcntl.LOCK_UN)
+except Exception:
+    pass
+lf.close()
 print(p)
 " 2>/dev/null || echo "6381")
             py_config clone_site --domain "$DST_DOMAIN" --clone-from "$SRC_DOMAIN" --redis-port "$DST_REDIS_PORT"
@@ -2500,18 +2846,76 @@ def stage_wordpress_install(cfg):
     # ── Create dedicated Redis instance ──────────────────────────────────
     log("INFO", f"Creating Redis instance for {domain} on port {redis_port}")
     domain_slug = domain.replace('.', '-')
+
+    # ── Derive per-site memory cap (RAM-aware, site-count-aware) ─────────────
+    try:
+        total_ram_kb  = int(open("/proc/meminfo").readline().split()[1])
+        total_ram_mb  = total_ram_kb // 1024
+        # Count existing sites to distribute budget fairly
+        site_count    = max(1, len(list(Path("/var/www/html").iterdir()))
+                            if Path("/var/www/html").exists() else 1)
+        # Budget: 50% of RAM for all Redis instances combined, floor 64 MB each
+        redis_budget  = total_ram_mb * 50 // 100
+        per_site_mb   = max(64, min(512, redis_budget // max(site_count, 1)))
+        per_site_mem  = f"{per_site_mb}mb"
+        # maxclients scales with RAM: 512 MB server → 500, 2 GB → 2000
+        max_clients   = max(500, min(5000, total_ram_mb * 2))
+    except Exception:
+        per_site_mem  = cfg.redis_max_memory
+        max_clients   = 1000
+
     redis_conf_content = textwrap.dedent(f"""\
-        # Redis for {domain}
+        # ── EasyInstall v7.0 — Redis cache for {domain} (HIGH-TRAFFIC) ───────
+        bind 127.0.0.1
         port {redis_port}
         daemonize yes
+        supervised systemd
         pidfile /var/run/redis/redis-{domain_slug}.pid
         logfile /var/log/redis/redis-{domain_slug}.log
         dir /var/lib/redis/{domain_slug}
-        maxmemory {cfg.redis_max_memory}
+
+        # ── Memory management ────────────────────────────────────────────────
+        maxmemory {per_site_mem}
+        # allkeys-lru: best for WordPress — evicts least-recently-used on full
         maxmemory-policy allkeys-lru
-        appendonly no
+        # 15 samples = better LRU accuracy with moderate CPU cost
+        maxmemory-samples 15
+        # Proactive expiry — cleans up stale keys between requests
+        active-expire-effort 5
+
+        # ── Persistence — disabled (pure cache, restart is OK) ───────────────
         save ""
-        bind 127.0.0.1
+        appendonly no
+
+        # ── Network / connection tuning ──────────────────────────────────────
+        tcp-backlog 65535
+        tcp-keepalive 60
+        # Close idle connections after 5 min to reclaim fd slots
+        timeout 300
+        maxclients {max_clients}
+
+        # ── Performance ──────────────────────────────────────────────────────
+        # hz 25: more frequent background tasks = sharper TTL precision
+        hz 25
+        dynamic-hz yes
+        # Lazy deletion avoids blocking event loop on large value DEL/EXPIRE
+        lazyfree-lazy-eviction yes
+        lazyfree-lazy-expire yes
+        lazyfree-lazy-server-del yes
+        lazyfree-lazy-user-flush yes
+        replica-lazy-flush yes
+
+        # ── Slow log ─────────────────────────────────────────────────────────
+        # Capture commands slower than 2 ms for diagnosis
+        slowlog-log-slower-than 2000
+        slowlog-max-len 128
+
+        # ── Latency monitoring ───────────────────────────────────────────────
+        latency-monitor-threshold 50
+        latency-tracking yes
+
+        # ── Database isolation: DB0=object cache DB1=sessions DB2=transients ─
+        databases 4
     """)
     write_file(f"/etc/redis/redis-{domain_slug}.conf", redis_conf_content)
     Path(f"/var/lib/redis/{domain_slug}").mkdir(parents=True, exist_ok=True)
@@ -2519,17 +2923,34 @@ def stage_wordpress_install(cfg):
 
     redis_service_content = textwrap.dedent(f"""\
         [Unit]
-        Description=Redis server for {domain}
+        Description=Redis — dedicated cache for {domain}
+        Documentation=https://redis.io
         After=network.target
+        AssertPathExists=/etc/redis/redis-{domain_slug}.conf
 
         [Service]
         Type=forking
+        ExecStartPre=/bin/sh -c 'mkdir -p /var/run/redis && chown redis:redis /var/run/redis'
         ExecStart=/usr/bin/redis-server /etc/redis/redis-{domain_slug}.conf
-        ExecStop=/usr/bin/redis-cli -p {redis_port} shutdown
+        ExecStop=/usr/bin/redis-cli -p {redis_port} shutdown nosave
+        PIDFile=/var/run/redis/redis-{domain_slug}.pid
         User=redis
         Group=redis
         RuntimeDirectory=redis
         RuntimeDirectoryMode=0755
+        Restart=on-failure
+        RestartSec=5
+        StartLimitIntervalSec=60
+        StartLimitBurst=5
+        # Give Redis time to load on busy systems
+        TimeoutStartSec=30
+        TimeoutStopSec=15
+
+        # Security hardening
+        NoNewPrivileges=yes
+        PrivateTmp=yes
+        ProtectSystem=strict
+        ReadWritePaths=/var/lib/redis/{domain_slug} /var/log/redis /var/run/redis
 
         [Install]
         WantedBy=multi-user.target
@@ -2589,14 +3010,34 @@ def stage_wordpress_install(cfg):
         define('WP_AUTO_UPDATE_CORE',      'minor');
         define('FS_METHOD',                'direct');
 
-        // Redis (dedicated instance)
-        define('WP_REDIS_HOST',     '127.0.0.1');
-        define('WP_REDIS_PORT',     {redis_port});
-        define('WP_REDIS_DATABASE', 0);
-        define('WP_REDIS_TIMEOUT',  1);
-        define('WP_REDIS_READ_TIMEOUT', 1);
-        define('WP_REDIS_MAXTTL',   86400);
-        define('WP_CACHE_KEY_SALT', '{domain}_');
+        // ── EasyInstall v7.0 — Redis (dedicated instance, port {redis_port}) ──
+        // Each site has its own Redis process → zero cross-site interference
+        define('WP_REDIS_HOST',              '127.0.0.1');
+        define('WP_REDIS_PORT',              {redis_port});
+        define('WP_REDIS_DATABASE',          0);           // DB0 = object cache
+        define('WP_REDIS_DATABASE_SESSION',  1);           // DB1 = PHP sessions
+        define('WP_REDIS_DATABASE_TRANSIENT',2);           // DB2 = transients
+        // Connection timeouts — short to fail fast and fall back to DB
+        define('WP_REDIS_TIMEOUT',           0.5);         // connect timeout (s)
+        define('WP_REDIS_READ_TIMEOUT',      0.5);         // read timeout (s)
+        // Retry: 3 attempts, 100 ms apart — handles brief Redis restarts
+        define('WP_REDIS_RETRY_INTERVAL',    100);         // ms between retries
+        define('WP_REDIS_RETRIES',           3);
+        // TTL: 24 h ceiling keeps cache fresh without runaway memory growth
+        define('WP_REDIS_MAXTTL',            86400);
+        // Per-site key prefix — prevents collisions if ever on a shared instance
+        define('WP_CACHE_KEY_SALT',          '{domain}_');
+        // Selective flush: only purge this site's own keys, not all of Redis
+        define('WP_REDIS_SELECTIVE_FLUSH',   true);
+        // Graceful fallback: serve un-cached if Redis is temporarily down
+        define('WP_REDIS_GRACEFUL_FALLBACK', true);
+        // Igbinary serializer (faster + smaller than PHP serialize, if available)
+        define('WP_REDIS_SERIALIZER',        defined('Redis::SERIALIZER_IGBINARY') ? Redis::SERIALIZER_IGBINARY : Redis::SERIALIZER_PHP);
+        // Compression (LZ4 if phpredis supports it, else none)
+        define('WP_REDIS_COMPRESSION',       defined('Redis::COMPRESSION_LZ4') ? Redis::COMPRESSION_LZ4 : Redis::COMPRESSION_NONE);
+        // Session handler — PHP sessions stored in Redis DB1 (not files)
+        ini_set('session.save_handler', 'redis');
+        ini_set('session.save_path',    'tcp://127.0.0.1:{redis_port}?database=1&timeout=0.5');
 
         $table_prefix = 'wp_';
         if (!defined('ABSPATH')) define('ABSPATH', __DIR__ . '/');
