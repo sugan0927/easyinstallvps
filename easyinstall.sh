@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # ============================================
-# EasyInstall WordPress Maximum Performance Installation Script v6.4
+# EasyInstall WordPress Maximum Performance Installation Script v6.5
 # HYBRID EDITION: Bash = Dependencies | Python = Configuration
 # Ultra-Optimized WordPress Setup with Advanced Auto-Tuning (10 Phases)
 # RAM Auto-Detection: 512MB to 16GB
 # Compatible with Debian 12 and Ubuntu 24.04/22.04
 #
 # ARCHITECTURE:
-#   easyinstall.sh         — Bash: all apt installs, system deps, repo setup,
+#   easyinstall.sh         - Bash: all apt installs, system deps, repo setup,
 #                            service start/enable, lock/logging, entry point
-#   easyinstall_config.py  — Python: all server config file generation,
+#   easyinstall_config.py  - Python: all server config file generation,
 #                            WordPress setup, Nginx/PHP/MySQL/Redis config,
 #                            autotune, firewall rules, monitoring scripts
 # ============================================
@@ -18,7 +18,7 @@
 set -eE
 trap 'error_handler ${LINENO} "$BASH_COMMAND" $?' ERR
 
-# ── Color Codes ─────────────────────────────────────────────────────────────
+# Color Codes
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -27,8 +27,8 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ── Global Variables ─────────────────────────────────────────────────────────
-SCRIPT_VERSION="6.4"
+# Global Variables
+SCRIPT_VERSION="6.5"
 LOCK_FILE="/var/run/easyinstall.lock"
 LOG_FILE="/var/log/easyinstall/install.log"
 ERROR_LOG="/var/log/easyinstall/error.log"
@@ -39,7 +39,7 @@ INSTALL_START_TIME=$(date +%s)
 PYTHON_CONFIG_SCRIPT="/usr/local/lib/easyinstall_config.py"
 
 # ============================================
-# SECTION 1 — LOGGING  (pure bash, no deps)
+# SECTION 1 - LOGGING
 # ============================================
 log() {
     local level=$1
@@ -48,11 +48,11 @@ log() {
     mkdir -p /var/log/easyinstall /var/lib/easyinstall 2>/dev/null || true
     echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
     case $level in
-        "ERROR")   echo -e "${RED}❌ $message${NC}" ;;
-        "WARNING") echo -e "${YELLOW}⚠️  $message${NC}" ;;
-        "SUCCESS") echo -e "${GREEN}✅ $message${NC}" ;;
-        "INFO")    echo -e "${BLUE}ℹ️  $message${NC}" ;;
-        "STEP")    echo -e "${PURPLE}🔷 $message${NC}" ;;
+        "ERROR")   echo -e "${RED}ERROR: $message${NC}" ;;
+        "WARNING") echo -e "${YELLOW}WARNING: $message${NC}" ;;
+        "SUCCESS") echo -e "${GREEN}SUCCESS: $message${NC}" ;;
+        "INFO")    echo -e "${BLUE}INFO: $message${NC}" ;;
+        "STEP")    echo -e "${PURPLE}STEP: $message${NC}" ;;
         *)         echo -e "$message" ;;
     esac
 }
@@ -85,7 +85,7 @@ update_status() {
 }
 
 # ============================================
-# SECTION 2 — SAFE COMMAND EXECUTION
+# SECTION 2 - SAFE COMMAND EXECUTION
 # ============================================
 run_cmd() {
     local cmd="$@"
@@ -122,7 +122,7 @@ run_cmd_retry() {
 }
 
 # ============================================
-# SECTION 3 — LOCK FILE MANAGEMENT
+# SECTION 3 - LOCK FILE MANAGEMENT
 # ============================================
 check_lock() {
     log "STEP" "Checking for existing installation..."
@@ -142,7 +142,7 @@ check_lock() {
 }
 
 # ============================================
-# SECTION 4 — CONFIGURATION BACKUP & ROLLBACK
+# SECTION 4 - CONFIGURATION BACKUP & ROLLBACK
 # ============================================
 backup_config() {
     local files=("$@")
@@ -182,7 +182,7 @@ perform_rollback() {
 }
 
 # ============================================
-# SECTION 5 — SYSTEM VALIDATION (BASH)
+# SECTION 5 - SYSTEM VALIDATION
 # ============================================
 check_root() {
     log "STEP" "Checking root privileges"
@@ -244,7 +244,7 @@ check_os_compatibility() {
 }
 
 # ============================================
-# SECTION 6 — SERVICE HEALTH CHECKS (BASH)
+# SECTION 6 - SERVICE HEALTH CHECKS
 # ============================================
 wait_for_service() {
     local service=$1 max_attempts=${2:-30} attempt=1
@@ -286,8 +286,7 @@ validate_nginx_config() {
 }
 
 # ============================================
-# SECTION 7 — RAM AUTO-DETECT & TUNE (BASH)
-# Exported as env vars consumed by Python config
+# SECTION 7 - RAM AUTO-DETECT & TUNE
 # ============================================
 detect_ram_and_tune() {
     log "STEP" "Auto-tuning based on RAM"
@@ -329,18 +328,17 @@ detect_ram_and_tune() {
 
     NGINX_WORKER_PROCESSES=$TOTAL_CORES
 
-    # Export so Python config script can read them via env
     export TOTAL_RAM TOTAL_CORES
     export PHP_MAX_CHILDREN PHP_START_SERVERS PHP_MIN_SPARE PHP_MAX_SPARE
     export PHP_MEMORY_LIMIT PHP_MAX_EXECUTION
     export MYSQL_BUFFER_POOL MYSQL_LOG_FILE
     export REDIS_MAX_MEMORY NGINX_WORKER_CONNECTIONS NGINX_WORKER_PROCESSES
 
-    log "SUCCESS" "Auto-tuning complete — PHP children: $PHP_MAX_CHILDREN | MySQL: $MYSQL_BUFFER_POOL | Redis: $REDIS_MAX_MEMORY"
+    log "SUCCESS" "Auto-tuning complete - PHP children: $PHP_MAX_CHILDREN | MySQL: $MYSQL_BUFFER_POOL | Redis: $REDIS_MAX_MEMORY"
 }
 
 # ============================================
-# SECTION 8 — OS DETECTION (BASH)
+# SECTION 8 - OS DETECTION
 # ============================================
 detect_os() {
     log "STEP" "Detecting operating system"
@@ -366,7 +364,7 @@ detect_os() {
 }
 
 # ============================================
-# SECTION 9 — PACKAGE MANAGER & BASE DEPS (BASH)
+# SECTION 9 - PACKAGE MANAGER & BASE DEPS
 # ============================================
 setup_package_manager() {
     log "STEP" "Setting up package manager and base dependencies"
@@ -395,7 +393,7 @@ setup_package_manager() {
 }
 
 # ============================================
-# SECTION 10 — SWAP SETUP (BASH — filesystem op)
+# SECTION 10 - SWAP SETUP
 # ============================================
 setup_swap() {
     log "STEP" "Configuring swap space"
@@ -422,7 +420,7 @@ setup_swap() {
 }
 
 # ============================================
-# SECTION 11 — INSTALL NGINX (BASH: repo + pkg)
+# SECTION 11 - INSTALL NGINX
 # ============================================
 install_nginx_packages() {
     log "STEP" "Installing Nginx from official repository"
@@ -438,24 +436,21 @@ install_nginx_packages() {
     run_cmd_retry 3 5 "apt-get update -y"
     run_cmd_retry 3 5 "apt-get install -y nginx"
 
-    # Optional: Brotli module
     run_cmd_retry 2 3 "apt-get install -y libnginx-mod-brotli" 2>/dev/null || \
-        log "WARNING" "Brotli module not available — gzip remains active"
+        log "WARNING" "Brotli module not available - gzip remains active"
 
-    # Optional: GeoIP2 module
     apt-get install -y libnginx-mod-http-geoip2 mmdb-bin 2>/dev/null || true
 
     mkdir -p /etc/nginx/{sites-available,sites-enabled,conf.d,ssl,snippets}
     mkdir -p /var/cache/nginx/{fastcgi,proxy,static,edge}
     mkdir -p /var/log/nginx
-    # FIX: Use www-data (matches PHP-FPM socket owner and nginx worker user in config)
     chown -R www-data:www-data /var/cache/nginx 2>/dev/null || true
     chmod -R 755 /var/cache/nginx 2>/dev/null || true
     log "SUCCESS" "Nginx packages installed"
 }
 
 # ============================================
-# SECTION 12 — INSTALL PHP (BASH: repo + pkgs)
+# SECTION 12 - INSTALL PHP
 # ============================================
 install_php_packages() {
     log "STEP" "Installing PHP from Sury/Ondrej repository"
@@ -469,7 +464,6 @@ install_php_packages() {
         run_cmd_retry 3 5 "apt-get update -y"
     fi
 
-    # Try PHP 8.4 → 8.3 → 8.2
     PHP_INSTALLED_VERSION=""
     for ver in 8.4 8.3 8.2; do
         local pkgs="php${ver}-fpm php${ver}-mysql php${ver}-curl php${ver}-gd php${ver}-mbstring"
@@ -479,7 +473,6 @@ install_php_packages() {
         if run_cmd_retry 3 5 "apt-get install -y $pkgs"; then
             PHP_INSTALLED_VERSION=$ver
             log "SUCCESS" "PHP $ver installed"
-            # Always also try installing 8.3 and 8.2 as fallback versions
         else
             log "WARNING" "PHP $ver not available"
         fi
@@ -491,7 +484,7 @@ install_php_packages() {
 }
 
 # ============================================
-# SECTION 13 — INSTALL MARIADB (BASH: repo + pkg)
+# SECTION 13 - INSTALL MARIADB
 # ============================================
 install_mysql_packages() {
     log "STEP" "Installing MariaDB 11.x"
@@ -512,7 +505,7 @@ install_mysql_packages() {
 }
 
 # ============================================
-# SECTION 14 — INSTALL WP-CLI (BASH: download)
+# SECTION 14 - INSTALL WP-CLI
 # ============================================
 install_wp_cli() {
     log "STEP" "Installing WP-CLI"
@@ -527,7 +520,6 @@ install_wp_cli() {
         log "ERROR" "Failed to download WP-CLI"
     fi
 
-    # Weekly self-update cron
     cat > /etc/cron.weekly/easyinstall-wpcli-update <<'WPCLIUPDATE'
 #!/bin/bash
 /usr/local/bin/wp cli update --yes --allow-root 2>/dev/null && \
@@ -538,7 +530,7 @@ WPCLIUPDATE
 }
 
 # ============================================
-# SECTION 15 — INSTALL REDIS (BASH: repo + pkg)
+# SECTION 15 - INSTALL REDIS
 # ============================================
 install_redis_packages() {
     log "STEP" "Installing Redis 7.x"
@@ -552,7 +544,7 @@ install_redis_packages() {
 }
 
 # ============================================
-# SECTION 16 — INSTALL CERTBOT (BASH)
+# SECTION 16 - INSTALL CERTBOT
 # ============================================
 install_certbot() {
     log "STEP" "Installing Certbot for SSL"
@@ -562,7 +554,7 @@ install_certbot() {
 }
 
 # ============================================
-# SECTION 17 — GET/MARK REDIS PORTS (BASH)
+# SECTION 17 - GET/MARK REDIS PORTS
 # ============================================
 get_next_redis_port() {
     mkdir -p /var/lib/easyinstall
@@ -588,10 +580,9 @@ mark_redis_port_used() {
 }
 
 # ============================================
-# SECTION 18 — START/ENABLE SERVICES (BASH)
+# SECTION 18 - START/ENABLE SERVICES
 # ============================================
 enable_start_nginx() {
-    # FIX: Remove default nginx site before starting to avoid port 80 conflict
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     systemctl enable nginx
     systemctl start nginx
@@ -624,7 +615,7 @@ enable_start_mariadb() {
 }
 
 # ============================================
-# SECTION 19 — CLEANUP
+# SECTION 19 - CLEANUP
 # ============================================
 cleanup_temp_files() {
     log "STEP" "Cleaning up temporary files"
@@ -635,9 +626,7 @@ cleanup_temp_files() {
 }
 
 # ============================================
-# SECTION 19b — DETECT ACTIVE PHP VERSION (BASH)
-# Finds the highest PHP-FPM version that is running.
-# Called by wordpress_install stage to pass correct version.
+# SECTION 20 - DETECT ACTIVE PHP VERSION
 # ============================================
 detect_active_php_version() {
     for ver in 8.4 8.3 8.2; do
@@ -645,17 +634,16 @@ detect_active_php_version() {
             echo "$ver"
             return 0
         fi
-        # Also check if the socket exists even if service name differs
         if [ -S "/run/php/php${ver}-fpm.sock" ]; then
             echo "$ver"
             return 0
         fi
     done
-    echo "8.3"   # safe default
+    echo "8.3"
 }
 
 # ============================================
-# SECTION 19c — PHP SOCKET HEALTH FIX (BASH)
+# SECTION 21 - PHP SOCKET HEALTH FIX
 # ============================================
 test_php_fpm() {
     local version=$1
@@ -664,16 +652,13 @@ test_php_fpm() {
         log "WARNING" "PHP-FPM $version socket not found at $sock"
         return 1
     fi
-    # Fix socket permissions so www-data + nginx can both read it
     chmod 666 "$sock" 2>/dev/null || true
     log "SUCCESS" "PHP-FPM $version socket OK: $sock"
     return 0
 }
 
 # ============================================
-# SECTION 19d — CREATE PER-SITE REDIS INSTANCE (BASH)
-# Bash handles: systemd unit creation, daemon-reload, enable/start.
-# Config file is written by Python (wordpress_install stage).
+# SECTION 22 - CREATE PER-SITE REDIS INSTANCE
 # ============================================
 create_site_redis_instance() {
     local domain=$1
@@ -682,9 +667,8 @@ create_site_redis_instance() {
 
     log "INFO" "Starting dedicated Redis instance for $domain on port $redis_port"
 
-    # Config file already written by Python stage; just start the service
     if [ ! -f "/etc/redis/redis-${domain_slug}.conf" ]; then
-        log "WARNING" "Redis config for $domain not found — Python stage may not have run yet"
+        log "WARNING" "Redis config for $domain not found - Python stage may not have run yet"
         return 1
     fi
 
@@ -703,7 +687,7 @@ create_site_redis_instance() {
 }
 
 # ============================================
-# SECTION 20 — INSTALL OLLAMA (BASH: curl install)
+# SECTION 23 - INSTALL OLLAMA
 # ============================================
 install_ollama() {
     log "STEP" "Installing Ollama for local AI"
@@ -724,26 +708,22 @@ install_ollama() {
         ollama serve >/dev/null 2>&1 &
         sleep 4
     fi
-    # Pick model based on RAM
     local model="llama3"
     [ "${TOTAL_RAM:-0}" -ge 8192 ] && model="llama3.1"
     [ "${TOTAL_RAM:-0}" -lt 4096 ] && model="phi3"
     [ "${TOTAL_RAM:-0}" -lt 2048 ] && model="tinyllama"
     log "INFO" "Pulling Ollama model: $model"
-    ollama pull "$model" 2>/dev/null || log "WARNING" "Model pull failed — will retry on first use"
+    ollama pull "$model" 2>/dev/null || log "WARNING" "Model pull failed - will retry on first use"
     log "SUCCESS" "Ollama ready with model: $model"
 }
 
 # ============================================
-# SECTION 21 — PYTHON BRIDGE
-# Runs the Python config generator with all
-# tuning values exported as environment vars.
+# SECTION 24 - PYTHON BRIDGE
 # ============================================
 run_python_config() {
     local stage="$1"
     shift
     log "STEP" "Running Python config generator: stage=$stage"
-    # Extra args (e.g. --domain, --php-version) forwarded as-is after shift
     python3 "$PYTHON_CONFIG_SCRIPT" \
         --stage "$stage" \
         --total-ram "$TOTAL_RAM" \
@@ -770,7 +750,7 @@ run_python_config() {
 }
 
 # ============================================
-# SECTION 22 — INSTALLATION TESTS
+# SECTION 25 - INSTALLATION TESTS
 # ============================================
 test_installation() {
     log "STEP" "Testing installation"
@@ -812,7 +792,7 @@ test_installation() {
 }
 
 # ============================================
-# SECTION 23 — AUTOHEAL SERVICE START
+# SECTION 26 - AUTOHEAL SERVICE START
 # ============================================
 start_autoheal() {
     systemctl daemon-reload
@@ -830,24 +810,509 @@ start_fail2ban() {
 }
 
 # ============================================
-# SECTION 24 — MAIN INSTALLATION FLOW
+# SECTION 27 - PERFORMANCE OPTIMIZATION FUNCTIONS
+# ============================================
+
+configure_redis_persistence() {
+    log "STEP" "Configuring Redis persistence for WordPress"
+    mkdir -p /etc/redis/redis.conf.d
+    cat > /etc/redis/redis.conf.d/wordpress-persist.conf <<'EOF'
+save 900 1
+save 300 10
+save 60 10000
+
+appendonly yes
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+maxmemory-policy allkeys-lru
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+EOF
+
+    if [ -f /etc/redis/redis.conf ]; then
+        if ! grep -q "redis.conf.d" /etc/redis/redis.conf; then
+            echo -e "\ninclude /etc/redis/redis.conf.d/*.conf" >> /etc/redis/redis.conf
+        fi
+    fi
+    systemctl restart redis-server 2>/dev/null || true
+    log "SUCCESS" "Redis persistence configured"
+}
+
+configure_fastcgi_cache() {
+    log "STEP" "Configuring Nginx FastCGI microcache for WordPress"
+    mkdir -p /var/run/nginx-cache
+    chown www-data:www-data /var/run/nginx-cache 2>/dev/null || true
+    cat > /etc/nginx/conf.d/fastcgi-cache.conf <<'EOF'
+fastcgi_cache_path /var/run/nginx-cache
+    levels=1:2
+    keys_zone=wordpress:100m
+    inactive=60m
+    max_size=1g
+    use_temp_path=off;
+
+fastcgi_cache_key "$scheme$request_method$host$request_uri";
+fastcgi_cache_use_stale error timeout invalid_header http_500;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+
+map $request_method $skip_cache_post {
+    default 0;
+    POST    1;
+}
+
+map $http_cookie $skip_cache_cookie {
+    default                        0;
+    "~*wordpress_logged_in"        1;
+    "~*wordpress_no_cache"         1;
+    "~*comment_author"             1;
+    "~*woocommerce_cart_hash"      1;
+    "~*woocommerce_items_in_cart"  1;
+}
+
+map $request_uri $skip_cache_uri {
+    default 0;
+    "~*/wp-admin/"          1;
+    "~*/wp-login.php"       1;
+    "~*/wp-cron.php"        1;
+    "~*/xmlrpc.php"         1;
+    "~*\?.*"                0;
+}
+EOF
+    validate_nginx_config && systemctl reload nginx 2>/dev/null || \
+        log "WARNING" "Nginx reload skipped - validate config manually"
+    log "SUCCESS" "FastCGI cache configured"
+}
+
+install_image_optimizers() {
+    log "STEP" "Installing image optimization tools"
+    local pkgs="webp optipng jpegoptim pngquant gifsicle imagemagick"
+    run_cmd_retry 3 5 "apt-get install -y $pkgs" || {
+        log "WARNING" "Some image optimizer packages failed to install"
+    }
+    log "INFO" "Creating daily WebP conversion cron job"
+    cat > /etc/cron.daily/optimize-images <<'CRONEOF'
+#!/bin/bash
+WP_ROOT="/var/www/html"
+LOG="/var/log/easyinstall/image-optimize.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+echo "[$TIMESTAMP] Starting image optimization" >> "$LOG"
+
+find "$WP_ROOT" -type f \( -iname "*.jpg" -o -iname "*.jpeg" \) -mtime +1 | while read -r img; do
+    webp_path="${img%.*}.webp"
+    [ -f "$webp_path" ] && continue
+    cwebp -q 80 "$img" -o "$webp_path" >> "$LOG" 2>&1 && \
+        echo "[$TIMESTAMP] Converted: $img" >> "$LOG"
+done
+
+find "$WP_ROOT" -type f -iname "*.png" -mtime +1 | while read -r img; do
+    webp_path="${img%.*}.webp"
+    [ -f "$webp_path" ] && continue
+    cwebp -q 80 "$img" -o "$webp_path" >> "$LOG" 2>&1 && \
+        echo "[$TIMESTAMP] Converted: $img" >> "$LOG"
+done
+
+find "$WP_ROOT" -type f -iname "*.png" -mtime +1 -exec optipng -o2 -quiet {} \; 2>/dev/null
+
+find "$WP_ROOT" -type f \( -iname "*.jpg" -o -iname "*.jpeg" \) -mtime +1 \
+    -exec jpegoptim --strip-all --max=85 --quiet {} \; 2>/dev/null
+
+echo "[$TIMESTAMP] Image optimization complete" >> "$LOG"
+CRONEOF
+    chmod +x /etc/cron.daily/optimize-images
+    log "SUCCESS" "Image optimizers installed; daily WebP cron created"
+}
+
+optimize_mysql_query_cache() {
+    log "STEP" "Optimizing MySQL query cache and InnoDB settings"
+    local cores
+    cores=$(nproc)
+    mkdir -p /etc/mysql/mariadb.conf.d
+    cat > /etc/mysql/mariadb.conf.d/99-query-cache.cnf <<EOF
+[mysqld]
+query_cache_type        = 1
+query_cache_size        = 128M
+query_cache_limit       = 4M
+query_cache_min_res_unit = 2k
+
+innodb_buffer_pool_instances = ${cores}
+innodb_io_capacity           = 2000
+innodb_io_capacity_max       = 4000
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method          = O_DIRECT
+innodb_read_io_threads       = ${cores}
+innodb_write_io_threads      = ${cores}
+innodb_log_buffer_size       = 64M
+innodb_file_per_table        = 1
+innodb_stats_on_metadata     = 0
+
+max_allowed_packet           = 256M
+thread_cache_size            = 16
+table_open_cache             = 4000
+table_definition_cache       = 4000
+open_files_limit             = 65535
+EOF
+    systemctl restart mariadb 2>/dev/null || systemctl restart mysql 2>/dev/null || true
+    log "SUCCESS" "MySQL query cache optimized"
+}
+
+configure_advanced_opcache() {
+    log "STEP" "Configuring advanced OPcache for WordPress"
+    local php_ver="${PHP_INSTALLED_VERSION:-8.3}"
+    local ini_dir="/etc/php/${php_ver}/mods-available"
+    mkdir -p "$ini_dir" /tmp/opcache
+    chown www-data:www-data /tmp/opcache 2>/dev/null || true
+    cat > "${ini_dir}/opcache-wordpress.ini" <<'EOF'
+[opcache]
+opcache.enable                 = 1
+opcache.enable_cli             = 0
+opcache.memory_consumption     = 256
+opcache.interned_strings_buffer = 16
+opcache.max_accelerated_files  = 100000
+opcache.max_wasted_percentage  = 10
+opcache.revalidate_freq        = 0
+opcache.validate_timestamps    = 0
+opcache.save_comments          = 1
+opcache.fast_shutdown          = 1
+opcache.huge_code_pages        = 1
+opcache.file_cache             = /tmp/opcache
+opcache.file_cache_consistency_checks = 0
+opcache.jit                    = tracing
+opcache.jit_buffer_size        = 64M
+EOF
+    phpenmod -v "${php_ver}" opcache-wordpress 2>/dev/null || true
+    systemctl reload "php${php_ver}-fpm" 2>/dev/null || true
+    log "SUCCESS" "Advanced OPcache configured"
+}
+
+optimize_kernel_network() {
+    log "STEP" "Applying kernel network performance settings"
+    cat > /etc/sysctl.d/99-network-performance.conf <<'EOF'
+net.core.default_qdisc          = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.somaxconn              = 65535
+net.core.netdev_max_backlog     = 65536
+net.ipv4.tcp_max_syn_backlog    = 8192
+net.ipv4.tcp_tw_reuse           = 1
+net.ipv4.tcp_fin_timeout        = 15
+net.ipv4.tcp_keepalive_time     = 300
+net.ipv4.tcp_keepalive_intvl    = 30
+net.ipv4.tcp_keepalive_probes   = 3
+net.ipv4.ip_local_port_range    = 1024 65535
+net.ipv4.tcp_rmem               = 4096 87380 16777216
+net.ipv4.tcp_wmem               = 4096 65536 16777216
+net.core.rmem_max               = 16777216
+net.core.wmem_max               = 16777216
+fs.file-max                     = 2097152
+vm.swappiness                   = 10
+vm.dirty_ratio                  = 15
+vm.dirty_background_ratio       = 5
+EOF
+    sysctl -p /etc/sysctl.d/99-network-performance.conf 2>/dev/null || true
+
+    local kernel_version
+    kernel_version=$(uname -r | cut -d. -f1-2 | tr -d '.')
+    if [ "${kernel_version:-0}" -ge 49 ] 2>/dev/null; then
+        modprobe tcp_bbr 2>/dev/null || true
+        if lsmod | grep -q tcp_bbr 2>/dev/null; then
+            log "SUCCESS" "BBR congestion control enabled"
+        else
+            log "WARNING" "BBR module not loaded - kernel may not support it"
+        fi
+    else
+        log "WARNING" "Kernel < 4.9 detected - skipping BBR activation"
+    fi
+    log "SUCCESS" "Kernel network settings applied"
+}
+
+setup_db_optimization_cron() {
+    log "STEP" "Setting up daily database optimization cron"
+    cat > /etc/cron.daily/optimize-db <<'DBCRON'
+#!/bin/bash
+LOG="/var/log/easyinstall/db-optimize.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+echo "[$TIMESTAMP] Starting DB optimization" >> "$LOG"
+
+mysqlcheck -o --all-databases --silent 2>> "$LOG" || true
+
+mysql --batch --skip-column-names -e "
+SELECT CONCAT('OPTIMIZE TABLE \`', table_schema, '\`.\`', table_name, '\`;')
+FROM information_schema.tables
+WHERE engine = 'MyISAM'
+  AND data_free > 0
+  AND table_schema NOT IN ('information_schema','performance_schema','mysql');
+" 2>/dev/null | mysql 2>> "$LOG" || true
+
+echo "[$TIMESTAMP] DB optimization complete" >> "$LOG"
+DBCRON
+    chmod +x /etc/cron.daily/optimize-db
+    log "SUCCESS" "DB optimization cron created"
+}
+
+setup_auto_scaling_php() {
+    log "STEP" "Setting up PHP-FPM auto-scaling service"
+    local php_ver="${PHP_INSTALLED_VERSION:-8.3}"
+    local max_children="${PHP_MAX_CHILDREN:-20}"
+    local min_children="${PHP_MIN_SPARE:-3}"
+
+    cat > /usr/local/bin/php-auto-scale.sh <<EOF
+#!/bin/bash
+PHP_VERSION="${php_ver}"
+MAX_CHILDREN=${max_children}
+MIN_CHILDREN=${min_children}
+LOG="/var/log/easyinstall/php-autoscale.log"
+POOL_CONF="/etc/php/\${PHP_VERSION}/fpm/pool.d/www.conf"
+
+scale_php() {
+    local load
+    load=\$(awk '{print \$1}' /proc/loadavg | cut -d. -f1)
+    local current_max
+    current_max=\$(grep "^pm.max_children" "\$POOL_CONF" 2>/dev/null | awk '{print \$3}' || echo "\$MAX_CHILDREN")
+    local timestamp
+    timestamp=\$(date '+%Y-%m-%d %H:%M:%S')
+
+    if [ "\$load" -gt 5 ] && [ "\$current_max" -lt "\$MAX_CHILDREN" ]; then
+        local new_max=\$((current_max + 5))
+        [ "\$new_max" -gt "\$MAX_CHILDREN" ] && new_max="\$MAX_CHILDREN"
+        sed -i "s/^pm.max_children.*/pm.max_children = \$new_max/" "\$POOL_CONF"
+        systemctl reload "php\${PHP_VERSION}-fpm" 2>/dev/null
+        echo "[\$timestamp] Load \$load > 5: scaled UP to \$new_max workers" >> "\$LOG"
+    elif [ "\$load" -lt 2 ] && [ "\$current_max" -gt "\$MIN_CHILDREN" ]; then
+        local new_max=\$((current_max - 2))
+        [ "\$new_max" -lt "\$MIN_CHILDREN" ] && new_max="\$MIN_CHILDREN"
+        sed -i "s/^pm.max_children.*/pm.max_children = \$new_max/" "\$POOL_CONF"
+        systemctl reload "php\${PHP_VERSION}-fpm" 2>/dev/null
+        echo "[\$timestamp] Load \$load < 2: scaled DOWN to \$new_max workers" >> "\$LOG"
+    fi
+}
+
+while true; do
+    scale_php
+    sleep 60
+done
+EOF
+    chmod +x /usr/local/bin/php-auto-scale.sh
+
+    cat > /etc/systemd/system/php-auto-scale.service <<EOF
+[Unit]
+Description=PHP-FPM Auto-Scaler - EasyInstall Performance Layer
+After=network.target php${php_ver}-fpm.service
+Wants=php${php_ver}-fpm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/php-auto-scale.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable php-auto-scale.service 2>/dev/null || true
+    systemctl start  php-auto-scale.service 2>/dev/null || true
+    log "SUCCESS" "PHP-FPM auto-scaling service installed and started"
+}
+
+setup_memcached() {
+    log "STEP" "Installing and configuring Memcached"
+    local php_ver="${PHP_INSTALLED_VERSION:-8.3}"
+    run_cmd_retry 3 5 "apt-get install -y memcached php${php_ver}-memcached" || {
+        log "WARNING" "Memcached installation failed - skipping"
+        return 1
+    }
+    local mc_conf="/etc/memcached.conf"
+    if [ -f "$mc_conf" ]; then
+        sed -i 's/^-m [0-9]*/-m 256/'                  "$mc_conf" 2>/dev/null || true
+        sed -i 's/^-c [0-9]*/-c 10240/'                "$mc_conf" 2>/dev/null || true
+        grep -q "^-m 256"   "$mc_conf" || echo "-m 256"   >> "$mc_conf"
+        grep -q "^-c 10240" "$mc_conf" || echo "-c 10240" >> "$mc_conf"
+    fi
+    systemctl enable memcached 2>/dev/null || true
+    systemctl restart memcached 2>/dev/null || true
+
+    for wp_config in /var/www/html/wp-config.php /var/www/*/wp-config.php; do
+        [ -f "$wp_config" ] || continue
+        if ! grep -q "MEMCACHED_BACKUP" "$wp_config"; then
+            sed -i "/\/\* That's all, stop editing/i \\
+// Memcached backup cache - EasyInstall Performance Layer\\
+define('MEMCACHED_HOST', '127.0.0.1');\\
+define('MEMCACHED_PORT', 11211);\\
+define('WP_CACHE', true);\\
+" "$wp_config" 2>/dev/null || true
+            log "INFO" "Memcached constants added to $wp_config"
+        fi
+    done
+    log "SUCCESS" "Memcached configured (256MB, 10240 connections)"
+}
+
+enable_http3_optimization() {
+    log "STEP" "Checking Nginx HTTP/3 support"
+    if nginx -V 2>&1 | grep -q "with-http_v3_module\|quic"; then
+        log "INFO" "Nginx HTTP/3 module detected - configuring"
+        cat > /etc/nginx/conf.d/http3.conf <<'EOF'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+        cat > /etc/nginx/snippets/http3-site.conf <<'EOF'
+listen 443 quic reuseport;
+listen 443 ssl;
+http2 on;
+http3 on;
+quic_retry on;
+ssl_early_data on;
+add_header Alt-Svc 'h3=":443"; ma=86400' always;
+EOF
+        validate_nginx_config && systemctl reload nginx 2>/dev/null || true
+        log "SUCCESS" "HTTP/3 config created"
+    else
+        log "WARNING" "Nginx HTTP/3 module not found - skipping"
+    fi
+}
+
+setup_asset_preloading() {
+    log "STEP" "Configuring Nginx asset preloading and resource hints"
+    cat > /etc/nginx/conf.d/preload.conf <<'EOF'
+map $sent_http_content_type $preload_link {
+    default                     "";
+    "text/html"                 "<https://fonts.googleapis.com>; rel=preconnect, <https://fonts.gstatic.com>; rel=preconnect crossorigin";
+}
+EOF
+    cat > /etc/nginx/snippets/preload-headers.conf <<'EOF'
+add_header Link $preload_link always;
+
+location ~* \.(woff2)$ {
+    add_header Link "</wp-content/themes/.*/style.css>; rel=preload; as=style" always;
+    expires 1y;
+    access_log off;
+    add_header Cache-Control "public, immutable";
+}
+
+add_header X-DNS-Prefetch-Control "on" always;
+EOF
+    validate_nginx_config && systemctl reload nginx 2>/dev/null || true
+    log "SUCCESS" "Asset preloading configured"
+}
+
+configure_pagespeed() {
+    log "STEP" "Checking for Nginx PageSpeed module"
+    if nginx -V 2>&1 | grep -q "pagespeed"; then
+        log "INFO" "PageSpeed module detected - configuring"
+        mkdir -p /var/cache/ngx_pagespeed
+        chown www-data:www-data /var/cache/ngx_pagespeed 2>/dev/null || true
+        cat > /etc/nginx/conf.d/pagespeed.conf <<'EOF'
+pagespeed on;
+pagespeed FileCachePath /var/cache/ngx_pagespeed;
+pagespeed FileCacheSizeKb 102400;
+pagespeed FileCacheCleanIntervalMs 3600000;
+
+pagespeed EnableFilters rewrite_images;
+pagespeed EnableFilters convert_png_to_jpeg;
+pagespeed EnableFilters convert_jpeg_to_webp;
+pagespeed EnableFilters resize_images;
+pagespeed EnableFilters lazyload_images;
+
+pagespeed EnableFilters combine_javascript;
+pagespeed EnableFilters combine_css;
+pagespeed EnableFilters minify_javascript;
+pagespeed EnableFilters rewrite_css;
+pagespeed EnableFilters collapse_whitespace;
+pagespeed EnableFilters remove_comments;
+
+pagespeed EnableFilters defer_javascript;
+
+pagespeed Disallow "*/wp-admin/*";
+pagespeed Disallow "*/wp-login.php";
+EOF
+        validate_nginx_config && systemctl reload nginx 2>/dev/null || true
+        log "SUCCESS" "PageSpeed configured"
+    else
+        log "WARNING" "Nginx PageSpeed module not found - skipping"
+    fi
+}
+
+apply_performance_optimizations() {
+    log "STEP" "Applying all WordPress performance optimizations"
+
+    local success_count=0
+    local fail_count=0
+    local applied_list=()
+    local failed_list=()
+
+    _run_opt() {
+        local name="$1"
+        local func="$2"
+        log "INFO" "Running: $name"
+        if $func 2>/dev/null; then
+            success_count=$((success_count + 1))
+            applied_list+=("$name")
+        else
+            fail_count=$((fail_count + 1))
+            failed_list+=("$name")
+            log "WARNING" "Optimization '$name' failed - continuing"
+        fi
+    }
+
+    _run_opt "Redis Persistence"         configure_redis_persistence
+    _run_opt "FastCGI Microcache"        configure_fastcgi_cache
+    _run_opt "Image Optimizers + WebP"   install_image_optimizers
+    _run_opt "MySQL Query Cache"         optimize_mysql_query_cache
+    _run_opt "Advanced OPcache"          configure_advanced_opcache
+    _run_opt "Kernel Network (BBR)"      optimize_kernel_network
+    _run_opt "DB Optimization Cron"      setup_db_optimization_cron
+    _run_opt "PHP Auto-Scaling"          setup_auto_scaling_php
+    _run_opt "Memcached Backup Cache"    setup_memcached
+    _run_opt "HTTP/3 + QUIC"            enable_http3_optimization
+    _run_opt "Asset Preloading"         setup_asset_preloading
+    _run_opt "PageSpeed Module"         configure_pagespeed
+
+    echo ""
+    log "STEP" "Performance Optimization Summary"
+    log "SUCCESS" "Applied:  $success_count optimizations"
+    [ $fail_count -gt 0 ] && log "WARNING" "Failed:   $fail_count optimizations" || true
+
+    if [ ${#applied_list[@]} -gt 0 ]; then
+        log "INFO" "Applied optimizations:"
+        for opt in "${applied_list[@]}"; do
+            log "INFO" "  - $opt"
+        done
+    fi
+    if [ ${#failed_list[@]} -gt 0 ]; then
+        log "WARNING" "Failed optimizations (non-fatal):"
+        for opt in "${failed_list[@]}"; do
+            log "WARNING" "  - $opt"
+        done
+    fi
+
+    local total=$((success_count + fail_count))
+    [ $success_count -eq $total ] && return 0 || return 1
+}
+
+# ============================================
+# SECTION 28 - MAIN INSTALLATION FLOW
 # ============================================
 main() {
     clear
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}🚀 EasyInstall WordPress Performance v6.4 (HYBRID EDITION)${NC}"
+    echo -e "${GREEN}EasyInstall WordPress Performance v6.5 (HYBRID EDITION)${NC}"
     echo -e "${GREEN}   Bash = Dependencies | Python = Configuration${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo -e "${YELLOW}Architecture:${NC}"
-    echo -e "   • ${CYAN}Bash layer${NC}  → apt installs, repos, service start/enable, lock files"
-    echo -e "   • ${CYAN}Python layer${NC} → all config file generation, tuning, WP setup, monitoring"
+    echo -e "   * ${CYAN}Bash layer${NC}  - apt installs, repos, service start/enable, lock files"
+    echo -e "   * ${CYAN}Python layer${NC} - all config file generation, tuning, WP setup, monitoring"
     echo ""
 
     check_root
     check_lock
 
-    # Create directories first
     mkdir -p /var/log/easyinstall /var/lib/easyinstall /var/www/html
     mkdir -p /etc/nginx/{sites-available,sites-enabled,ssl,conf.d,snippets}
     mkdir -p /backups/{daily,weekly,monthly}
@@ -861,7 +1326,6 @@ main() {
 
     update_status "START" "Installation started"
 
-    # ── Backup existing configs ──────────────────────────────────────────
     backup_config \
         "/etc/nginx/nginx.conf" \
         "/etc/mysql/mariadb.conf.d/99-wordpress.cnf" \
@@ -870,37 +1334,30 @@ main() {
         "/etc/redis/redis.conf" \
         "/etc/fail2ban/jail.local"
 
-    # ── PHASE A: Bash — detect & tune ───────────────────────────────────
     detect_ram_and_tune
     update_status "DETECT" "RAM detection complete"
 
     detect_os
     update_status "OS" "OS detection complete"
 
-    # ── PHASE B: Bash — install all packages ───────────────────────────
     setup_package_manager
     update_status "PACKAGES" "Package manager setup complete"
 
     setup_swap
     update_status "SWAP" "Swap setup complete"
 
-    # ── PHASE C: Python — kernel tuning (writes sysctl files) ──────────
-    # Deploy the Python config script now (it was placed by the installer)
     deploy_python_script
     run_python_config "kernel_tuning"
     sysctl -p /etc/sysctl.d/99-wordpress.conf 2>/dev/null || true
     update_status "KERNEL" "Kernel tuning complete"
 
-    # ── PHASE D: Bash — install Nginx packages ──────────────────────────
     install_nginx_packages
     update_status "NGINX_PKGS" "Nginx packages installed"
 
-    # ── PHASE E: Python — configure Nginx ──────────────────────────────
     run_python_config "nginx_config"
     enable_start_nginx
     update_status "NGINX" "Nginx configured and running"
 
-    # ── PHASE F: Python — Nginx extras (Brotli, CF, SSL, WS, HTTP3, Edge)
     run_python_config "nginx_extras"
     run_python_config "websocket_support"
     run_python_config "http3_quic"
@@ -908,26 +1365,21 @@ main() {
     validate_nginx_config && systemctl reload nginx 2>/dev/null || true
     update_status "NGINX_EXTRAS" "Nginx extras complete"
 
-    # ── PHASE G: Bash — install PHP packages ───────────────────────────
     install_php_packages
     update_status "PHP_PKGS" "PHP packages installed"
 
-    # ── PHASE H: Python — configure PHP ────────────────────────────────
     run_python_config "php_config"
     enable_start_php
     update_status "PHP" "PHP configured and running"
 
-    # ── PHASE I: Bash — install MariaDB ────────────────────────────────
     install_mysql_packages
     enable_start_mariadb
     update_status "MYSQL_PKGS" "MariaDB installed"
 
-    # ── PHASE J: Python — configure MariaDB ────────────────────────────
     run_python_config "mysql_config"
     systemctl restart mariadb
     test_mysql_connection
 
-    # ── Secure MariaDB ──────────────────────────────────────────────────
     mysql <<'SECURE_SQL'
 ALTER USER 'root'@'localhost' IDENTIFIED BY '';
 DELETE FROM mysql.user WHERE User='';
@@ -939,34 +1391,27 @@ SECURE_SQL
     log "SUCCESS" "MySQL secured"
     update_status "MYSQL" "MySQL configured"
 
-    # ── PHASE K: Bash — install WP-CLI ─────────────────────────────────
     install_wp_cli
     update_status "WPCLI" "WP-CLI installed"
 
-    # ── PHASE L: Bash — install Redis ───────────────────────────────────
     install_redis_packages
     update_status "REDIS_PKGS" "Redis packages installed"
 
-    # ── PHASE M: Python — configure Redis ──────────────────────────────
     run_python_config "redis_config"
     enable_start_redis
     update_status "REDIS" "Redis configured and running"
 
-    # ── PHASE N: Bash — install Certbot ────────────────────────────────
     install_certbot
     update_status "CERTBOT" "Certbot installed"
 
-    # ── PHASE O: Python — configure Firewall ───────────────────────────
     run_python_config "firewall_config"
     echo "y" | ufw enable 2>/dev/null || true
     update_status "FIREWALL" "Firewall configured"
 
-    # ── PHASE P: Python — configure Fail2ban ───────────────────────────
     run_python_config "fail2ban_config"
     start_fail2ban
     update_status "FAIL2BAN" "Fail2ban configured"
 
-    # ── PHASE Q: Python — create monitoring & utility scripts ──────────
     run_python_config "create_redis_monitor"
     run_python_config "create_commands"
     run_python_config "create_autoheal"
@@ -978,25 +1423,20 @@ SECURE_SQL
     run_python_config "create_autotune_module"
     start_autoheal
 
-    # ── Detect and export active PHP version for site creation ───────────
     ACTIVE_PHP_VERSION=$(detect_active_php_version)
     export ACTIVE_PHP_VERSION
     log "INFO" "Active PHP-FPM version: $ACTIVE_PHP_VERSION"
-    # Fix sockets for all active PHP-FPM versions
     for _v in 8.4 8.3 8.2; do test_php_fpm "$_v" 2>/dev/null || true; done
 
     update_status "SCRIPTS" "Utility scripts created"
 
-    # ── PHASE R: Python — advanced auto-tuning (all 10 phases) ─────────
     log "STEP" "Running Advanced Auto-Tuning (10 phases)..."
     run_python_config "advanced_autotune"
     update_status "AUTOTUNE" "Advanced auto-tuning complete"
 
-    # ── PHASE S: Bash — install Ollama local AI ─────────────────────────
     install_ollama
     update_status "OLLAMA" "Ollama local AI installed"
 
-    # ── PHASE T: Governor + cron timers ────────────────────────────────
     if [ -f /usr/local/lib/easyinstall-autotune.sh ]; then
         source /usr/local/lib/easyinstall-autotune.sh 2>/dev/null && {
             install_governor_timer 2>/dev/null || true
@@ -1006,7 +1446,12 @@ SECURE_SQL
     fi
     update_status "AUTOTUNE_SERVICES" "Governor + cron jobs installed"
 
-    # ── Final validation ────────────────────────────────────────────────
+    log "STEP" "Applying 10x WordPress performance optimizations..."
+    apply_performance_optimizations && \
+        log "SUCCESS" "All performance optimizations applied" || \
+        log "WARNING" "Some optimizations skipped - check logs for details"
+    update_status "PERF_OPT" "Performance optimizations complete"
+
     update_status "TEST" "Running installation tests"
     test_installation
 
@@ -1018,14 +1463,14 @@ SECURE_SQL
 
     echo ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}✅ EasyInstall v6.4 HYBRID EDITION Complete!${NC}"
+    echo -e "${GREEN}EasyInstall v6.5 HYBRID EDITION Complete!${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    echo -e "${YELLOW}📊 Installation Statistics:${NC}"
-    echo "   • Duration : ${INSTALL_DURATION} seconds"
-    echo "   • RAM      : ${TOTAL_RAM}MB | Cores: ${TOTAL_CORES}"
+    echo -e "${YELLOW}Installation Statistics:${NC}"
+    echo "   * Duration : ${INSTALL_DURATION} seconds"
+    echo "   * RAM      : ${TOTAL_RAM}MB | Cores: ${TOTAL_CORES}"
     echo ""
-    echo -e "${YELLOW}📋 Next Steps:${NC}"
+    echo -e "${YELLOW}Next Steps:${NC}"
     echo "   1.  source ~/.bashrc"
     echo "   2.  easyinstall help"
     echo "   3.  easyinstall create mysite.com"
@@ -1033,21 +1478,20 @@ SECURE_SQL
     echo "   5.  easyinstall monitor"
     echo "   6.  easyinstall perf-dashboard"
     echo "   7.  easyinstall warm-cache"
-    echo "   8.  [NEW] easyinstall update-site domain.com"
-    echo "   9.  [NEW] easyinstall clone src.com dst.com"
-    echo "   10. [v6.4] easyinstall ws-enable domain.com 8080"
-    echo "   11. [v6.4] easyinstall http3-enable"
-    echo "   12. [v6.4] easyinstall edge-setup"
+    echo "   8.  easyinstall update-site domain.com"
+    echo "   9.  easyinstall clone src.com dst.com"
+    echo "   10. easyinstall ws-enable domain.com 8080"
+    echo "   11. easyinstall http3-enable"
+    echo "   12. easyinstall edge-setup"
     echo ""
-    echo -e "${GREEN}⚡ Performance Settings:${NC}"
-    echo "   • PHP Children     : ${PHP_MAX_CHILDREN}"
-    echo "   • PHP Memory       : ${PHP_MEMORY_LIMIT}"
-    echo "   • MySQL Buffer     : ${MYSQL_BUFFER_POOL}"
-    echo "   • Redis Memory     : ${REDIS_MAX_MEMORY}"
-    echo "   • Nginx Connections: ${NGINX_WORKER_CONNECTIONS}"
+    echo -e "${GREEN}Performance Settings:${NC}"
+    echo "   * PHP Children     : ${PHP_MAX_CHILDREN}"
+    echo "   * PHP Memory       : ${PHP_MEMORY_LIMIT}"
+    echo "   * MySQL Buffer     : ${MYSQL_BUFFER_POOL}"
+    echo "   * Redis Memory     : ${REDIS_MAX_MEMORY}"
+    echo "   * Nginx Connections: ${NGINX_WORKER_CONNECTIONS}"
     echo ""
-    echo -e "${YELLOW}📝 Logs: $LOG_FILE${NC}"
-    echo -e "${YELLOW}☕ Support: https://paypal.me/sugandodrai${NC}"
+    echo -e "${YELLOW}Logs: $LOG_FILE${NC}"
     echo -e "${GREEN}========================================${NC}"
 
     update_status "COMPLETE" "Installation completed successfully"
@@ -1055,12 +1499,10 @@ SECURE_SQL
 
 # ============================================
 # Deploy Python config script
-# (embeds easyinstall_config.py alongside this script)
 # ============================================
 deploy_python_script() {
     log "STEP" "Deploying Python configuration module"
     mkdir -p /usr/local/lib
-    # The Python script is bundled in the same directory as this script
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -f "$script_dir/easyinstall_config.py" ]; then
         cp "$script_dir/easyinstall_config.py" "$PYTHON_CONFIG_SCRIPT"
