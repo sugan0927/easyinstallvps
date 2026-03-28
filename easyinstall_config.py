@@ -740,44 +740,142 @@ def stage_php_config(cfg):
             php_ini.write_text(content)
             log("SUCCESS", f"php.ini tuned for PHP {version}")
 
-        # opcache v8.0 — JIT (tracing) + WordPress preloading
+        # ── OPcache v8.0 — hardware-aware, JIT + preloading ─────────────────────
+
+        # Detect total RAM once (used for proportional sizing)
+        try:
+            _meminfo   = Path("/proc/meminfo").read_text()
+            _total_kb  = int(next(l for l in _meminfo.splitlines()
+                                  if l.startswith("MemTotal")).split()[1])
+            _total_mb  = _total_kb // 1024
+        except Exception:
+            _total_mb  = cfg.total_ram  # fall back to CLI arg
+
+        # OPcache shared memory:
+        #   • needs to hold compiled bytecode for WP core + all active plugins
+        #   • floor 128 MB (tiny VPS), cap 512 MB (diminishing returns beyond that)
+        #   • use ≈12 % of RAM so we leave room for PHP workers + MariaDB + Redis
+        _opcache_mb = max(128, min(512, _total_mb * 12 // 100))
+
+        # Interned-strings buffer:
+        #   • scales with OPcache size — WP has a very large string pool
+        #   • floor 16 MB, cap 64 MB
+        _strings_mb = max(16, min(64, _opcache_mb // 8))
+
+        # JIT native-code buffer:
+        #   • only useful when JIT is active; 4 % of RAM, floor 64 MB, cap 256 MB
+        _jit_mb     = max(64, min(256, _total_mb * 4 // 100))
+
+        # ── Huge-code-pages: only enable when the kernel actually supports it ────
+        # opcache.huge_code_pages uses transparent huge pages (THP).
+        # We explicitly disable THP in kernel_tuning (for Redis/MariaDB latency),
+        # so this MUST be 0 unless the operator has re-enabled THP deliberately.
+        _thp_path    = Path("/sys/kernel/mm/transparent_hugepage/enabled")
+        _thp_enabled = False
+        if _thp_path.exists():
+            _thp_val = _thp_path.read_text().strip()
+            # value is e.g. "[always] madvise never" — active mode is in brackets
+            import re as _re
+            _thp_match = _re.search(r"\[(\w+)\]", _thp_val)
+            if _thp_match and _thp_match.group(1) != "never":
+                _thp_enabled = True
+
+        _huge_code_pages = "1" if _thp_enabled else "0"
+        if not _thp_enabled:
+            log("INFO", f"PHP {version}: huge_code_pages disabled (THP is 'never' on this system)")
+        else:
+            log("INFO", f"PHP {version}: huge_code_pages enabled (THP is active)")
+
+        # ── Check whether opcache.so is actually installed ────────────────────
+        # The zend_extension line is only needed when the .so is NOT already
+        # auto-loaded by the distro's mods-enabled mechanism.  On Debian/Ubuntu
+        # the package ships /etc/php/{ver}/mods-available/opcache.ini with the
+        # zend_extension line, and phpenmod links it into conf.d/.
+        # We run phpenmod as a safety net, and *also* include zend_extension
+        # in our own ini so the setting is self-contained even if phpenmod fails.
+        _opcache_so_candidates = [
+            Path(f"/usr/lib/php/{version}/opcache.so"),
+            # common Debian multi-arch layout (PHP version comes from build path)
+        ] + list(Path("/usr/lib").glob(f"php/{version}/opcache.so"))           + list(Path("/usr/lib").glob(f"php/*/opcache.so"))
+
+        # Prefer the version-specific .so; fall back to any found .so path
+        _opcache_so = None
+        versioned_so = Path(f"/usr/lib/php/{version}/opcache.so")
+        if versioned_so.exists():
+            _opcache_so = str(versioned_so)
+        else:
+            for _candidate in Path("/usr/lib").glob("php/*/opcache.so"):
+                _opcache_so = str(_candidate)
+                break  # take the first found
+
+        # Ensure opcache is enabled via phpenmod (idempotent)
+        run(f"phpenmod -v {version} -s fpm opcache 2>/dev/null || true", check=False)
+
+        # Build the ini — zend_extension is always included so our file is
+        # self-contained even on non-Debian systems that lack phpenmod.
+        _zend_line = ""
+        if _opcache_so:
+            _zend_line = f"zend_extension={_opcache_so}\n"
+        else:
+            # .so path unknown — rely on the PHP binary having it compiled in,
+            # or on phpenmod having already linked the distro ini.
+            log("WARNING", f"PHP {version}: opcache.so not found at expected path — "
+                           "relying on phpenmod/distro auto-load")
+
         opcache_ini = (
-            "; EasyInstall v8.0 — OPcache 100x Speed\n"
+            f"; EasyInstall v8.0 — OPcache ({_total_mb} MB RAM detected)\n"
+            "; ── Extension load ─────────────────────────────────────────────\n"
+            + _zend_line +
+            "; ── Basic settings ─────────────────────────────────────────────\n"
             "opcache.enable=1\n"
-            "opcache.memory_consumption=512\n"
-            "opcache.interned_strings_buffer=32\n"
+            f"opcache.memory_consumption={_opcache_mb}\n"
+            f"opcache.interned_strings_buffer={_strings_mb}\n"
+            "; 100k slots covers WP core + full plugin ecosystem\n"
             "opcache.max_accelerated_files=100000\n"
+            "; production: disable timestamp checks — reload FPM after deploys\n"
             "opcache.validate_timestamps=0\n"
             "opcache.revalidate_freq=0\n"
             "opcache.fast_shutdown=1\n"
             "opcache.enable_cli=1\n"
             "opcache.save_comments=1\n"
             "opcache.load_comments=1\n"
+            "; 0 = no per-file size limit\n"
             "opcache.max_file_size=0\n"
             "opcache.consistency_checks=0\n"
-            "opcache.huge_code_pages=1\n"
+            f"; huge_code_pages: only safe when THP != never (detected: {_thp_enabled})\n"
+            f"opcache.huge_code_pages={_huge_code_pages}\n"
             "opcache.lockfile_path=/tmp\n"
-            "; PHP 8.x JIT tracing mode — best for WordPress mixed workloads\n"
+            "; ── PHP 8.x JIT — tracing mode is best for WP mixed workloads ──\n"
             "opcache.jit=tracing\n"
-            "opcache.jit_buffer_size=256M\n"
+            f"opcache.jit_buffer_size={_jit_mb}M\n"
             "opcache.jit_max_root_traces=1024\n"
             "opcache.jit_max_side_traces=128\n"
-            "; Preload WP core on FPM start — zero cold-start overhead\n"
+            "; ── WordPress preload — eliminates cold-start on FPM restart ────\n"
             "opcache.preload=/usr/local/lib/wp-preload.php\n"
             "opcache.preload_user=www-data\n"
         )
         write_file(f"/etc/php/{version}/fpm/conf.d/10-opcache.ini", opcache_ini)
+        log("SUCCESS", f"PHP {version} OPcache: {_opcache_mb}MB cache, "
+                       f"{_jit_mb}MB JIT, huge_pages={_huge_code_pages}, "
+                       f"zend_extension={'included' if _zend_line else 'via phpenmod'}")
 
-        # apcu
-        write_file(f"/etc/php/{version}/fpm/conf.d/20-apcu.ini", textwrap.dedent("""\
-            apcu.enabled=1
-            apcu.shm_size=128M
-            apcu.ttl=7200
-            apcu.gc_ttl=3600
-            apcu.mmap_file_mask=/tmp/apcu.XXXXXX
-            apcu.slam_defense=1
-            apcu.enable_cli=0
-        """))
+        # ── APCu — hardware-aware in-process user-data cache ─────────────────
+        # APCu lives in PHP worker shared memory (separate from OPcache).
+        # Allocate ~5 % of RAM; floor 64 MB, cap 256 MB.
+        _apcu_mb = max(64, min(256, _total_mb * 5 // 100))
+        apcu_ini = (
+            f"; EasyInstall v8.0 — APCu ({_apcu_mb}MB, {_total_mb}MB RAM detected)\n"
+            "apcu.enabled=1\n"
+            f"apcu.shm_size={_apcu_mb}M\n"
+            "apcu.ttl=7200\n"
+            "apcu.gc_ttl=3600\n"
+            "apcu.mmap_file_mask=/tmp/apcu.XXXXXX\n"
+            "apcu.slam_defense=1\n"
+            "apcu.enable_cli=1\n"
+            "apcu.serializer=php\n"
+        )
+        write_file(f"/etc/php/{version}/fpm/conf.d/20-apcu.ini", apcu_ini)
+        log("SUCCESS", f"PHP {version} APCu: {_apcu_mb}MB shared memory")
 
     log("SUCCESS", "PHP configuration complete")
 
