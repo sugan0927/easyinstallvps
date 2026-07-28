@@ -1,7 +1,7 @@
 {
   // EasyInstall VPS — Cloudflare Worker Config
   // Deploy: wrangler deploy
-  "name": "easyinstall-vps",
+  "name": "easyinstallvps",
   "main": "worker.js",
   "compatibility_date": "2025-01-01",
 
