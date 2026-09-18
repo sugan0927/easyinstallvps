@@ -501,8 +501,6 @@ def stage_nginx_config(cfg):
             fastcgi_cache_lock on;
             fastcgi_cache_lock_timeout 10s;
             fastcgi_cache_background_update on;
-            # Serve stale cache while refreshing — eliminates lock wait
-            fastcgi_cache_use_stale updating;
 
             # ── Microcache zone (1s — absorbs traffic spikes) ────────────────
             fastcgi_cache_path /var/cache/nginx/microcache levels=1:2
@@ -2333,22 +2331,19 @@ def stage_create_commands(cfg):
             [ -z "$2" ] && { echo -e "${RED}❌ Usage: easyinstall ssl domain.com${NC}"; exit 1; }
             SSLDOM="$2"
             log_command "ssl $SSLDOM"
-            # FIX: Use webroot method — more reliable, avoids nginx plugin conflicts
-            systemctl reload nginx 2>/dev/null || true
-            if certbot certonly --webroot -w "/var/www/html/$SSLDOM" \
-                -d "$SSLDOM" -d "www.$SSLDOM" \
-                --non-interactive --agree-tos --email "admin@$SSLDOM"; then
-                echo -e "${GREEN}✅ SSL certificate obtained for $SSLDOM${NC}"
-                # Run Python config to rewrite nginx config with HTTPS block
-                py_config wordpress_install --domain "$SSLDOM" --use-ssl 2>/dev/null || true
-                echo -e "${YELLOW}ℹ️  If site already existed, re-run: easyinstall ssl $SSLDOM${NC}"
-            else
-                echo -e "${YELLOW}⚠️  Webroot failed, trying --nginx plugin fallback...${NC}"
-                certbot --nginx -d "$SSLDOM" -d "www.$SSLDOM" \
-                    --non-interactive --agree-tos --email "admin@$SSLDOM" && \
-                    echo -e "${GREEN}✅ SSL enabled via nginx plugin${NC}" || \
-                    echo -e "${RED}❌ SSL failed. Ensure DNS A-record points to this server and port 80 is open.${NC}"
-            fi ;;
+            # FIX (v6.5): this used to run its own certbot call here, then
+            # try to "rewrite nginx with an HTTPS block" via
+            # `py_config wordpress_install --domain ... --use-ssl`, which
+            # ALWAYS failed silently (2>/dev/null || true) because that
+            # stage aborts immediately for any site that already exists —
+            # i.e. every real-world case of running `ssl` standalone. A
+            # certificate could be issued but nginx never actually got
+            # updated to serve HTTPS. Delegate to the dedicated apply_ssl
+            # stage instead, which detects WordPress vs HTML, detects the
+            # site's actual PHP version, gives a clear error if the site
+            # doesn't exist yet (instead of a confusing certbot 404), and
+            # correctly rewrites the vhost after the cert is issued.
+            py_config apply_ssl --domain "$SSLDOM" ;;
 
         ssl-renew)
             log_command "ssl-renew"
@@ -3876,7 +3871,7 @@ def _wp_install_setup_ssl(domain: str, php_version: str):
         log("SUCCESS", f"HTTPS enabled and nginx updated for {domain}")
         # FIX: Install certbot auto-renewal cron if not already present
         run(
-            "echo '0 3 * * * root certbot renew --quiet --post-hook \'systemctl reload nginx\'' "
+            "echo '0 3 * * * root certbot renew --quiet --post-hook \"systemctl reload nginx\"' "
             "> /etc/cron.d/certbot-renew-easyinstall 2>/dev/null || true",
             check=False
         )
@@ -4246,6 +4241,63 @@ def stage_html_site_install(cfg):
     log("SUCCESS", f"HTML site created for {domain}")
     log("INFO",    f"Site info: /root/{domain}-info.txt")
     print(site_url)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE: apply_ssl  (standalone `easyinstall ssl domain.com` for an
+# ALREADY-EXISTING site — WordPress or HTML)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_apply_ssl(cfg):
+    """Enable HTTPS on a site that was already created with `easyinstall
+    create`.
+
+    FIX: previously, `easyinstall ssl domain.com` obtained a certificate via
+    a raw certbot call in the bash CLI, then tried to "rewrite the nginx
+    config with an HTTPS block" by calling `py_config wordpress_install
+    --domain domain.com --use-ssl`. That ALWAYS failed silently
+    (`2>/dev/null || true` swallowed the error), because
+    stage_wordpress_install's very first step aborts with
+    "Domain already exists" for any site that was already created — which is
+    the only realistic case for running `ssl` on its own. The net effect: a
+    certificate could get issued, but the nginx vhost was never actually
+    updated to serve HTTPS.
+
+    This stage replaces that broken call chain: it detects whether the site
+    exists at all (and gives a clear error instead of a confusing 404 from
+    certbot if it doesn't), detects whether it's a WordPress or HTML site,
+    detects the PHP version already configured for it, and calls the
+    correct dedicated SSL setup function directly.
+    """
+    domain = cfg.domain
+    if not domain:
+        log("ERROR", "--domain is required for apply_ssl stage")
+        sys.exit(1)
+    domain = re.sub(r'https?://', '', domain)
+    domain = re.sub(r'^www\.', '', domain)
+    domain = domain.strip('/')
+
+    nginx_conf_path = Path(f"{NGINX_SITES_AVAILABLE}/{domain}")
+    site_root = Path(f"{WWW_ROOT}/{domain}")
+    if not nginx_conf_path.exists() or not site_root.exists():
+        log("ERROR", f"No existing site found for {domain}.")
+        log("ERROR", f"Run 'easyinstall create {domain}' (or '--html') first, then 'easyinstall ssl {domain}'.")
+        sys.exit(1)
+
+    conf_text = nginx_conf_path.read_text()
+    m = re.search(r'php([0-9]+\.[0-9]+)-fpm\.sock', conf_text)
+    php_version = m.group(1) if m else (cfg.php_version or "")
+
+    is_wordpress = (site_root / "wp-config.php").exists() or (site_root / "wp-settings.php").exists()
+
+    log("STEP", f"Applying SSL for {domain} "
+                 f"({'WordPress' if is_wordpress else 'HTML'} site"
+                 + (f", PHP {php_version}" if php_version else "") + ")")
+
+    if is_wordpress:
+        _wp_install_setup_ssl(domain, php_version or "8.3")
+    else:
+        _html_install_setup_ssl(domain, php_version)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4855,7 +4907,12 @@ def stage_security_hardening(cfg):
     ddos_conf = textwrap.dedent(f"""\
         # EasyInstall v7.0 — DDoS Protection
         # Rate limit zones (reference in server blocks)
-        limit_req_zone $binary_remote_addr zone=login:10m rate=10r/m;
+        # NOTE: the "login" zone is intentionally NOT redefined here — it is
+        # already declared once in the main nginx.conf http block (by
+        # stage_nginx_config) for the wp-login.php rate limit. Redeclaring
+        # the same zone name here caused nginx to fail with:
+        #   "limit_req_zone 'login' is already bound to key ..."
+        # because conf.d/*.conf is included inside the same http context.
         limit_req_zone $binary_remote_addr zone=api:10m   rate=30r/m;
         limit_req_zone $binary_remote_addr zone=global:20m rate=100r/s;
         limit_conn_zone $binary_remote_addr zone=perip:10m;
@@ -6903,6 +6960,7 @@ STAGE_MAP = {
     "advanced_autotune":        stage_advanced_autotune,
     "wordpress_install":        stage_wordpress_install,
     "html_site_install":        stage_html_site_install,
+    "apply_ssl":                stage_apply_ssl,
     "clone_site":               stage_clone_site,
     "remote_install":           stage_remote_install,
     # ── New v7.0 stages ───────────────────────────────────────────────────────
