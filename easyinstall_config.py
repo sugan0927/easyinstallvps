@@ -2150,6 +2150,23 @@ def stage_create_commands(cfg):
             echo "  easyinstall security-scan        — run ClamAV malware scan now (also runs weekly)"
             echo "  easyinstall waf-setup             — write ModSecurity/OWASP-CRS config (manual activation)"
             echo ""
+            echo -e "${GREEN}⚡ ADVANCED PERFORMANCE (v6.5 — newly wired up):${NC}"
+            echo "  easyinstall speed-pack            — WordPress speed pack (object cache + speed constants)"
+            echo "  easyinstall object-cache          — Redis object-cache drop-in for all WP sites"
+            echo "  easyinstall fastcgi-cache domain  — FastCGI cache reference snippet (safe, not auto-applied)"
+            echo "  easyinstall jit-preload           — PHP OPcache/JIT preload for WordPress"
+            echo "  easyinstall static-cache          — immutable long-term caching for static assets"
+            echo "  easyinstall microcache            — nginx 1-second microcache (traffic-spike protection)"
+            echo "  easyinstall db-indexes            — add WordPress-specific MariaDB indexes (all sites)"
+            echo "  easyinstall db-thread-pool        — enable MariaDB thread pool tuning"
+            echo "  easyinstall db-query-report       — slow-query analysis + optimization report"
+            echo "  easyinstall cron-offload          — move WP-Cron to real system cron (all sites)"
+            echo "  easyinstall fpm-autoscale         — dynamic PHP-FPM pm.max_children auto-scaler"
+            echo "  easyinstall redis-multidb         — per-site Redis DB-index isolation"
+            echo "  easyinstall speed-audit           — TTFB/cache audit report"
+            echo "  easyinstall prometheus-setup      — Prometheus + node_exporter (port 9100)"
+            echo "  easyinstall validate-config       — sanity-check nginx/php/mysql configs"
+            echo ""
             echo -e "${GREEN}OPTIMIZE:${NC}"
             echo "  easyinstall optimize | clean"
             echo ""
@@ -2443,6 +2460,94 @@ def stage_create_commands(cfg):
             echo -e "${YELLOW}   'load_module modules/ngx_http_modsecurity_module.so;' to nginx.conf,${NC}"
             echo -e "${YELLOW}   and 'modsecurity on; modsecurity_rules_file /etc/nginx/modsec/main.conf;'${NC}"
             echo -e "${YELLOW}   inside each site block you want protected, then reload nginx.${NC}" ;;
+
+        # ── v6.5: previously-orphaned v7.0/v8.0 stages, now wired to commands ──
+        fpm-autoscale)
+            log_command "fpm-autoscale"
+            echo -e "${YELLOW}⚙️  Installing dynamic PHP-FPM auto-scaler (adjusts pm.max_children every 5 min)...${NC}"
+            py_config stage_php_fpm_autoscaler ;;
+
+        redis-multidb)
+            log_command "redis-multidb"
+            echo -e "${YELLOW}⚙️  Configuring per-site Redis DB-index isolation...${NC}"
+            py_config stage_redis_multidb ;;
+
+        db-query-report)
+            log_command "db-query-report"
+            echo -e "${YELLOW}⚙️  Installing DB query optimizer (slow-log analysis)...${NC}"
+            py_config stage_db_optimizer
+            echo -e "${YELLOW}📊 Running analysis now...${NC}"
+            /usr/local/bin/easy-db-optimizer 2>/dev/null || echo -e "${RED}❌ Could not run analyzer${NC}" ;;
+
+        prometheus-setup)
+            log_command "prometheus-setup"
+            echo -e "${YELLOW}⚙️  Installing Prometheus + node_exporter (port 9100)...${NC}"
+            py_config stage_prometheus_setup ;;
+
+        validate-config)
+            log_command "validate-config"
+            echo -e "${YELLOW}🔍 Validating nginx/php/mysql config files...${NC}"
+            py_config stage_config_validator ;;
+
+        speed-pack)
+            log_command "speed-pack"
+            echo -e "${YELLOW}⚡ Installing WordPress Speed Pack (object cache, speed constants)...${NC}"
+            py_config stage_wordpress_speed_pack ;;
+
+        object-cache)
+            log_command "object-cache"
+            echo -e "${YELLOW}⚡ Deploying Redis object-cache drop-in for all WordPress sites...${NC}"
+            py_config stage_wp_object_cache ;;
+
+        fastcgi-cache)
+            log_command "fastcgi-cache ${2:-}"
+            echo -e "${YELLOW}⚡ Writing FastCGI full-page cache reference snippet...${NC}"
+            if [ -n "$2" ]; then
+                py_config stage_nginx_fastcgi_site --domain "$2" --php-version "${PHP_VERSION:-8.3}"
+            else
+                py_config stage_nginx_fastcgi_site
+            fi
+            echo -e "${YELLOW}ℹ️  This does NOT touch your site's live nginx config or SSL setup —${NC}"
+            echo -e "${YELLOW}   'easyinstall create' already sets up working FastCGI caching.${NC}"
+            echo -e "${YELLOW}   The snippet is a reference for customizing cache rules by hand;${NC}"
+            echo -e "${YELLOW}   see the file's header comments for merge instructions.${NC}" ;;
+
+        jit-preload)
+            log_command "jit-preload"
+            echo -e "${YELLOW}⚡ Installing PHP OPcache/JIT preload script for WordPress...${NC}"
+            py_config stage_php_jit_preload ;;
+
+        static-cache)
+            log_command "static-cache"
+            echo -e "${YELLOW}⚡ Configuring immutable long-term caching for static assets...${NC}"
+            py_config stage_static_asset_cache ;;
+
+        db-indexes)
+            log_command "db-indexes"
+            echo -e "${YELLOW}⚡ Adding WordPress-specific MariaDB indexes to all sites' databases...${NC}"
+            py_config stage_db_wordpress_indexes ;;
+
+        speed-audit)
+            log_command "speed-audit"
+            echo -e "${YELLOW}📊 Running WordPress speed audit...${NC}"
+            py_config stage_speed_audit
+            echo ""
+            cat /root/speed-audit-report.txt 2>/dev/null || echo -e "${RED}❌ Report not generated${NC}" ;;
+
+        db-thread-pool)
+            log_command "db-thread-pool"
+            echo -e "${YELLOW}⚡ Enabling MariaDB thread pool + performance tuning...${NC}"
+            py_config stage_mariadb_thread_pool ;;
+
+        microcache)
+            log_command "microcache"
+            echo -e "${YELLOW}⚡ Configuring nginx 1-second microcache (traffic-spike protection)...${NC}"
+            py_config stage_nginx_microcache ;;
+
+        cron-offload)
+            log_command "cron-offload"
+            echo -e "${YELLOW}⚡ Offloading WP-Cron to real system cron for all sites...${NC}"
+            py_config stage_wp_cron_offload ;;
 
         ai-setup)
             source /usr/local/lib/easyinstall-ai.sh 2>/dev/null && ai_setup || echo -e "${RED}❌ AI module not found${NC}" ;;
@@ -6149,14 +6254,15 @@ function wp_cache_close(): bool {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def stage_nginx_fastcgi_site(cfg):
-    log("STEP", "Writing per-site Nginx FastCGI full-page cache config (v8.0)")
+    log("STEP", "Writing per-site Nginx FastCGI full-page cache snippet (v8.0)")
 
     domain = cfg.domain
     if not domain:
-        log("WARNING", "--domain not specified; writing template to /etc/nginx/snippets/fastcgi-wordpress.conf")
+        log("WARNING", "--domain not specified; writing a generic template")
         domain = "DOMAIN_PLACEHOLDER"
+    else:
+        domain = re.sub(r'https?://', '', domain).strip('/')
 
-    domain = re.sub(r'https?://', '', domain).strip('/')
     php_version = cfg.php_version or "8.3"
 
     # Create cache dir
@@ -6164,40 +6270,61 @@ def stage_nginx_fastcgi_site(cfg):
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     run(f"chown -R www-data:www-data {cache_dir} 2>/dev/null || true", check=False)
 
+    # FIX (v6.5): this used to write the fragment below DIRECTLY to
+    # /etc/nginx/sites-available/{domain} — completely OVERWRITING the
+    # site's real vhost (including its SSL server block, server_name, root,
+    # everything set up by `easyinstall create`/`ssl`). Worse, the fragment
+    # is bare `set`/`if`/`location` directives with no enclosing `server {}`
+    # block at all, which isn't valid syntax as a standalone site file — so
+    # this would have broken nginx entirely for that domain (and, since all
+    # sites-enabled/*.conf load into one nginx.conf, could take down every
+    # other site on the box too if reload_or_restart's `nginx -t` check
+    # didn't stop it in time). Since easyinstall.sh already gives every
+    # WordPress site fastcgi caching in its own vhost (via
+    # _wp_install_configure_nginx_site), this is now written as a
+    # reference SNIPPET only — never auto-applied, never touches an
+    # existing site's vhost — with explicit instructions for merging it in
+    # by hand if you want to customize an existing site's cache rules.
     site_conf = textwrap.dedent(f"""
-        # EasyInstall v8.0 — FastCGI Full-Page Cache for {domain}
+        # EasyInstall v8.0 — FastCGI Full-Page Cache reference snippet for {domain}
         # Generated: {datetime.now().isoformat()}
-        # Provides: 100x speed for anonymous (uncached) WordPress traffic
+        #
+        # This is a REFERENCE ONLY — it is NOT included or applied
+        # automatically, and running this command never touches your
+        # existing nginx site config. `easyinstall create {domain}` already
+        # sets up working FastCGI caching for this domain.
+        #
+        # To use this instead of the default: open
+        #   /etc/nginx/sites-available/{domain}
+        # and REPLACE its existing `location ~ \\.php$ {{ ... }}` block with
+        # everything between the `location ~ \\.php$` markers below (do not
+        # add a second php location block — nginx will reject a duplicate
+        # location in the same server block). Then run:
+        #   nginx -t && systemctl reload nginx
 
-        # ── Cache-bypass decision variables ──────────────────────────────────
+        # ── Cache-bypass decision variables (put these near the top of your
+        #    existing `server {{ ... }}` block, alongside its other `set`s) ──
         set $skip_cache 0;
         set $cache_reason "";
 
-        # Do not cache POST requests
         if ($request_method = POST) {{
             set $skip_cache 1;
             set $cache_reason "POST";
         }}
-
-        # Do not cache URLs with query strings (except pagination)
         if ($query_string != "") {{
             set $skip_cache 1;
             set $cache_reason "QUERY_STRING";
         }}
-
-        # Do not cache wp-admin, wp-login, or feeds
         if ($request_uri ~* "(/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?.xml)") {{
             set $skip_cache 1;
             set $cache_reason "WP_ADMIN";
         }}
-
-        # Do not cache for logged-in users or recent commenters
         if ($http_cookie ~* "(wordpress_logged_in|comment_author|woocommerce_cart|woocommerce_session|wp_postpass|edd_items_in_cart)") {{
             set $skip_cache 1;
             set $cache_reason "COOKIE";
         }}
 
-        # ── PHP-FPM location ─────────────────────────────────────────────────
+        # ── PHP-FPM location (REPLACES your existing location ~ \\.php$ block) ──
         location ~ \\.php$ {{
             try_files $uri =404;
             fastcgi_split_path_info ^(.+\\.php)(/.+)$;
@@ -6209,57 +6336,25 @@ def stage_nginx_fastcgi_site(cfg):
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
             fastcgi_param PATH_INFO $fastcgi_path_info;
 
-            # ── FastCGI Full-Page Cache ───────────────────────────────────────
             fastcgi_cache WORDPRESS;
             fastcgi_cache_valid 200 301 302 120m;
             fastcgi_cache_valid 404      5m;
             fastcgi_cache_bypass $skip_cache;
             fastcgi_no_cache    $skip_cache;
-
-            # Serve stale content while refreshing (no visitor waits)
             fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_503;
             fastcgi_cache_background_update on;
             fastcgi_cache_lock on;
 
-            # Expose cache status in header (debug; remove in strict prod)
             add_header X-Cache-Status $upstream_cache_status always;
             add_header X-Cache-Reason $cache_reason always;
         }}
-
-        # ── Static assets — immutable long-term cache ────────────────────────
-        location ~* \\.(js|css|png|jpg|jpeg|gif|ico|webp|svg|woff|woff2|ttf|eot|otf|mp4|webm)$ {{
-            expires max;
-            add_header Cache-Control "public, max-age=31536000, immutable";
-            add_header Vary "Accept-Encoding";
-            access_log off;
-            log_not_found off;
-        }}
-
-        # ── Favicon + robots ─────────────────────────────────────────────────
-        location = /favicon.ico {{ log_not_found off; access_log off; }}
-        location = /robots.txt  {{ allow all; log_not_found off; access_log off; }}
-
-        # ── Block PHP execution in uploads ───────────────────────────────────
-        location ~* /(?:uploads|files)/.*\\.php$ {{
-            deny all;
-        }}
-
-        # ── WordPress pretty permalinks ──────────────────────────────────────
-        location / {{
-            try_files $uri $uri/ /index.php?$args;
-        }}
+        # ── end location ~ \\.php$ ──
     """).strip()
 
-    out_path = f"/etc/nginx/sites-available/{domain}" if domain != "DOMAIN_PLACEHOLDER" else "/etc/nginx/snippets/fastcgi-wordpress.conf"
+    out_path = f"/etc/nginx/snippets/fastcgi-{domain}.conf.reference"
     write_file(out_path, site_conf)
-
-    if domain != "DOMAIN_PLACEHOLDER":
-        symlink = Path(f"/etc/nginx/sites-enabled/{domain}")
-        if not symlink.exists():
-            run(f"ln -sf {out_path} /etc/nginx/sites-enabled/{domain}", check=False)
-        reload_or_restart("nginx", "nginx -t 2>&1")
-
-    log("SUCCESS", f"FastCGI full-page cache site config written: {out_path}")
+    log("SUCCESS", f"Reference snippet written (NOT applied): {out_path}")
+    log("INFO",    f"Your site's actual nginx config was NOT modified — see the file's header for merge instructions.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6371,6 +6466,11 @@ def stage_static_asset_cache(cfg):
         # EasyInstall v8.0 — Static Asset Immutable Cache
         # Aggressive long-term caching for versioned WordPress assets.
         # WP adds ?ver= to all assets, so immutable is safe.
+        #
+        # Include this INSIDE a `server {{ }}` block (e.g. via
+        #   include /etc/nginx/snippets/static-asset-cache.conf;
+        # inside /etc/nginx/sites-available/yourdomain.com), then
+        #   nginx -t && systemctl reload nginx
 
         # ── Images ────────────────────────────────────────────────────────────
         location ~* \\.(?:jpg|jpeg|png|gif|ico|webp|avif|svg|cur|gz)$ {
@@ -6398,11 +6498,6 @@ def stage_static_asset_cache(cfg):
             access_log  off;
         }
 
-        # ── Pre-compressed static files (.gz + .br) ───────────────────────────
-        # Serve pre-compressed versions if present (generated offline by build tools)
-        gzip_static  on;
-        brotli_static on;
-
         # ── HTML + XML — short cache (dynamic content) ────────────────────────
         location ~* \\.(?:html|htm|xml|json|rss|atom)$ {
             expires     1h;
@@ -6410,9 +6505,20 @@ def stage_static_asset_cache(cfg):
         }
     """).strip()
 
-    write_file("/etc/nginx/conf.d/static-asset-cache.conf", static_conf)
-    reload_or_restart("nginx", "nginx -t 2>&1")
-    log("SUCCESS", "Static asset immutable cache headers configured (v8.0)")
+    # FIX (v6.5): this used to be written straight into
+    # /etc/nginx/conf.d/static-asset-cache.conf, which nginx auto-includes
+    # inside the http{} block on Debian/Ubuntu — but `location {}` is not
+    # valid syntax at that level (it must be nested inside a server{}
+    # block). That would fail `nginx -t` the moment anything reloaded nginx.
+    # reload_or_restart() below already refuses to push a config that fails
+    # its syntax check, so this never took a live site down — but the bad
+    # file would sit in conf.d as a landmine for the next unconditional
+    # `systemctl restart nginx` (e.g. a reboot) done by anything else.
+    # Written as an include-only snippet instead; nothing auto-loads it.
+    write_file("/etc/nginx/snippets/static-asset-cache.conf", static_conf)
+    log("SUCCESS", "Static asset cache snippet written: /etc/nginx/snippets/static-asset-cache.conf")
+    log("INFO",    "Not auto-applied — include it inside a site's server{} block to use it "
+                    "(see the file's header comment).")
 
     # Pre-compress existing static files in all WordPress sites
     log("INFO", "Pre-compressing existing static assets (this may take a minute)...")
