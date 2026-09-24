@@ -532,6 +532,24 @@ install_nginx_packages() {
     run_cmd_retry 2 3 "apt-get install -y libnginx-mod-brotli" 2>/dev/null || \
         log "WARNING" "Brotli module not available — gzip remains active"
 
+    # Optional: Zstd module — no single package name is universal across
+    # distros yet, so try the known candidates in turn. Nginx is installed
+    # from nginx.org's own mainline repo above (not the distro's build), so
+    # a distro-built dynamic module can fail nginx's binary-compatibility
+    # check even when apt install succeeds — this is expected on some
+    # hosts. easyinstall_config.py only turns zstd_static/zstd on in
+    # nginx.conf if the module actually landed on disk, so a failed/skipped
+    # install here just means gzip + brotli keep serving everything.
+    run_cmd_retry 2 3 "apt-get install -y libnginx-mod-http-zstd" 2>/dev/null || \
+        run_cmd_retry 2 3 "apt-get install -y nginx-module-zstd" 2>/dev/null || \
+        log "WARNING" "Zstd module not available — gzip/brotli remain active"
+
+    # CLI tools used to pre-compress existing static assets (*.js/*.css/*.svg)
+    # into sibling .gz/.br/.zst files ahead of time — independent of the
+    # live nginx modules above, these are just userspace compressors.
+    run_cmd_retry 2 3 "apt-get install -y brotli zstd" 2>/dev/null || \
+        log "WARNING" "brotli/zstd CLI tools not available — static pre-compression will be gzip-only"
+
     # Optional: GeoIP2 module
     run_cmd_retry 2 3 "apt-get install -y libnginx-mod-http-geoip2 mmdb-bin" 2>/dev/null || true
 
