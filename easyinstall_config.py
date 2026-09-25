@@ -440,6 +440,16 @@ def stage_nginx_config(cfg):
         worker_rlimit_nofile 1048576;
         pid /run/nginx.pid;
 
+        # BUG FIX (v7.2): dynamic modules (brotli, zstd, geoip2, ...) are
+        # installed as .so files + a matching *.conf under
+        # /etc/nginx/modules-enabled/, but nothing was ever including that
+        # directory here — so even a perfectly working, ABI-compatible
+        # module install was silently never loaded. This one line is what
+        # actually turns "apt install libnginx-mod-http-zstd succeeded"
+        # into "nginx can use zstd". load_module directives are only valid
+        # in this top-level context, before events{{}}/http{{}}.
+        include /etc/nginx/modules-enabled/*.conf;
+
         events {{
             # 4096+ connections per worker for high-traffic WordPress
             worker_connections 4096;
@@ -579,28 +589,124 @@ def stage_nginx_config(cfg):
 # STAGE: nginx_extras  (Brotli + Cloudflare real-IP + SSL hardening)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def stage_nginx_extras(cfg):
-    log("STEP", "Writing Nginx extras: Brotli, Cloudflare real-IP, SSL hardening")
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared compression-module detection (single source of truth)
+#
+# BUG HISTORY (v7.1): brotli_static/zstd_static were added straight into the
+# per-site vhost templates without checking whether those modules were
+# actually loaded. On any server where the dynamic module failed to install
+# (e.g. an ABI mismatch between nginx.org's mainline nginx and a
+# distro-packaged module — a real, expected possibility, not an edge case),
+# nginx doesn't recognise those directives at all. That turns "unknown
+# directive" into a hard `nginx -t` failure, which aborts the ENTIRE site
+# creation via sys.exit(1) — before SSL/certbot ever runs. The visible
+# symptom is confusing: the browser tries HTTPS by default, finds nothing on
+# :443 (since the site creation never got that far), and reports
+# ERR_CONNECTION_REFUSED — nothing about that error mentions nginx config.
+#
+# Fix: every place that might emit brotli_static/zstd_static — the global
+# conf.d snippets AND every per-site vhost template — now calls the same two
+# functions below, so a module that isn't actually on disk can never end up
+# referenced anywhere.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Brotli — only if module .so exists
-    brotli_so = Path("/usr/lib/nginx/modules/ngx_http_brotli_filter_module.so")
-    brotli_conf = Path("/etc/nginx/modules-available/50-mod-brotli.conf")
-    if brotli_so.exists() or brotli_conf.exists():
-        write_file("/etc/nginx/conf.d/brotli.conf", textwrap.dedent("""\
+def _detect_compression_modules():
+    """Returns (brotli_available, zstd_available) based on what's actually
+    installed on THIS server, not what the install script attempted."""
+    brotli_available = (
+        Path("/usr/lib/nginx/modules/ngx_http_brotli_filter_module.so").exists()
+        or Path("/etc/nginx/modules-available/50-mod-brotli.conf").exists()
+    )
+
+    zstd_candidates = [
+        Path("/usr/lib/nginx/modules/ngx_http_zstd_filter_module.so"),
+        Path("/etc/nginx/modules-available/50-mod-http-zstd.conf"),
+        Path("/etc/nginx/modules-enabled/50-mod-http-zstd.conf"),
+    ]
+    zstd_available = any(p.exists() for p in zstd_candidates)
+    if not zstd_available:
+        modules_dir = Path("/usr/lib/nginx/modules")
+        if modules_dir.is_dir():
+            zstd_available = any(modules_dir.glob("*zstd*"))
+
+    return brotli_available, zstd_available
+
+
+def _extra_static_compression_lines(indent: str) -> str:
+    """`brotli_static on;` / `zstd_static on;` lines for a static-asset
+    location block, for whichever modules are actually available — never
+    both, one, or neither, purely based on what's really on disk. gzip_static
+    is NOT included here since gzip is always built into nginx core and is
+    written directly in every template regardless.
+
+    Returns a string starting with "\\n" (so it can be appended right after
+    an existing "gzip_static on;" line) or "" if neither module is present.
+    """
+    brotli_available, zstd_available = _detect_compression_modules()
+    lines = []
+    if brotli_available:
+        lines.append(f"{indent}brotli_static on;")
+    if zstd_available:
+        lines.append(f"{indent}zstd_static on;")
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+def stage_nginx_extras(cfg):
+    log("STEP", "Writing Nginx extras: Brotli, Zstd, Cloudflare real-IP, SSL hardening")
+
+    # Shared media-type list for all three compressors — kept in one place
+    # so gzip/brotli/zstd always agree on what gets compressed.
+    COMPRESSIBLE_TYPES = " ".join("""
+        text/plain text/css text/xml text/javascript
+        application/json application/javascript application/xml+rss
+        application/xml application/rss+xml application/atom+xml
+        application/x-javascript application/x-font-ttf
+        font/opentype image/svg+xml image/x-icon
+    """.split())
+
+    # Brotli / Zstd — single shared detection (see _detect_compression_modules
+    # above); a module only gets referenced anywhere in nginx config, in this
+    # function OR in any per-site vhost template, if it's actually on disk.
+    brotli_available, zstd_available = _detect_compression_modules()
+
+    if brotli_available:
+        write_file("/etc/nginx/conf.d/brotli.conf", textwrap.dedent(f"""\
             # Brotli compression (EasyInstall v6.3)
+            # nginx negotiates this automatically per-request from the
+            # browser's own Accept-Encoding header — no server-side
+            # browser detection needed.
             brotli on;
             brotli_comp_level 6;
             brotli_static on;
             brotli_min_length 1000;
             brotli_types
-                text/plain text/css text/xml text/javascript
-                application/json application/javascript application/xml+rss
-                application/xml application/rss+xml application/atom+xml
-                application/x-javascript application/x-font-ttf
-                font/opentype image/svg+xml image/x-icon;
+                {COMPRESSIBLE_TYPES};
         """))
     else:
-        log("INFO", "Brotli .so not found — skipping brotli.conf")
+        log("INFO", "Brotli module not found — skipping brotli.conf")
+
+    # Zstd — same idea as brotli above. There is no single universal
+    # package name across distros yet (unlike brotli), so easyinstall.sh
+    # probes every candidate package name it knows of; here we only decide
+    # whether to *write* zstd.conf, based on what's actually installed.
+    if zstd_available:
+        write_file("/etc/nginx/conf.d/zstd.conf", textwrap.dedent(f"""\
+            # Zstandard compression (EasyInstall v6.3)
+            # Modern, fast alternative to gzip/brotli. Like brotli above,
+            # nginx only sends "Content-Encoding: zstd" to browsers that
+            # advertise "zstd" in their own Accept-Encoding header — every
+            # other browser transparently falls through to brotli, then
+            # gzip, automatically. Nothing to configure per-browser.
+            zstd on;
+            zstd_comp_level 3;
+            zstd_static on;
+            zstd_min_length 256;
+            zstd_types
+                {COMPRESSIBLE_TYPES};
+        """))
+        log("SUCCESS", "Zstd compression module detected — zstd.conf written")
+    else:
+        log("INFO", "Zstd nginx module not found — skipping zstd.conf (gzip + brotli still active)")
 
     write_file("/etc/nginx/conf.d/cloudflare-realip.conf", textwrap.dedent("""\
         # Cloudflare real-IP restoration (EasyInstall v6.3)
@@ -3777,7 +3883,7 @@ def _wp_install_configure_nginx_site(domain: str, php_version: str):
             # FIX: Merged gzip_static into single static assets block (removed duplicate location)
             location ~* \\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot|pdf|zip|gz|mp4|webm|webp)$ {{
                 expires max; log_not_found off; access_log off;
-                gzip_static on;
+                gzip_static on;{_extra_static_compression_lines("                ")}
                 add_header Cache-Control "public, immutable";
                 try_files $uri @fallback;
             }}
@@ -3951,7 +4057,7 @@ def _wp_install_setup_ssl(domain: str, php_version: str):
                 location = /robots.txt                      {{ allow all; log_not_found off; access_log off; }}
                 location ~* \\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot|pdf|zip|gz|mp4|webm|webp)$ {{
                     expires max; log_not_found off; access_log off;
-                    gzip_static on;
+                    gzip_static on;{_extra_static_compression_lines("                    ")}
                     add_header Cache-Control "public, immutable";
                     try_files $uri @fallback;
                 }}
@@ -4108,7 +4214,7 @@ def _html_install_configure_nginx_site(domain: str, php_version: str):
             location = /robots.txt  {{ allow all; log_not_found off; access_log off; }}
             location ~* \\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot|pdf|zip|gz|mp4|webm|webp)$ {{
                 expires max; log_not_found off; access_log off;
-                gzip_static on;
+                gzip_static on;{_extra_static_compression_lines("                ")}
                 add_header Cache-Control "public, immutable";
             }}
         }}
@@ -4267,7 +4373,7 @@ def _html_install_setup_ssl(domain: str, php_version: str):
             location = /robots.txt  {{ allow all; log_not_found off; access_log off; }}
             location ~* \\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg|eot|pdf|zip|gz|mp4|webm|webp)$ {{
                 expires max; log_not_found off; access_log off;
-                gzip_static on;
+                gzip_static on;{_extra_static_compression_lines("                ")}
                 add_header Cache-Control "public, immutable";
             }}
         }}
@@ -6524,9 +6630,20 @@ def stage_static_asset_cache(cfg):
     log("INFO", "Pre-compressing existing static assets (this may take a minute)...")
     for base in ["/var/www", "/var/www/html"]:
         for wp_dir in Path(base).glob("*/wp-content"):
-            cmd = "find " + str(wp_dir) + " -type f -name '*.js' -o -name '*.css' -o -name '*.svg' | xargs -I{} sh -c 'gzip -9 -k \"{}\" 2>/dev/null; brotli -9 -k \"{}\" 2>/dev/null'"
+            # FIX: the old pattern was `-type f -name '*.js' -o -name '*.css' -o -name '*.svg'`
+            # without grouping, so -type f only bound to the *.js clause —
+            # directories literally named *.css/*.svg (rare, but possible)
+            # could slip through. Explicit \( ... \) groups the OR clause
+            # before -type f applies to all three.
+            cmd = (
+                "find " + str(wp_dir) + " -type f \\( -name '*.js' -o -name '*.css' -o -name '*.svg' \\) "
+                "| xargs -I{} sh -c "
+                "'gzip -9 -k -f \"{}\" 2>/dev/null; "
+                "brotli -q 11 -k -f \"{}\" 2>/dev/null; "
+                "zstd -19 -k -f -q \"{}\" 2>/dev/null'"
+            )
             run(cmd, check=False)
-    log("SUCCESS", "Static assets pre-compressed")
+    log("SUCCESS", "Static assets pre-compressed (.gz + .br + .zst, served automatically by gzip_static/brotli_static/zstd_static)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
